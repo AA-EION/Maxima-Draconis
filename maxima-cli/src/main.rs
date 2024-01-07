@@ -19,7 +19,7 @@ use maxima::{
 };
 
 use maxima::{
-    content::downloader::ZipDownloader,
+    content::downloader::{DownloadError, ZipDownloader},
     core::{
         auth::{nucleus_connect_token, TokenResponse},
         clients::JUNO_PC_CLIENT_ID,
@@ -27,7 +27,7 @@ use maxima::{
     },
 };
 use maxima::{
-    content::{zip::ZipFile, ContentService},
+    content::ContentService,
     core::{
         auth::{
             context::AuthContext,
@@ -310,13 +310,41 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         handles.push(async move {
             let ele = &downloader.manifest().entries()[i];
             info!("File: {}", ele.name());
-            downloader.download_single_file(ele).await.unwrap();
+
+            let mut bytes_downloaded = 0;
+            loop {
+                if let Err(err) = downloader.download_single_file(ele, bytes_downloaded).await {
+                    warn!("{} download failed: {}", ele.name(), err,);
+
+                    if let Ok(error) = err.downcast::<futures::io::Error>() {
+                        warn!(
+                            "{} download failed: {}",
+                            ele.name(),
+                            std::any::type_name_of_val(&error)
+                        );
+                        if let Some(DownloadError::DownloadFailed(downloaded_so_far)) =
+                            error.into_inner().unwrap().downcast_ref::<DownloadError>()
+                        {
+                            warn!(
+                                "{} failed at {} bytes downloaded. Trying from there...",
+                                ele.name(),
+                                downloaded_so_far
+                            );
+                            bytes_downloaded = *downloaded_so_far;
+                            continue;
+                        }
+                    }
+                }
+
+                break;
+            }
         });
     }
-    
+
     let _results = futures::stream::iter(handles)
         .buffer_unordered(16)
-        .collect::<Vec<_>>().await;
+        .collect::<Vec<_>>()
+        .await;
 
     let end_time = Instant::now();
 
