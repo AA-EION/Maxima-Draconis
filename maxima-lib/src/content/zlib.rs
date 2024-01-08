@@ -1,9 +1,9 @@
 use std::{
-    os::raw::{c_char, c_int, c_uchar, c_uint, c_ulong, c_ushort},
+    os::raw::{c_char, c_int, c_uchar, c_uint, c_ulong, c_ushort, c_void},
     ptr,
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flate2::raw::{gz_headerp, mz_stream, z_streamp};
 
 pub const Z_ENOUGH_LENS: usize = 852;
@@ -85,24 +85,28 @@ pub fn write_zlib_state(buf: &mut BytesMut, stream: &mut mz_stream) {
         ptr::copy_nonoverlapping(state, buffer.as_mut_ptr() as *mut ZInflateState, 1);
     }
 
-    println!("Offset: {}", state_ref.offset);
-    println!("Size: {}", size);
-    println!("Size: {}", buffer.len());
-
     for byte in buffer {
         buf.put_u8(byte);
+    }
+
+    if !state_ref.window.is_null() {
+        let window_size = 1 << state_ref.wbits;
+        let mut window_buffer = vec![0; window_size];
+        unsafe {
+            ptr::copy_nonoverlapping(state_ref.window, window_buffer.as_mut_ptr(), window_size);
+        }
+
+        for byte in window_buffer {
+            buf.put_i8(byte);
+        }
     }
 
     let lencode_index = unsafe { state_ref.lencode.offset_from(state_ref.codes.as_ptr()) };
     let distcode_index = unsafe { state_ref.distcode.offset_from(state_ref.codes.as_ptr()) };
     let next_index = unsafe { state_ref.next.offset_from(state_ref.codes.as_ptr()) };
-    println!(
-        "Lencode: {}, Distcode: {}, Next: {}",
-        lencode_index, distcode_index, next_index
-    );
 
     if lencode_index > Z_ENOUGH.try_into().unwrap() {
-        panic!("Can't serialize this zlib state, lencode too high!");
+        panic!("Can't serialize this zlib state, lencode too high! (Lencode: {}, Distcode: {}, Nextcode: {})", lencode_index, distcode_index, next_index);
     }
 
     buf.put_u32(lencode_index as u32);
@@ -111,4 +115,60 @@ pub fn write_zlib_state(buf: &mut BytesMut, stream: &mut mz_stream) {
 
     buf.put_u32(state_ref.lenbits);
     buf.put_u32(state_ref.distbits);
+}
+
+pub fn restore_zlib_state(buf: &mut Bytes, stream: &mut mz_stream) {
+    stream.total_in = buf.get_u32();
+    stream.total_out = buf.get_u32();
+    stream.data_type = buf.get_i32();
+    stream.adler = buf.get_u32();
+
+    let state = stream.state as *mut ZInflateState;
+    let state_ref = unsafe { &mut *state };
+
+    let size = std::mem::size_of::<ZInflateState>();
+    for i in 0..size {
+        let byte = buf.get_u8();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &byte,
+                (state as *mut c_uchar).offset(i.try_into().unwrap()),
+                1,
+            );
+        }
+    }
+
+    if !state_ref.window.is_null() {
+        let window_size = 1 << state_ref.wbits;
+
+        let streamp = stream as z_streamp;
+        state_ref.window =
+            unsafe { (stream.zalloc)(streamp as *mut c_void, 1, window_size) } as *mut i8;
+
+        for i in 0..window_size {
+            let byte = buf.get_u8();
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    &byte,
+                    state_ref.window.offset(i.try_into().unwrap()) as *mut u8,
+                    1,
+                );
+            }
+        }
+    }
+
+    let lencode = buf.get_u32() as isize;
+    let distcode = buf.get_u32() as isize;
+    let nextcode = buf.get_u32() as isize;
+
+    if lencode > Z_ENOUGH.try_into().unwrap() {
+        panic!("Can't deserialize this zlib state, lencode too high!");
+    }
+
+    state_ref.lencode = unsafe { state_ref.codes.as_ptr().offset(lencode) as *mut ZCode };
+    state_ref.distcode = unsafe { state_ref.codes.as_ptr().offset(distcode) as *mut ZCode };
+    state_ref.next = unsafe { state_ref.codes.as_ptr().offset(nextcode) as *mut ZCode };
+
+    state_ref.lenbits = buf.get_u32();
+    state_ref.distbits = buf.get_u32();
 }
