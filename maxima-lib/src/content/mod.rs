@@ -15,6 +15,7 @@ use crate::core::{
 pub mod downloader;
 pub mod patcher;
 pub mod zip;
+pub mod zlib;
 
 #[derive(Clone)]
 pub struct ServiceAvailableBuilds {

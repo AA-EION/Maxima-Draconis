@@ -309,6 +309,10 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
 
         handles.push(async move {
             let ele = &downloader.manifest().entries()[i];
+            if ele.name() != "__Installer/installerdata.xml" {
+                return;
+            }
+
             info!("File: {}", ele.name());
 
             let mut bytes_downloaded = 0;

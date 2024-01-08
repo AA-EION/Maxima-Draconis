@@ -1,6 +1,8 @@
-use std::path::Path;
+use std::{path::Path, slice, ptr};
 
 use anyhow::Result;
+use bytes::BytesMut;
+use flate2::Decompress;
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::{debug, error, warn};
 use reqwest::Client;
@@ -12,7 +14,7 @@ use tokio::{
 
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::content::zip::CompressionType;
+use crate::content::{zip::CompressionType, zlib::{ZInflateState, write_zlib_state}};
 
 use super::zip::{ZipFile, ZipFileEntry};
 
@@ -47,7 +49,7 @@ impl ZipDownloader {
         entry: &ZipFileEntry,
         bytes_downloaded: usize,
     ) -> Result<usize> {
-        let dir_path = Path::new("/Users/gustash/Documents/GameTest");
+        let dir_path = Path::new("DownloadTest");
         let file_path = dir_path.join(entry.name());
 
         if bytes_downloaded == 0 {
@@ -114,8 +116,11 @@ impl ZipDownloader {
             }
             CompressionType::Deflate => {
                 let mut decoder = async_compression::tokio::write::DeflateDecoder::new(writer);
-
                 tokio::io::copy(&mut stream_reader, &mut decoder).await?;
+                
+                //let zstream = decoder.inner_mut().decoder_mut().inner.decompress.get_raw();
+                //let mut buf = BytesMut::new();
+                //write_zlib_state(&mut buf, zstream);
             }
         };
 
