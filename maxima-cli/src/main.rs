@@ -309,15 +309,11 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
 
         handles.push(async move {
             let ele = &downloader.manifest().entries()[i];
-            if ele.name() != "__Installer/installerdata.xml" {
-                //return;
-            }
-
             info!("File: {}", ele.name());
 
             let mut bytes_downloaded = 0;
             loop {
-                if let Err(err) = downloader.download_single_file(ele, bytes_downloaded).await {
+                if let Err(err) = downloader.download_single_file(ele).await {
                     warn!("{} download failed: {}", ele.name(), err,);
 
                     if let Ok(error) = err.downcast::<futures::io::Error>() {

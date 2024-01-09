@@ -1430,6 +1430,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2856,7 +2865,6 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-recursion",
- "async-trait",
  "base64 0.21.2",
  "bytebuffer",
  "bytes",
@@ -2864,6 +2872,7 @@ dependencies = [
  "derive-getters",
  "derive_builder",
  "directories",
+ "dirs",
  "dll-syringe",
  "enable-ansi-support",
  "encoding",
