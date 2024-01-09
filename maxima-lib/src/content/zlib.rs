@@ -71,10 +71,10 @@ pub struct ZInflateState {
 }
 
 pub fn write_zlib_state(buf: &mut BytesMut, stream: &mut mz_stream) {
-    buf.put_u32(stream.total_in);
-    buf.put_u32(stream.total_out);
+    buf.put_u64(stream.total_in);
+    buf.put_u64(stream.total_out);
     buf.put_i32(stream.data_type);
-    buf.put_u32(stream.adler);
+    buf.put_u64(stream.adler);
 
     let state = stream.state as *mut ZInflateState;
     let state_ref = unsafe { &mut *state };
@@ -118,10 +118,10 @@ pub fn write_zlib_state(buf: &mut BytesMut, stream: &mut mz_stream) {
 }
 
 pub fn restore_zlib_state(buf: &mut Bytes, stream: &mut mz_stream) {
-    stream.total_in = buf.get_u32();
-    stream.total_out = buf.get_u32();
+    stream.total_in = buf.get_u64();
+    stream.total_out = buf.get_u64();
     stream.data_type = buf.get_i32();
-    stream.adler = buf.get_u32();
+    stream.adler = buf.get_u64();
 
     let state = stream.state as *mut ZInflateState;
     let state_ref = unsafe { &mut *state };
