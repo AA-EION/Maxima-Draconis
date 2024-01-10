@@ -1,4 +1,4 @@
-use std::{fmt::Display, io::SeekFrom, path::Path, pin::Pin, prelude, task, task::Poll};
+use std::{path::Path, pin::Pin, prelude, task, task::Poll};
 
 use anyhow::Result;
 use async_compression::tokio::write::DeflateDecoder;
@@ -9,7 +9,7 @@ use reqwest::Client;
 use strum_macros::Display;
 use tokio::{
     fs::{create_dir, create_dir_all, OpenOptions},
-    io::{AsyncSeekExt, AsyncWrite, BufReader},
+    io::{AsyncWrite, BufReader},
 };
 
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -54,10 +54,8 @@ impl<W: AsyncWrite> RestorableDeflateDecoder<W> {
     fn update_bytes_written(&mut self, bytes: usize) {
         self.bytes_written += bytes;
 
-        // if self.bytes_since_last + bytes >= 1_048_576 {
-        if self.bytes_since_last + bytes >= 65536 {
-            // self.bytes_since_last = self.bytes_since_last + bytes - 1_048_576;
-            self.bytes_since_last = self.bytes_since_last + bytes - 65536;
+        if self.bytes_since_last + bytes >= 1_048_576 {
+            self.bytes_since_last = self.bytes_since_last + bytes - 1_048_576;
             self.should_save = true;
             return;
         }
@@ -241,20 +239,11 @@ impl ZipDownloader {
                     Ok((bytes_in, bytes_out)) => {
                         bytes_downloaded = bytes_in;
 
-                        let current_size = match tokio::fs::metadata(&file_path).await {
-                            Ok(metadata) => metadata.len(),
-                            Err(_) => 0,
-                        };
-                        let new_size = current_size.saturating_sub(bytes_out);
-                        info!("New size for {} is {}", entry.name(), new_size);
-
                         let file = decoder.get_mut().get_mut();
-                        file.seek(SeekFrom::Start(0)).await?;
-                        file.set_len(new_size).await?;
+                        file.set_len(bytes_out).await?;
                     }
                     Err(err) => {
                         let file = decoder.get_mut().get_mut();
-                        file.seek(SeekFrom::Start(0)).await?;
                         file.set_len(0).await?;
                         debug!("Failed to restore state for {}: {:?}", entry.name(), err);
                     }

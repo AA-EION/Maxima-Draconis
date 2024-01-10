@@ -137,6 +137,9 @@ pub fn restore_zlib_state(buf: &mut Bytes, stream: &mut mz_stream) {
             );
         }
     }
+    unsafe {
+        (*state).strm = &mut *stream;
+    }
 
     if !state_ref.window.is_null() {
         let window_size = 1 << state_ref.wbits;
