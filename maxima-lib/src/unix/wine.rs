@@ -12,9 +12,7 @@ use xz2::read::XzDecoder;
 use crate::util::{native::maxima_dir, github::{fetch_github_release, github_download_asset, fetch_github_releases, GithubRelease}};
 
 lazy_static! {
-    static ref DXVK_PATTERN: Regex = Regex::new(r"dxvk-(.*)\.tar\.gz").unwrap();
-    static ref VKD3D_PATTERN: Regex = Regex::new(r"vkd3d-proton-(.*)\.tar\.zst").unwrap();
-    static ref PROTON_PATTERN: Regex = Regex::new(r"wine-lutris-GE-Proton.*\.tar\.xz").unwrap();
+    static ref UMU_PATTERN: Regex = Regex::new(r"wine-lutris-GE-Proton.*\.tar\.xz").unwrap();
 }
 
 const VERSION_FILE: &str = "dependency-versions.toml";
@@ -49,52 +47,21 @@ fn set_versions(versions: Versions) -> Result<()> {
 pub fn check_wine_validity() -> Result<bool> {
     let version = versions()?.wine;
 
-    let release = get_wine_release();
+    let release = get_umu_release();
     if release.is_err() {
         if !version.is_empty() {
-            warn!("Failed to check wine release, rate limited?");
+            warn!("Failed to check umu-launcher release, rate limited?");
             return Ok(true);
         }
 
-        bail!("Failed to check wine release: {}", release.err().unwrap());
+        bail!("Failed to check umu-launcher release: {}", release.err().unwrap());
     }
 
     Ok(version == release.unwrap().tag_name)
 }
 
-pub fn check_dxvk_validity() -> Result<bool> {
-    let version = versions()?.dxvk;
-
-    let release = fetch_github_release("doitsujin", "dxvk", "latest");
-    if release.is_err() {
-        if !version.is_empty() {
-            warn!("Failed to check dxvk release, rate limited?");
-            return Ok(true);
-        }
-
-        bail!("Failed to check dxvk release: {}", release.err().unwrap());
-    }
-    Ok(version == release.unwrap().tag_name)
-}
-
-pub fn check_vkd3d_validity() -> Result<bool> {
-    let version = versions()?.vkd3d;
-
-    let release = fetch_github_release("HansKristian-Work", "vkd3d-proton", "latest");
-    if release.is_err() {
-        if !version.is_empty() {
-            warn!("Failed to check vkd3d release, rate limited?");
-            return Ok(true);
-        }
-
-        bail!("Failed to check vkd3d release: {}", release.err().unwrap());
-    }
-
-    Ok(version == release.unwrap().tag_name)
-}
-
-fn get_wine_release() -> Result<GithubRelease> {
-    let releases = fetch_github_releases("GloriousEggroll", "wine-ge-custom")?;
+fn get_umu_release() -> Result<GithubRelease> {
+    let releases = fetch_github_releases("Open-Wine-Components", "umu-launcher")?;
 
     let mut release = None;
     for r in releases {
@@ -107,37 +74,25 @@ fn get_wine_release() -> Result<GithubRelease> {
     }
 
     if release.is_none() {
-        bail!("Couldn't find suitable wine release");
+        bail!("Couldn't find suitable umu-launcher release");
     }
 
     Ok(release.unwrap())
 }
 
-pub fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
-    program: &str,
+pub fn umu_run<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     arg: T,
     args: Option<I>,
     want_output: bool,
 ) -> Result<String> {
-    let path = maxima_dir()?.join(format!("wine/bin/{}", program));
+    let path = maxima_dir()?.join("umu-launcher/bin/umu-run");
 
     // Create command with all necessary wine env variables
     let mut binding = Command::new(path);
     let mut child = binding
         .env("WINEPREFIX", wine_prefix_dir()?)
-        .env("WINEDLLOVERRIDES", "CryptBase,bcrypt,dxgi,d3d11,d3d12,d3d12core=n,b;winemenubuilder.exe=d") // Disable winemenubuilder so it doesnt mess with file associations
-        .env("WINEDLLPATH", format!("{}:{}", maxima_dir()?.join("wine/lib64/wine").display(), maxima_dir()?.join("wine/lib/wine").display()))
-
-        // These should probably be settings for the user to enable/disable
-        .env("WINE_FULLSCREEN_FSR", "0")
-        .env("WINEESYNC", "1")
-        .env("WINEFSYNC", "1")
-        .env("WINEDEBUG", "fixme-all")
-
-        .env("LD_PRELOAD", "") // Fixes some log errors for some games
-        .env("LD_LIBRARY_PATH", format!("{}:{}", maxima_dir()?.join("wine/lib64").display(), maxima_dir()?.join("wine/lib").display()))
-        .env("GST_PLUGIN_SYSTEM_PATH_1_0", format!("{}:{}", maxima_dir()?.join("wine/lib64/gstreamer-1.0").display(), maxima_dir()?.join("wine/lib/gstreamer-1.0").display()))
-
+        .env("GAMEID", "umu-0") // TODO: proper ids
+        .env("STORE", "ea")
         .arg(arg);
 
     if let Some(arguments) = args {
@@ -153,16 +108,6 @@ pub fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         status = output.status;
     } else {
         status = child.spawn()?.wait()?;
-        
-        // Start wineserver to wait for the process to exit
-        // Disabled because this is causing hangs
-
-        // let wine_server_path = maxima_dir()?.join("wine/bin/wineserver");
-        // let mut wine_server_binding = Command::new(wine_server_path);
-        // let wine_server = wine_server_binding
-        //     .env("WINEPREFIX", wine_prefix_dir()?)
-        //     .arg("--wait");
-        // wine_server.spawn()?.wait()?;
     };
 
     if !status.success() {
@@ -172,11 +117,33 @@ pub fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     Ok(output_str.to_string())
 }
 
-pub async fn install_wine() -> Result<()> {
-    let release = get_wine_release()?;
-    let asset = release.assets.iter().find(|x| PROTON_PATTERN.captures(&x.name).is_some());
+pub async fn install_umu() -> Result<()> {
+    let release = get_umu_release()?;
+    let asset = release.assets.iter().find(|x| UMU_PATTERN.captures(&x.name).is_some());
     if asset.is_none() {
-        bail!("Failed to find proton asset! the name pattern might be outdated, please make an issue at https://github.com/ArmchairDevelopers/Maxima/issues.");
+        // TODO: umu-launcher doesnt have a release yet, so we are going to compile and install it
+        // bail!("Failed to find umu-launcher asset! the name pattern might be outdated, please make an issue at https://github.com/ArmchairDevelopers/Maxima/issues.");
+
+        let dir = maxima_dir()?.join("downloads");
+        create_dir_all(&dir)?;
+
+        let umu_dir = dir.join("umu-launcher");
+
+        let umu_install_dir = maxima_dir()?.join("umu-launcher");
+
+        // clone git repo
+        Command::new("git").current_dir(&dir).arg("clone").arg("https://github.com/Open-Wine-Components/umu-launcher.git").spawn()?.wait()?;
+
+        // init submodule
+        Command::new("git").current_dir(&umu_dir).arg("submodule").arg("update").arg("--init").arg("--recursive").spawn()?.wait()?;
+
+        // configure
+        Command::new(umu_dir.join("configure.sh")).current_dir(&umu_dir).arg(format!("--prefix={}", umu_install_dir.display())).spawn()?.wait()?;
+
+        // make install
+        Command::new("make").current_dir(&umu_dir).arg(format!("PREFIX={}", umu_install_dir.display())).arg("install").spawn()?.wait()?;
+
+        return Ok(())
     }
 
     let asset = asset.unwrap();
@@ -186,21 +153,19 @@ pub async fn install_wine() -> Result<()> {
 
     let path = dir.join(&asset.name);
     github_download_asset(asset, &path)?;
-    extract_wine(&path)?;
+    extract_umu(&path)?;
 
     let mut versions = versions()?;
     versions.wine = release.tag_name;
     set_versions(versions)?;
 
-    run_wine_command("wine", "wineboot", Some(vec![" --init"]), false)?;
-
     Ok(())
 }
 
-fn extract_wine(archive_path: &PathBuf) -> Result<()> {
-    info!("Extracting wine...");
+fn extract_umu(archive_path: &PathBuf) -> Result<()> {
+    info!("Extracting umu-launcher...");
 
-    let dir = maxima_dir()?.join("wine");
+    let dir = maxima_dir()?.join("umu-launcher");
     if dir.exists() {
         remove_dir_all(&dir)?;
     }
@@ -226,103 +191,9 @@ fn extract_wine(archive_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn add_dll_override(dll_name: &str) -> Result<()> {
-    run_wine_command("wine", "reg", Some(vec!["add", "HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides", "/v", dll_name,  "/d", "native,builtin", "/f"]), false)?;
-
-    Ok(())
-}
-
-pub async fn wine_install_dxvk() -> Result<()> {
-    let release = fetch_github_release("doitsujin", "dxvk", "latest")?;
-    let asset = release.assets.iter().find(|x| DXVK_PATTERN.captures(&x.name).is_some());
-    if asset.is_none() {
-        bail!("Failed to find DXVK asset! the name pattern might be outdated, please make an issue at https://github.com/ArmchairDevelopers/Maxima/issues.");
-    }
-
-    let asset = asset.unwrap();
-
-    let dir = maxima_dir()?.join("downloads");
-    create_dir_all(&dir)?;
-
-    let path = dir.join(&asset.name);
-    github_download_asset(asset, &path)?;
-
-    let version = DXVK_PATTERN.captures(&asset.name).unwrap().get(1).unwrap().as_str();
-    extract_dynamic_archive(GzDecoder::new(File::open(path)?), "dxvk", version)?;
-
-    let mut versions = versions()?;
-    versions.dxvk = release.tag_name;
-    set_versions(versions)?;
-
-    add_dll_override("d3d10core")?;
-    add_dll_override("d3d11")?;
-    add_dll_override("d3d9")?;
-    add_dll_override("dxgi")?;
-
-    Ok(())
-}
-
-pub async fn wine_install_vkd3d() -> Result<()> {
-    let release = fetch_github_release("HansKristian-Work", "vkd3d-proton", "latest")?;
-    let asset = release.assets.iter().find(|x| VKD3D_PATTERN.captures(&x.name).is_some());
-    if asset.is_none() {
-        bail!("Failed to find VKD3D asset! the name pattern might be outdated, please make an issue at https://github.com/ArmchairDevelopers/Maxima/issues.");
-    }
-
-    let dir = maxima_dir()?.join("downloads");
-    create_dir_all(&dir)?;
-
-    let asset = &release.assets[0];
-    let path = dir.join(&asset.name);
-    github_download_asset(asset, &path)?;
-
-    let version = VKD3D_PATTERN.captures(&asset.name).unwrap().get(1).unwrap().as_str();
-    extract_dynamic_archive(zstd::Decoder::new(File::open(path)?)?, "vkd3d-proton", version)?;
-
-    let mut versions = versions()?;
-    versions.vkd3d = release.tag_name;
-    set_versions(versions)?;
-
-    add_dll_override("d3d12core")?;
-    add_dll_override("d3d12")?;
-
-    Ok(())
-}
-
-fn extract_dynamic_archive<R>(reader: R, label: &str, version: &str) -> Result<()>
-    where R: Read,
-{
-    let windows_dir = wine_prefix_dir()?.join("drive_c/windows");
-    let strip_prefix = format!("{}-{}/", label, version);
-
-    let mut archive = Archive::new(reader);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?;
-        
-        let destination_path: PathBuf;
-        if entry_path.starts_with(strip_prefix.clone() + "x64/") {
-            destination_path = windows_dir.join("system32").join(entry_path.strip_prefix(strip_prefix.clone() + "x64/")?);
-        } else if entry_path.starts_with(strip_prefix.clone() + "x32/") {
-            destination_path = windows_dir.join("syswow64").join(entry_path.strip_prefix(strip_prefix.clone() + "x32/")?);
-        } else {
-            continue;
-        }
-
-        if let Some(parent_dir) = destination_path.parent() {
-            create_dir_all(parent_dir)?;
-        }
-
-        entry.unpack(destination_path)?;
-    }
-
-    Ok(())
-}
-
-pub fn setup_wine_registry() -> Result<()> {
-    run_wine_command("wine", "reg", Some(vec!["add", "HKLM\\Software\\Electronic Arts\\EA Desktop", "/v", "InstallSuccessful",  "/d", "true", "/f", "/reg:64"]), false)?;
-    run_wine_command("wine", "reg", Some(vec!["add", "HKLM\\Software\\Origin", "/v", "ClientPath",  "/d", "C:/Windows/System32/conhost.exe", "/f", "/reg:32"]), false)?;
-
+pub fn setup_proton_fixes() -> Result<()> {
+    // TODO: probably best to add this to https://github.com/Open-Wine-Components/umu-protonfixes
+    // util.regedit_add('HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\EA Desktop', 'InstallSuccessful', 'REG_SZ', 'true', True)
+    // util.regedit_add('HKEY_LOCAL_MACHINE\\Software\\Origin', 'ClientPath', 'REG_SZ', 'C:/Windows/System32/conhost.exe')
     Ok(())
 }

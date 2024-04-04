@@ -276,27 +276,18 @@ pub async fn start_game(
 #[cfg(unix)]
 pub async fn linux_setup() -> Result<()> {
     use crate::unix::wine::{
-        check_dxvk_validity, check_vkd3d_validity, check_wine_validity, install_wine,
-        setup_wine_registry, wine_install_dxvk, wine_install_vkd3d,
+        check_wine_validity, install_umu, setup_proton_fixes
     };
 
-    info!("Verifying wine dependencies...");
+    info!("Verifying umu-launcher dependencies...");
 
     let skip = std::env::var("MAXIMA_DISABLE_WINE_VERIFICATION").is_ok();
 
     if !skip && !check_wine_validity()? {
-        install_wine().await?;
+        install_umu().await?;
     }
 
-    setup_wine_registry()?;
-
-    if !skip && !check_dxvk_validity()? {
-        wine_install_dxvk().await?;
-    }
-
-    if !skip && !check_vkd3d_validity()? {
-        wine_install_vkd3d().await?;
-    }
+    setup_proton_fixes()?;
 
     Ok(())
 }
