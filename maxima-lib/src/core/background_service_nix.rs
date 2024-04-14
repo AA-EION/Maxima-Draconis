@@ -5,7 +5,7 @@ use log::debug;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::{unix::wine::umu_run, util::native::module_path};
+use crate::{unix::wine::umu_run, unix::wine::run_wine_command, util::native::module_path};
 
 lazy_static! {
     static ref PID_PATTERN: Regex = Regex::new(r"wine-helper: PID (.*)").unwrap();
@@ -32,7 +32,7 @@ pub fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32> {
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&launch_args).unwrap());
-    /*let output = run_wine_command(
+    let output = run_wine_command(
         "wine",
         module_path()
             .parent()
@@ -44,12 +44,12 @@ pub fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32> {
         true,
     )?;
 
-    if output.contains("Failed to find PID") {*/
+    if output.contains("Failed to find PID") {
         bail!("Failed to find PID");
-    //}
+    }
 
-    //let pid = PID_PATTERN.captures(&output).unwrap().get(1).unwrap().as_str();
-    //Ok(pid.parse()?)
+    let pid = PID_PATTERN.captures(&output).unwrap().get(1).unwrap().as_str();
+    Ok(pid.parse()?)
 }
 
 pub async fn request_library_injection(pid: u32, path: &str) -> Result<()> {
@@ -61,7 +61,7 @@ pub async fn request_library_injection(pid: u32, path: &str) -> Result<()> {
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&launch_args).unwrap());
-    /*run_wine_command(
+    run_wine_command(
         "wine",
         module_path()
             .parent()
@@ -71,7 +71,7 @@ pub async fn request_library_injection(pid: u32, path: &str) -> Result<()> {
             .unwrap(),
         Some(vec!["inject", b64.as_str()]),
         false,
-    )?;*/
+    )?;
 
     Ok(())
 }

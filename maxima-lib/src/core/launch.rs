@@ -276,7 +276,7 @@ pub async fn start_game(
 #[cfg(unix)]
 pub async fn linux_setup() -> Result<()> {
     use crate::unix::wine::{
-        check_wine_validity, install_umu, setup_proton_fixes
+        check_wine_validity, install_umu, setup_wine_registry
     };
 
     info!("Verifying umu-launcher dependencies...");
@@ -287,7 +287,7 @@ pub async fn linux_setup() -> Result<()> {
         install_umu().await?;
     }
 
-    setup_proton_fixes()?;
+    setup_wine_registry()?;
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, fs::{create_dir_all, File, self, remove_dir_all}, io::Read, process::{Command, Stdio, ExitStatus}, ffi::OsStr};
+use std::{path::PathBuf, fs::{create_dir_all, File, self, remove_dir_all}, io::Read, process::{Command, Stdio, ExitStatus}, ffi::OsStr, env};
 
 use anyhow::{Result, bail};
 use flate2::read::GzDecoder;
@@ -80,6 +80,20 @@ fn get_umu_release() -> Result<GithubRelease> {
     Ok(release.unwrap())
 }
 
+pub fn umu_dir() -> Result<PathBuf> {
+    let home = if let Ok(home) = env::var("XDG_DATA_HOME") {
+        home
+    } else if let Ok(home) = env::var("HOME") {
+        format!("{}/.local/share/Steam/compatibilitytools.d", home)
+    } else {
+        bail!("You don't have a HOME environment variable set");
+    };
+
+    let path = PathBuf::from(format!("{}/UMU-Latest", home));
+    create_dir_all(&path)?;
+    Ok(path)
+}
+
 pub fn umu_run<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     arg: T,
     args: Option<I>,
@@ -93,6 +107,43 @@ pub fn umu_run<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .env("WINEPREFIX", wine_prefix_dir()?)
         .env("GAMEID", "umu-0") // TODO: proper ids
         .env("STORE", "ea")
+        .arg(arg);
+
+    if let Some(arguments) = args {
+        child = child.args(arguments);
+    }
+
+    let status: ExitStatus;
+    let mut output_str = String::new();
+
+    if want_output {
+        let output = child.stdout(Stdio::piped()).spawn()?.wait_with_output()?;
+        output_str = String::from_utf8_lossy(&output.stdout).to_string();
+        status = output.status;
+    } else {
+        status = child.spawn()?.wait()?;
+    };
+
+    if !status.success() {
+        bail!("{}", status.code().unwrap());
+    }
+
+    Ok(output_str.to_string())
+}
+
+pub fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
+    program: &str,
+    arg: T,
+    args: Option<I>,
+    want_output: bool,
+) -> Result<String> {
+    let path = umu_dir()?.join("files/bin/wine");
+
+    // Create command with all necessary wine env variables
+    let mut binding = Command::new(path);
+    let mut child = binding
+        .env("WINEPREFIX", wine_prefix_dir()?)
+        .env("WINEESYNC", "1")
         .arg(arg);
 
     if let Some(arguments) = args {
@@ -191,9 +242,13 @@ fn extract_umu(archive_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn setup_proton_fixes() -> Result<()> {
+pub fn setup_wine_registry() -> Result<()> {
     // TODO: probably best to add this to https://github.com/Open-Wine-Components/umu-protonfixes
     // util.regedit_add('HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\EA Desktop', 'InstallSuccessful', 'REG_SZ', 'true', True)
     // util.regedit_add('HKEY_LOCAL_MACHINE\\Software\\Origin', 'ClientPath', 'REG_SZ', 'C:/Windows/System32/conhost.exe')
+
+    run_wine_command("wine", "reg", Some(vec!["add", "HKLM\\Software\\Electronic Arts\\EA Desktop", "/v", "InstallSuccessful",  "/d", "true", "/f", "/reg:64"]), false)?;
+    run_wine_command("wine", "reg", Some(vec!["add", "HKLM\\Software\\Origin", "/v", "ClientPath",  "/d", "C:/Windows/System32/conhost.exe", "/f", "/reg:32"]), false)?;
+
     Ok(())
 }
