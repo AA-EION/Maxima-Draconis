@@ -47,7 +47,7 @@ jobs:
       id: install-depends
       if: runner.os == 'Linux'
       run: |
-        sudo apt-get install -y musl-tools
+        sudo apt-get install -y libssl-dev musl-tools
         rustup target add x86_64-unknown-linux-musl
 
     - uses: Swatinem/rust-cache@v2
@@ -56,41 +56,10 @@ jobs:
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/master' }}
 
-    - name: Cache OpenSSL
-      id: cache-openssl
-      if: runner.os == 'Windows'
-      uses: actions/cache@v3
-      with:
-        path: |
-          ${{ github.workspace }}\vcpkg\installed\x64-windows-static-md
-        key: ${{ runner.os }}-vcpkg-openssl
-
-    - name: Clone vcpkg and compile OpenSSL
-      if: runner.os == 'Windows' && steps.cache-openssl.outputs.cache-hit != 'true'
-      run: |
-        git clone https://github.com/microsoft/vcpkg.git
-        cd vcpkg
-        [Environment]::SetEnvironmentVariable("VCPKG_DEFAULT_BINARY_CACHE", "${{ github.workspace }}/vcpkg/cache/", "User")
-        .\bootstrap-vcpkg.bat
-        .\vcpkg install openssl:x64-windows-static-md
-
-    - name: Save OpenSSL Cache
-      id: cache-openssl-save
-      if: runner.os == 'Windows'
-      uses: actions/cache/save@v3
-      with:
-        path: |
-          ${{ github.workspace }}\vcpkg\installed\x64-windows-static-md
-        key: ${{ runner.os }}-vcpkg-openssl
-
     - name: Build Maxima
       if: runner.os == 'Windows'
       run: |
         cargo build --release
-      env:
-        VCPKGRS_DYNAMIC: "0"
-        OPENSSL_DIR: ${{ github.workspace }}\vcpkg\installed\x64-windows-static-md
-        OPENSSL_STATIC: "1"
 
     - name: Build Maxima
       if: runner.os == 'Linux'

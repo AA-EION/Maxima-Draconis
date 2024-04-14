@@ -56,9 +56,11 @@ async-trait = "0.1.77"
 tokio-rustls = "0.23.1"
 rustls = "0.20.0"
 webpki-roots = "0.22.0"
+aes = "0.8.4"
+ecb = { version = "0.1.2", features = ["std"] }
+cbc = { version = "0.1.2", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
-openssl = "0.10.55"
 winapi = { version = "0.3.9", features = [
     "memoryapi",
     "handleapi",
@@ -79,9 +81,6 @@ is_elevated = "0.1.2"
 widestring = "1.0.2"
 dll-syringe = "0.15.2"
 wmi = "0.13.1"
-
-[target.'cfg(unix)'.dependencies]
-openssl = { version = "0.10.55", features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 smbios-lib = "0.9.1"

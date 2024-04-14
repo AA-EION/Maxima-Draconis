@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose, Engine};
 use derive_getters::Getters;
 use log::info;
-use std::{env, fmt::Display, path::PathBuf, sync::Arc, vec::Vec};
+use std::{env, fmt::Display, path::PathBuf, sync::Arc};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
@@ -157,7 +157,7 @@ pub async fn start_game(
     // Need to move this into Maxima and have a "current game" system
     let path = if game_path_override.is_some() {
         PathBuf::from(game_path_override.as_ref().unwrap())
-    } else if online_offline {
+    } else if !online_offline {
         // https://youtu.be/TGfQu0bQTKc?t=506
         let software = offer
             .as_ref()

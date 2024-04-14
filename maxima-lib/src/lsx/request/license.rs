@@ -2,10 +2,13 @@ use anyhow::{bail, Result};
 use log::info;
 
 use crate::{
-    core::launch::LaunchMode, lsx::{
+    core::launch::LaunchMode,
+    lsx::{
         connection::LockedConnectionState,
         types::{LSXRequestLicense, LSXRequestLicenseResponse, LSXResponseType},
-    }, make_lsx_handler_response, ooa::{request_license, LicenseAuth}
+    },
+    make_lsx_handler_response,
+    ooa::{request_license, LicenseAuth},
 };
 
 pub async fn handle_license_request(
@@ -23,14 +26,12 @@ pub async fn handle_license_request(
 
     let auth = match mode {
         LaunchMode::Offline(_) => {
-            return make_lsx_handler_response!(Response, RequestLicenseResponse, { attr_License: todo!() });
-        },
-        LaunchMode::Online(_) => {
-            LicenseAuth::AccessToken(maxima.access_token().await?)
-        },
+            return make_lsx_handler_response!(Response, RequestLicenseResponse, { attr_License: String::new() });
+        }
+        LaunchMode::Online(_) => LicenseAuth::AccessToken(maxima.access_token().await?),
         LaunchMode::OnlineOffline(_, persona, password) => {
             LicenseAuth::Direct(persona.to_owned(), password.to_owned())
-        },
+        }
     };
 
     let license = request_license(

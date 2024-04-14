@@ -1,29 +1,36 @@
 use std::{io::Write, num::Wrapping, str};
 
+use aes::cipher::{
+    block_padding::Pkcs7,
+    generic_array::GenericArray,
+    BlockDecryptMut, BlockEncryptMut, KeyInit, KeyIvInit,
+};
 use chrono::Datelike;
-use openssl::symm::{decrypt, encrypt, Cipher};
 
 const CRYPTO_KEY: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+type Aes128EcbEnc = ecb::Encryptor<aes::Aes128>;
+type Aes128EcbDec = ecb::Decryptor<aes::Aes128>;
 
 const PRIME_10K: u32 = 104729;
 const PRIME_20K: u32 = 224737;
 const PRIME_30K: u32 = 350377;
 
-pub fn simple_decrypt_cipher(cipher: Cipher, data: &[u8], key: &[u8; 16]) -> String {
-    let data = get_array(str::from_utf8(data).unwrap());
-    let decrypted_data = decrypt(cipher, key, Some(&[0; 16]), &data).unwrap();
-    String::from_utf8(decrypted_data).unwrap()
-}
-
 pub fn simple_decrypt(data: &[u8], key: &[u8; 16]) -> String {
-    let cipher = Cipher::aes_128_ecb();
-    simple_decrypt_cipher(cipher, data, key)
+    let data = get_array(str::from_utf8(data).unwrap());
+
+    let key = GenericArray::from_slice(key);
+    let result = Aes128EcbDec::new(key)
+        .decrypt_padded_vec_mut::<Pkcs7>(&data)
+        .unwrap();
+
+    String::from_utf8(result).unwrap()
 }
 
 pub fn simple_encrypt(data: &[u8], key: &[u8; 16]) -> String {
-    let cipher = Cipher::aes_128_ecb();
-    let encrypted_data = encrypt(cipher, key, None, data).unwrap();
-    hex::encode(encrypted_data)
+    let key = GenericArray::from_slice(key);
+    let res = Aes128EcbEnc::new(key).encrypt_padded_vec_mut::<Pkcs7>(data);
+    hex::encode(res)
 }
 
 pub fn check_challenge_response(response: &str, challenge: &str) -> bool {

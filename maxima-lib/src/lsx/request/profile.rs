@@ -86,21 +86,14 @@ pub async fn handle_set_presence_request(
         return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
     }
 
-    let offer_id = playing
-        .offer()
-        .as_ref()
-        .unwrap()
-        .offer_id
-        .to_owned();
+    let offer_id = playing.offer().as_ref().unwrap().offer_id.to_owned();
 
-    maxima
-        .rtm()
-        .set_presence(
-            BasicPresence::Online,
-            &request.attr_RichPresence.unwrap(),
-            &offer_id,
-        )
-        .await?;
+    if let Some(presence) = request.attr_RichPresence {
+        maxima
+            .rtm()
+            .set_presence(BasicPresence::Online, &presence, &offer_id)
+            .await?;
+    }
 
     make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() })
 }

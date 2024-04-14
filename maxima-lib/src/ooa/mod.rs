@@ -4,20 +4,26 @@ use std::{
     path::PathBuf,
 };
 
+use aes::cipher::{
+    block_padding::Pkcs7, generic_array::GenericArray, BlockDecryptMut, BlockEncryptMut, KeyIvInit,
+};
 use anyhow::{bail, Result};
 
 use base64::{engine::general_purpose, Engine};
-use openssl::symm::{decrypt, encrypt, Cipher};
+
+use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use lazy_static::lazy_static;
 
 use crate::core::endpoints::API_PROXY_NOVAFUSION_LICENSES;
 
 pub const OOA_CRYPTO_KEY: [u8; 16] = [
     65, 50, 114, 45, 208, 130, 239, 176, 220, 100, 87, 197, 118, 104, 202, 9,
 ];
+
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 lazy_static! {
     static ref EMAIL_PATTERN: Regex = Regex::new(
@@ -123,7 +129,7 @@ pub async fn request_license(
             }
 
             query.push(("ea_password", password));
-        },
+        }
     }
 
     if request_token.is_some() {
@@ -147,15 +153,26 @@ pub async fn request_license(
 
     let mut license = decrypt_license(body.as_slice())?;
     license.signature = signature.to_str()?.to_owned();
-
     Ok(license)
 }
 
 pub fn decrypt_license(data: &[u8]) -> Result<License> {
-    let cipher = Cipher::aes_128_cbc();
-    let decrypted_data = decrypt(cipher, &OOA_CRYPTO_KEY, Some(&[0; 16]), data)?;
-    let data = String::from_utf8(decrypted_data)?;
-    Ok(quick_xml::de::from_str(data.as_str())?)
+    let key = GenericArray::from_slice(&OOA_CRYPTO_KEY);
+    let iv = GenericArray::from_slice(&[0u8; 16]);
+    let cipher = Aes128CbcDec::new(key, iv);
+
+    let decrypted_data = cipher.decrypt_padded_vec_mut::<Pkcs7>(data)?;
+    let data_str = String::from_utf8(decrypted_data)?;
+
+    Ok(quick_xml::de::from_str(&data_str)?)
+}
+
+pub fn encrypt_license(data: &str) -> Result<Vec<u8>> {
+    let key = GenericArray::from_slice(&OOA_CRYPTO_KEY);
+    let iv = GenericArray::from_slice(&[0u8; 16]);
+    
+    let cipher = Aes128CbcEnc::new(key, iv);
+    Ok(cipher.encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes()))
 }
 
 pub fn save_license(license: &License, state: OOAState, path: PathBuf) -> Result<()> {
@@ -166,8 +183,7 @@ pub fn save_license(license: &License, state: OOAState, path: PathBuf) -> Result
         data.remove_matches("<GameToken/>");
     }
 
-    let cipher = Cipher::aes_128_cbc();
-    let encrypted_data = encrypt(cipher, &OOA_CRYPTO_KEY, Some(&[0; 16]), data.as_bytes())?;
+    let encrypted_data = encrypt_license(&data)?;
 
     let mut signature = license.signature.as_bytes().to_vec();
     if state == OOAState::SignatureDecoded {

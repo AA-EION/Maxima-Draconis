@@ -56,7 +56,7 @@ use self::{
     library::GameLibrary,
     locale::Locale,
     service_layer::{
-        ServiceAvatarList, ServiceAvatarListBuilder, ServiceFriends, ServiceGameProductType,
+        ServiceAvatarListBuilder, ServiceFriends, ServiceGameProductType,
         ServiceGetBasicPlayerRequestBuilder, ServiceGetMyFriendsRequestBuilder,
         ServiceGetPreloadedOwnedGamesRequestBuilder, ServiceGetUserPlayerRequest, ServiceImage,
         ServiceImageBuilder, ServiceLayerClient, ServicePlatform, ServicePlayer,
@@ -187,7 +187,12 @@ impl Maxima {
     }
 
     pub fn new() -> Result<LockedMaxima> {
-        Maxima::new_with_options(MaximaOptionsBuilder::default().build()?)
+        Maxima::new_with_options(
+            MaximaOptionsBuilder::default()
+                .load_auth_storage(true)
+                .dummy_local_user(false)
+                .build()?,
+        )
     }
 
     pub async fn start_lsx(&self, maxima: LockedMaxima) -> Result<()> {
@@ -418,5 +423,12 @@ impl Maxima {
         }
 
         self.playing = None;
+    }
+
+    /// Returns whether this Maxima instance was constructed with a dummy
+    /// user. This is usually paired with not loading/interacting with auth
+    /// storage.
+    pub fn dummy_local_user(&self) -> bool {
+        self.dummy_local_user.is_some()
     }
 }
