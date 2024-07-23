@@ -24,6 +24,7 @@ pub struct UIImage {
 
 #[derive(Clone, PartialEq)]
 pub enum GameImageType {
+    Background,
     Hero,
     Logo,
 }
@@ -58,6 +59,7 @@ impl UIImage {
     ) -> Result<UIImage> {
         let cache_folder = maxima_dir().unwrap().join("cache/ui/images").join(&slug);
         let file_name = match diff {
+            GameImageType::Background => cache_folder.join("background.jpg"),
             GameImageType::Hero => cache_folder.join("hero.jpg"),
             GameImageType::Logo => cache_folder.join("logo.png"),
         };
@@ -81,7 +83,7 @@ impl UIImage {
             download_image(url.unwrap(), &file_name).await?;
         }
 
-        let fs_load = ImageLoader::load_from_fs(&file_name.to_str().unwrap());
+        let fs_load = ImageLoader::load_from_fs(&file_name.to_str().unwrap()).await;
         if fs_load.is_ok() {
             let img = fs_load?;
             Ok(UIImage {
@@ -125,7 +127,7 @@ impl UIImage {
             png_cache
         };
 
-        let fs_load = ImageLoader::load_from_fs(&file_name.to_str().unwrap());
+        let fs_load = ImageLoader::load_from_fs(&file_name.to_str().unwrap()).await;
         if fs_load.is_ok() {
             let img = fs_load?;
             return Ok(UIImage {

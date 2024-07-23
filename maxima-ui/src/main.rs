@@ -1,4 +1,5 @@
 #![feature(slice_pattern)]
+extern crate ffmpeg_next as ffmpeg;
 use anyhow::bail;
 use clap::{arg, command, Parser};
 
@@ -7,6 +8,7 @@ use egui::style::{ScrollStyle, Spacing};
 use egui::Style;
 use log::{error, warn};
 use maxima::core::library::OwnedOffer;
+use renderers::media_player::{Player, State};
 use views::downloads_view::{downloads_view, QueuedDownload};
 use views::undefinied_view::coming_soon_view;
 use std::collections::HashMap;
@@ -83,6 +85,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     init_logger();
+    ffmpeg::init().unwrap();
     let mut args = Args::parse();
 
     if !cfg!(debug_assertions) {
@@ -174,6 +177,8 @@ pub struct GameInstalledModsInfo {}
 pub struct GameUIImages {
     /// YOOOOO
     hero: Arc<UIImage>,
+    hero_bg: Arc<UIImage>,
+    hero_video: Option<String>,
     /// The stylized logo of the game, some games don't have this!
     logo: Option<Arc<UIImage>>,
 }
@@ -308,6 +313,8 @@ pub struct MaximaEguiApp {
     game_view_bg_renderer: Option<GameViewBgRenderer>,
     /// Renderer for the app's background
     app_bg_renderer: Option<AppBgRenderer>,
+    /// Renderer for the app's background videos
+    app_bg_media_player: Option<Player>,
     /// Translations
     locale: TranslationManager, 
     /// If a core thread has crashed and made the UI unstable
@@ -473,6 +480,7 @@ impl MaximaEguiApp {
             modal: None,
             game_view_bg_renderer: GameViewBgRenderer::new(cc),
             app_bg_renderer: AppBgRenderer::new(cc),
+            app_bg_media_player: Some(Player::new(&cc.egui_ctx)),
             locale: TranslationManager::new()
                 .expect("Could not load translation file"),
             critical_bg_thread_crashed: false,
@@ -649,6 +657,7 @@ impl eframe::App for MaximaEguiApp {
                 let has_game_img = self.backend_state == BackendStallState::BingChilling && self.games.len() > 0;
                 let gaming = self.page_view == PageType::Games && has_game_img;
                 let how_game: f32 = ctx.animate_bool(egui::Id::new("MainAppBackgroundGamePageFadeBool"), gaming);
+                
                 if has_game_img
                 {
                     if self.game_sel.is_empty() && self.games.len() > 0 {
@@ -656,17 +665,53 @@ impl eframe::App for MaximaEguiApp {
                             self.game_sel = key.clone()
                         }
                     }
+
                     match &self.games[&self.game_sel].images {
                         GameUIImagesWrapper::Unloaded | GameUIImagesWrapper::Loading => {
                             render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
                         }
                         GameUIImagesWrapper::Available(images) => {
-                            render.draw(ui, fullrect, images.hero.size, images.hero.renderable, how_game);
+                            match &mut self.app_bg_media_player {
+                                Some(player) => {
+                                    if let Some(video) = &images.hero_video {
+                                        match player.state() {
+                                            State::Paused => {
+                                                if gaming {
+                                                    player.unpause();
+                                                }
+                                                render.draw(ui, fullrect, player.size(), player.texture(), how_game);
+                                            }
+                                            State::Playing => {
+                                                if !gaming {
+                                                    player.pause();
+                                                }
+                                                if player.ready_to_show() {
+                                                    render.draw(ui, fullrect, player.size(), player.texture(), how_game);
+                                                } else {
+                                                    render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
+                                                }
+                                            },
+                                            State::EndOfFile | State::Stopped => {
+                                                render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game);
+                                            }
+                                        }
+                                        player.start(&video);
+                                    }
+                                    else {
+                                        player.stop();
+                                        render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game);
+                                    }
+                                },
+                                None => render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game)
+
+                            }
                         }
                     }
+
                 } else {
                     render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
                 }
+                
             }
             let app_rect = ui.available_rect_before_wrap().clone();
             match self.backend_state {

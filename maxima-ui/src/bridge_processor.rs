@@ -84,10 +84,8 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             }
         
                             debug!("setting images for {:?}", game.slug);
-                            game.images = GameUIImagesWrapper::Available(GameUIImages {
-                                hero: response.hero.to_owned(),
-                                logo: response.logo.to_owned(),
-                            });
+                            game.images = GameUIImagesWrapper::Available(response);
+                            break
                         }
                     }
                     bridge_thread::MaximaLibResponse::UserAvatarResponse(res) => {

@@ -9,7 +9,7 @@ use std::{
     }, time::{Duration, SystemTime}
 };
 
-use maxima::{content::manager::{ContentManager, QueuedGameBuilder}, core::{dip::{DiPManifest, DIP_RELATIVE_PATH}, service_layer::ServicePlayer, LockedMaxima, Maxima, MaximaOptionsBuilder}, util::registry::{check_registry_validity, set_up_registry}};
+use maxima::{content::manager::{ContentManager, QueuedGameBuilder}, core::{dip::{DiPManifest, DIP_RELATIVE_PATH}, service_layer::{ServicePlayer, ServiceGameHubCollection}, LockedMaxima, Maxima, MaximaOptionsBuilder}, util::registry::{check_registry_validity, set_up_registry}};
 use crate::{
     bridge::{
         game_details::game_details_request,

@@ -3,18 +3,18 @@ use egui::ColorImage;
 use egui_extras::RetainedImage;
 use image::{io::Reader as ImageReader, DynamicImage};
 use log::{debug, error};
-use std::io::Read;
+use tokio::io::AsyncReadExt;
 
 pub struct ImageLoader {}
 
 impl ImageLoader {
-    pub fn load_from_fs(path: &str) -> Result<egui_extras::RetainedImage> {
+    pub async fn load_from_fs(path: &str) -> Result<egui_extras::RetainedImage> {
         debug!("Loading image {:?}", path);
         let img = ImageReader::open(path);
         if img.is_err() {
             error!("Failed to open \"{}\"!", path);
             // TODO: fix this
-            return Self::load_from_fs("./res/placeholder.png"); // probably a really shitty idea but i don't want to embed the png, or make a system to return pointers to the texture, suffer.
+            return Box::pin(Self::load_from_fs("./res/placeholder.png")).await; // probably a really shitty idea but i don't want to embed the png, or make a system to return pointers to the texture, suffer.
         }
 
         let img_decoded = img?.with_guessed_format();
@@ -23,9 +23,9 @@ impl ImageLoader {
             // this is incredibly fucking stupid
             // i should've never done this, i should've found a proper method to detect things
             // but here we are. if it works, it works, and i sure as hell don't want to fix it.
-            let mut f = std::fs::File::open(path)?;
+            let mut f = tokio::fs::File::open(path).await?;
             let mut buffer = String::new();
-            f.read_to_string(&mut buffer)?;
+            f.read_to_string(&mut buffer).await?;
             let yeah = RetainedImage::from_svg_str(format!("{:?}_Retained_Decoded", path), &buffer);
             if yeah.is_err() {
                 bail!("Failed to read SVG from \"{}\"!", path);
