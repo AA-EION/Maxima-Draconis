@@ -1,22 +1,19 @@
 use anyhow::{Ok, Result};
 use egui::Context;
-use log::{info, warn};
+use log::{error, info, warn};
 
 use std::{
-    panic, path::PathBuf, sync::{
-        mpsc::{Receiver, Sender},
-        Arc,
-    }, time::{Duration, SystemTime}
+    panic, path::PathBuf, sync::mpsc::{Receiver, Sender}, time::{Duration, SystemTime}
 };
 
 use maxima::{content::manager::{ContentManager, QueuedGameBuilder}, core::{dip::{DiPManifest, DIP_RELATIVE_PATH}, service_layer::{ServicePlayer, ServiceGameHubCollection}, LockedMaxima, Maxima, MaximaOptionsBuilder}, util::registry::{check_registry_validity, set_up_registry}};
 use crate::{
     bridge::{
         game_details::game_details_request,
-        game_images::game_images_request, get_friends::get_friends_request,
-        get_games::get_games_request, get_user_avatar::get_user_avatar_request,
+        get_friends::get_friends_request,
+        get_games::get_games_request,
         login_oauth::login_oauth, start_game::start_game_request,
-    }, event_thread::{EventThread, MaximaEventRequest, MaximaEventResponse}, ui_image::UIImage, views::friends_view::UIFriend, GameDetails, GameInfo, GameSettings, GameUIImages
+    }, event_thread::{EventThread, MaximaEventRequest, MaximaEventResponse}, ui_image::UIImageCacheLoaderCommand, views::friends_view::UIFriend, GameDetails, GameInfo, GameSettings
 };
 
 pub struct InteractThreadLoginResponse {
@@ -32,19 +29,9 @@ pub struct InteractThreadFriendListResponse {
     pub friend: UIFriend,
 }
 
-pub struct InteractThreadUserAvatarResponse {
-    pub id: String,
-    pub response: Result<Arc<UIImage>>,
-}
-
 pub struct InteractThreadGameDetailsResponse {
     pub slug: String,
     pub response: Result<GameDetails>,
-}
-
-pub struct InteractThreadGameUIImagesResponse {
-    pub slug: String,
-    pub response: Result<GameUIImages>,
 }
 
 pub struct InteractThreadLocateGameFailure {
@@ -67,8 +54,6 @@ pub enum MaximaLibRequest {
     LoginRequestOauth,
     GetGamesRequest,
     GetFriendsRequest,
-    GetUserAvatarRequest(String, String),
-    GetGameImagesRequest(String),
     GetGameDetailsRequest(String),
     StartGameRequest(GameInfo, Option<GameSettings>),
     InstallGameRequest(String, PathBuf),
@@ -83,9 +68,7 @@ pub enum MaximaLibResponse {
     ServiceStarted,
     GameInfoResponse(InteractThreadGameListResponse),
     FriendInfoResponse(InteractThreadFriendListResponse),
-    UserAvatarResponse(InteractThreadUserAvatarResponse),
     GameDetailsResponse(InteractThreadGameDetailsResponse),
-    GameUIImagesResponse(InteractThreadGameUIImagesResponse),
     LocateGameResponse(InteractThreadLocateGameResponse),
     // Alerts, rather than responses:
     
@@ -120,7 +103,8 @@ impl BridgeThread {
         backend_responder.send(MaximaLibResponse::DownloadQueueUpdate(current, queue)).unwrap();
     }
 
-    pub fn new(ctx: &Context) -> Self {
+    pub fn new(ctx: &Context, remote_provider_channel: Sender<UIImageCacheLoaderCommand>) -> Self {
+        puffin::profile_function!();
         let (backend_commander, backend_cmd_listener) = std::sync::mpsc::channel();
         let (backend_responder, backend_listener) = std::sync::mpsc::channel();
 
@@ -131,7 +115,7 @@ impl BridgeThread {
         tokio::task::spawn(async move {
             let die_fallback_transmittter = backend_responder.clone();
             //panic::set_hook(Box::new( |_| {}));
-            let result = BridgeThread::run(backend_cmd_listener, backend_responder, rtm_cmd_listener, rtm_responder, &context).await;
+            let result = BridgeThread::run(backend_cmd_listener, backend_responder, rtm_cmd_listener, rtm_responder, remote_provider_channel, &context).await;
             if let Err(result) = result {
                 die_fallback_transmittter
                     .send(MaximaLibResponse::InteractionThreadDiedResponse)
@@ -150,6 +134,7 @@ impl BridgeThread {
         backend_responder: Sender<MaximaLibResponse>,
         rtm_cmd_listener: Receiver<MaximaEventRequest>,
         rtm_responder: Sender<MaximaEventResponse>,
+        remote_provider_channel: Sender<UIImageCacheLoaderCommand>,
         ctx: &Context,
     ) -> Result<()> {
         // first things first check registry
@@ -260,9 +245,10 @@ impl BridgeThread {
                 ));
                 backend_responder.send(lmessage)?;
             }
-            
-
-            get_user_avatar_request(backend_responder.clone(), user.id().to_string(), user.player().as_ref().unwrap().avatar().as_ref().unwrap().medium().path().to_string(), &ctx).await?;
+            let res = remote_provider_channel.send(UIImageCacheLoaderCommand::ProvideRemote(crate::ui_image::UIImageType::Avatar(user.id().to_string()), user.player().as_ref().unwrap().avatar().as_ref().unwrap().medium().path().to_string()));
+            if let Err(err) = res {
+                error!("failed to send user pfp to loader: {:?}", err);
+            }
             ctx.request_repaint();
         }
 
@@ -319,40 +305,28 @@ impl BridgeThread {
             }
 
             match request? {
-                MaximaLibRequest::LoginRequestOauth | MaximaLibRequest::StartService => { info!("bro tried to log in twice") }
+                MaximaLibRequest::LoginRequestOauth | MaximaLibRequest::StartService => { error!("bro tried to log in twice") }
                 MaximaLibRequest::GetGamesRequest => {
                     let channel = backend_responder.clone();
+                    let channel1 = remote_provider_channel.clone();
                     let maxima = maxima_arc.clone();
                     let context = ctx.clone();
-                    async move { get_games_request(maxima, channel, &context).await }.await?;
+                    tokio::task::spawn(async move { get_games_request(maxima, channel, channel1, &context).await });
+                    tokio::task::yield_now().await;
                 }
                 MaximaLibRequest::GetFriendsRequest => {
                     let channel = backend_responder.clone();
+                    let channel1 = remote_provider_channel.clone();
                     let maxima = maxima_arc.clone();
                     let context = ctx.clone();
-                    async move { get_friends_request(maxima, channel, &context).await }.await?;
-                }
-                MaximaLibRequest::GetGameImagesRequest(slug) => {
-                    let channel = backend_responder.clone();
-                    let maxima = maxima_arc.clone();
-                    let context = ctx.clone();
-                    async move { game_images_request(maxima, slug, channel, &context).await }
-                        .await?;
-                }
-                MaximaLibRequest::GetUserAvatarRequest(id, url) => {
-                    let channel = backend_responder.clone();
-                    let context = ctx.clone();
-                    async move { get_user_avatar_request(channel, id, url, &context).await }
-                        .await?;
+                    tokio::task::spawn(async move { get_friends_request(maxima, channel, channel1, &context).await });
+                    tokio::task::yield_now().await;
                 }
                 MaximaLibRequest::GetGameDetailsRequest(slug) => {
                     let channel = backend_responder.clone();
                     let maxima = maxima_arc.clone();
                     let context = ctx.clone();
-                    async move {
-                        game_details_request(maxima, slug.clone(), channel, &context).await
-                    }
-                    .await?;
+                    async move { game_details_request(maxima, slug.clone(), channel, &context).await }.await?;
                 }
                 MaximaLibRequest::LocateGameRequest(_, path) => {
                     #[cfg(unix)]
@@ -393,6 +367,7 @@ impl BridgeThread {
                 }
                 MaximaLibRequest::ShutdownRequest => break 'outer Ok(()), //TODO: kill the bridge thread
             }
+            puffin::GlobalProfiler::lock().new_frame();
         }
     }
 }

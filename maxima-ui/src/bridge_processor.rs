@@ -1,7 +1,7 @@
 use log::{debug, error, info, warn};
 use std::sync::mpsc::TryRecvError;
 use crate::{
-    bridge_thread, views::{downloads_view::QueuedDownload, friends_view::UIFriendImageWrapper}, BackendStallState, GameDetails, GameDetailsWrapper, GameUIImages, GameUIImagesWrapper, MaximaEguiApp
+    bridge_thread, views::downloads_view::QueuedDownload, BackendStallState, GameDetails, GameDetailsWrapper, MaximaEguiApp
 };
 
 pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
@@ -69,47 +69,6 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                     }
                     bridge_thread::MaximaLibResponse::FriendInfoResponse(res) => {
                         app.friends.push(res.friend);
-                    }
-                    bridge_thread::MaximaLibResponse::GameUIImagesResponse(res) => {
-                        debug!("Got UIImages back from the interact thread");
-                        if res.response.is_err() {
-                            continue;
-                        }
-        
-                        let response = res.response.unwrap();
-        
-                        for (slug, game) in &mut app.games {
-                            if !slug.eq(&res.slug) {
-                                continue;
-                            }
-        
-                            debug!("setting images for {:?}", game.slug);
-                            game.images = GameUIImagesWrapper::Available(response);
-                            break
-                        }
-                    }
-                    bridge_thread::MaximaLibResponse::UserAvatarResponse(res) => {
-                        
-                        if res.response.is_err() {
-                            error!("{}", res.response.err().expect("").to_string());
-                            continue;
-                        }
-        
-                        let response = res.response.unwrap();
-        
-                        if app.user_id.eq(&res.id) {
-                            app.local_user_pfp = UIFriendImageWrapper::Available(response.clone());
-                            debug!("your own pfp");
-                            continue;
-                        }
-        
-                        for user in &mut app.friends {
-                            if !user.id.eq(&res.id) {
-                                continue;
-                            }
-                            debug!("Got {}'s Avatar back from the interact thread", &user.name);
-                            user.avatar = UIFriendImageWrapper::Available(response.clone());
-                        }
                     }
                     bridge_thread::MaximaLibResponse::InteractionThreadDiedResponse => {
                         error!("interact thread died");

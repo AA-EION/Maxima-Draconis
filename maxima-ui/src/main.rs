@@ -9,14 +9,15 @@ use egui::Style;
 use log::{error, warn};
 use maxima::core::library::OwnedOffer;
 use renderers::media_player::{Player, State};
+use strum_macros::EnumIter;
 use views::downloads_view::{downloads_view, QueuedDownload};
 use views::undefinied_view::coming_soon_view;
 use std::collections::HashMap;
 use std::default::Default;
 use std::path::PathBuf;
 use std::{ops::RangeInclusive, rc::Rc, sync::Arc};
-use ui_image::UIImage;
-use views::friends_view::{UIFriend, UIFriendImageWrapper};
+use ui_image::UIImageCache;
+use views::friends_view::UIFriend;
 
 use eframe::egui_glow;
 use egui::{
@@ -24,17 +25,16 @@ use egui::{
     vec2, Color32, FontData, FontDefinitions, FontFamily, Margin, Rect, Response, Rounding, Stroke,
     TextureId, Ui, Vec2, Visuals,
 };
-use egui_extras::{RetainedImage, Size, StripBuilder};
+use egui_extras::{Size, StripBuilder};
 use egui_glow::glow;
 
 use bridge_thread::{BridgeThread, InteractThreadLocateGameResponse};
 
 use app_bg_renderer::AppBgRenderer;
-use fs::image_loader::ImageLoader;
 use game_view_bg_renderer::GameViewBgRenderer;
 use renderers::app_bg_renderer;
 use renderers::game_view_bg_renderer;
-use translation_manager::TranslationManager;
+use translation_manager::{positional_replace, TranslationManager};
 use views::friends_view::{FriendsViewBar, FriendsViewBarPage, FriendsViewBarStatusFilter};
 
 use maxima::util::{log::init_logger, registry::set_up_registry};
@@ -49,7 +49,6 @@ use views::{
 };
 
 pub mod bridge;
-mod fs;
 pub mod util;
 mod views;
 pub mod widgets;
@@ -173,23 +172,6 @@ pub enum GameInfoTab {
 /// TBD
 pub struct GameInstalledModsInfo {}
 
-#[derive(Clone)]
-pub struct GameUIImages {
-    /// YOOOOO
-    hero: Arc<UIImage>,
-    hero_bg: Arc<UIImage>,
-    hero_video: Option<String>,
-    /// The stylized logo of the game, some games don't have this!
-    logo: Option<Arc<UIImage>>,
-}
-
-#[derive(Clone)]
-pub enum GameUIImagesWrapper {
-    Unloaded,
-    Loading,
-    Available(GameUIImages),
-}
-
 #[derive(PartialEq, Clone)]
 pub struct GameDetails {
     /// Time (in hours/10) you have logged in the game
@@ -238,10 +220,9 @@ pub struct GameInfo {
     offer: String,
     /// Display name of the game
     name: String,
-    /// Art Assets
-    images: GameUIImagesWrapper,
     /// Game info
     details: GameDetailsWrapper,
+    bg_video: Option<String>, // not the best place to put it
     dlc: Vec<OwnedOffer>,
     installed: bool,
     has_cloud_saves: bool,
@@ -289,12 +270,6 @@ pub struct MaximaEguiApp {
     user_name: String,
     /// Logged in user's ID
     user_id: String,
-    /// CEO OF EPIC GAMES (TOTALLY NOT THE SINGLE BIGGEST DRAG ON THE GAMES INDUSTRY)
-    tim_sweeney: Rc<RetainedImage>,
-    /// actual renderable for the user's profile picture //TODO
-    user_pfp_renderable: TextureId,
-    /// Your profile picture
-    local_user_pfp: UIFriendImageWrapper,
     /// games
     games: HashMap<String, GameInfo>,
     /// selected game
@@ -313,6 +288,8 @@ pub struct MaximaEguiApp {
     game_view_bg_renderer: Option<GameViewBgRenderer>,
     /// Renderer for the app's background
     app_bg_renderer: Option<AppBgRenderer>,
+    /// Image cache
+    img_cache: UIImageCache,
     /// Renderer for the app's background videos
     app_bg_media_player: Option<Player>,
     /// Translations
@@ -336,17 +313,27 @@ pub struct MaximaEguiApp {
     settings: FrontendSettings,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, EnumIter)]
+pub enum FrontendLanguage {
+    SystemDefault,
+    EnUS,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FrontendSettings {
     default_install_folder: String,
-    game_settings: HashMap<String, GameSettings>
+    language: FrontendLanguage,
+    game_settings: HashMap<String, GameSettings>,
+    videos: bool,
 }
 
 impl FrontendSettings {
     pub fn new() -> Self {
         Self {
             default_install_folder: String::new(),
+            language: FrontendLanguage::SystemDefault,
             game_settings: HashMap::new(),
+            videos: true,
         }
     }
 }
@@ -446,9 +433,8 @@ impl MaximaEguiApp {
         let settings: FrontendSettings = if let Some(storage) = cc.storage {
             eframe::get_value(storage, "settings").unwrap_or(FrontendSettings::new())
         } else { FrontendSettings::new() };
-        
-        let tim_sweeney =
-            Rc::new(RetainedImage::from_image_bytes("Timothy Dean Sweeney", include_bytes!("../res/usericon_tmp.png")).expect("yeah"));
+
+        let (img_cache, remote_provider_channel) = UIImageCache::new(cc.egui_ctx.clone());
 
         Self {
             args,
@@ -465,9 +451,6 @@ impl MaximaEguiApp {
                 search_buffer: String::new(),
                 friend_sel : String::new(),
             },
-            user_pfp_renderable: (&tim_sweeney).texture_id(&cc.egui_ctx),
-            tim_sweeney,
-            local_user_pfp: UIFriendImageWrapper::Loading,
             user_name: "User".to_owned(),
             user_id: String::new(),
             games: HashMap::new(),
@@ -480,11 +463,13 @@ impl MaximaEguiApp {
             modal: None,
             game_view_bg_renderer: GameViewBgRenderer::new(cc),
             app_bg_renderer: AppBgRenderer::new(cc),
-            app_bg_media_player: Some(Player::new(&cc.egui_ctx)),
-            locale: TranslationManager::new()
-                .expect("Could not load translation file"),
+            img_cache,
+            app_bg_media_player: if settings.videos {
+                Some(Player::new(&cc.egui_ctx))
+            } else { None },
+            locale: TranslationManager::new(&settings.language),
             critical_bg_thread_crashed: false,
-            backend: BridgeThread::new(&cc.egui_ctx), //please don't fucking break
+            backend: BridgeThread::new(&cc.egui_ctx, remote_provider_channel), //please don't fucking break
             backend_state: BackendStallState::Starting,
             playing_game: None,
             installing_now: None,
@@ -665,49 +650,52 @@ impl eframe::App for MaximaEguiApp {
                             self.game_sel = key.clone()
                         }
                     }
+                    let game = &self.games[&self.game_sel];
 
-                    match &self.games[&self.game_sel].images {
-                        GameUIImagesWrapper::Unloaded | GameUIImagesWrapper::Loading => {
-                            render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
-                        }
-                        GameUIImagesWrapper::Available(images) => {
-                            match &mut self.app_bg_media_player {
-                                Some(player) => {
-                                    if let Some(video) = &images.hero_video {
-                                        match player.state() {
-                                            State::Paused => {
-                                                if gaming {
-                                                    player.unpause();
-                                                }
-                                                render.draw(ui, fullrect, player.size(), player.texture(), how_game);
+                    let player_state: Option<(TextureId, Vec2)> = {
+                        match &mut self.app_bg_media_player {
+                            Some(player) => {
+                                if let Some(video) = &game.bg_video {
+                                    player.start(&video);
+                                    match player.state() {
+                                        State::Paused => {
+                                            if gaming {
+                                                player.unpause();
                                             }
-                                            State::Playing => {
-                                                if !gaming {
-                                                    player.pause();
-                                                }
-                                                if player.ready_to_show() {
-                                                    render.draw(ui, fullrect, player.size(), player.texture(), how_game);
-                                                } else {
-                                                    render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
-                                                }
-                                            },
-                                            State::EndOfFile | State::Stopped => {
-                                                render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game);
-                                            }
+                                            Some((player.texture(), player.size()))
                                         }
-                                        player.start(&video);
+                                        State::Playing => {
+                                            if !gaming {
+                                                player.pause();
+                                            }
+                                            if player.ready_to_show() {
+                                                Some((player.texture(), player.size()))
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                        State::EndOfFile | State::Stopped => {
+                                            None
+                                        }
                                     }
-                                    else {
-                                        player.stop();
-                                        render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game);
-                                    }
-                                },
-                                None => render.draw(ui, fullrect, images.hero_bg.size, images.hero_bg.renderable, how_game)
+                                }
+                                else {
+                                    player.stop();
+                                    None
+                                }
+                            },
+                            None => None
 
-                            }
                         }
-                    }
+                    };
 
+                    if let Some((tex, size)) = player_state {
+                        render.draw(ui, fullrect, size, tex, how_game);
+                    } else if let Some(img) = &self.img_cache.get(ui_image::UIImageType::Background(game.slug.clone())) {
+                        render.draw(ui, fullrect, img.size_vec2(), img.id(), how_game);
+                    } else {
+                        render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
+                    }
                 } else {
                     render.draw(ui, fullrect, fullrect.size(), TextureId::Managed(1), 0.0);
                 }
@@ -837,19 +825,12 @@ impl eframe::App for MaximaEguiApp {
                                                 rtl.style_mut().spacing.item_spacing.x = 0.0;
                                                 rtl.allocate_space(vec2(2.0, 2.0));
                                                 rtl.style_mut().spacing.item_spacing.x = APP_MARGIN.x;
-
-                                                let avatar: TextureId = match &self.local_user_pfp {
-                                                    UIFriendImageWrapper::DoNotLoad |
-                                                    UIFriendImageWrapper::Unloaded(_) |
-                                                    UIFriendImageWrapper::Loading => {
-                                                        self.user_pfp_renderable
-                                                    },
-                                                    UIFriendImageWrapper::Available(img) => {
-                                                        img.renderable
-                                                    },
+                                                
+                                                let img_response = if let Some(av) = self.img_cache.get(ui_image::UIImageType::Avatar(self.user_id.clone())) {
+                                                    rtl.image((av.id(), vec2(36.0, 36.0)))
+                                                } else {
+                                                    rtl.image((self.img_cache.placeholder_avatar.id(), vec2(36.0, 36.0)))
                                                 };
-
-                                                let img_response = rtl.image((avatar, vec2(36.0, 36.0)));
                                                 let stroke = Stroke::new(2.0, {
                                                     if self.playing_game.is_some() {
                                                         FRIEND_INGAME_COLOR
@@ -858,16 +839,16 @@ impl eframe::App for MaximaEguiApp {
                                                     }
                                                 });
                                                 rtl.painter().rect(img_response.rect.expand(1.0), Rounding::same(4.0), Color32::TRANSPARENT, stroke);
-                                                
+                                                let point = img_response.rect.left_center() + vec2(-rtl.spacing().item_spacing.x, 2.0);
+
                                                 if let Some(game_slug) = &self.playing_game {
                                                     if let Some(game) = &self.games.get(game_slug) {
-                                                        let point = img_response.rect.left_center() + vec2(-rtl.spacing().item_spacing.x, 2.0);
                                                         let offset = vec2(0.0, 0.5);
                                                         rtl.painter().text(point-offset, Align2::RIGHT_BOTTOM, &self.user_name, FontId::proportional(15.0), Color32::WHITE);
-                                                        rtl.painter().text(point+offset, Align2::RIGHT_TOP, format!("{} {}", &self.locale.localization.friends_view.status.playing, &game.name), FontId::proportional(10.0), Color32::WHITE);
+                                                        rtl.painter().text(point+offset, Align2::RIGHT_TOP, positional_replace!(&self.locale.localization.friends_view.status.presence_basic, "game", &game.name), FontId::proportional(10.0), Color32::WHITE);
                                                     }
                                                 } else {
-                                                    rtl.label(egui::RichText::new(&self.user_name).size(15.0).color(Color32::WHITE));
+                                                    rtl.painter().text(point, Align2::RIGHT_CENTER, &self.user_name, FontId::proportional(15.0), Color32::WHITE);
                                                 }
                                             },
                                         );
@@ -923,9 +904,9 @@ impl eframe::App for MaximaEguiApp {
                                         let game = if let Some(game) = self.games.get_mut(slug) { game } else { break 'outer; };
                                         //let game_settings = game.settings.borrow_mut();
                                         ui.horizontal(|header| {
-                                            header.heading(format!("Game settings for {}", &game.name));
+                                            header.heading(positional_replace!(self.locale.localization.modals.game_settings.header, "game", &game.name));
                                             header.with_layout(Layout::right_to_left(egui::Align::Center), |close_button| {
-                                                if close_button.add_sized(vec2(80.0, 30.0), egui::Button::new("Close")).clicked() {
+                                                if close_button.add_sized(vec2(80.0, 30.0), egui::Button::new(&self.locale.localization.modals.close.to_ascii_uppercase())).clicked() {
                                                     clear = true
                                                 }
                                             });
@@ -933,9 +914,9 @@ impl eframe::App for MaximaEguiApp {
                                         ui.separator();
                                         if game.installed {
                                             if let Some(settings) = self.settings.game_settings.get_mut(&game.slug) {
-                                                ui.add_enabled(/* game.has_cloud_saves */ false, egui::Checkbox::new(&mut settings.cloud_saves, "Cloud Saves"));
+                                                ui.add_enabled(/* game.has_cloud_saves */ false, egui::Checkbox::new(&mut settings.cloud_saves, &self.locale.localization.modals.game_settings.cloud_saves));
                                                 
-                                                ui.label("Launch Arguments:");
+                                                ui.label(&self.locale.localization.modals.game_settings.launch_arguments);
                                                 ui.add_sized(vec2(ui.available_width(), ui.style().spacing.interact_size.y), egui::TextEdit::singleline(&mut settings.launch_args).vertical_align(egui::Align::Center));
 
                                                 ui.separator();
@@ -943,7 +924,7 @@ impl eframe::App for MaximaEguiApp {
 
                                                 let button_size = vec2(100.0, 30.0);
 
-                                                ui.label("Executable Override");
+                                                ui.label(&self.locale.localization.modals.game_settings.executable_override);
                                                 ui.horizontal(|ui| {
                                                     let size = vec2(500.0 - (24.0 + ui.style().spacing.item_spacing.x), 30.0);
                                                     ui.add_sized(size, egui::TextEdit::singleline(&mut settings.exe_override).vertical_align(egui::Align::Center));
@@ -953,18 +934,18 @@ impl eframe::App for MaximaEguiApp {
                                                 ui.separator();
                                             }
 
-                                            ui.button("Uninstall");
+                                            ui.add_enabled(false, egui::Button::new(format!("  {}  ", &self.locale.localization.modals.game_settings.uninstall.to_ascii_uppercase())));
                                         } else {
-                                            ui.label("Game is not installed");
+                                            ui.label(&self.locale.localization.modals.game_settings.not_installed);
                                         }
                                     },
                                     PopupModal::GameInstall(slug) => 'outer: {
                                         let game = if let Some(game) = self.games.get_mut(slug) { game } else { break 'outer; };
                                         ui.horizontal(|header| {
-                                            header.heading(format!("Install {}", &game.name));
+                                            header.heading(positional_replace!(self.locale.localization.modals.game_install.header, "game", &game.name));
                                             header.with_layout(Layout::right_to_left(egui::Align::Center), |close_button| {
                                                 close_button.add_enabled_ui(!self.installer_state.locating, |close_button| {
-                                                    if close_button.add_sized(vec2(80.0, 30.0), egui::Button::new("Close")).clicked() {
+                                                    if close_button.add_sized(vec2(80.0, 30.0), egui::Button::new(&self.locale.localization.modals.close.to_ascii_uppercase())).clicked() {
                                                         clear = true
                                                     }
                                                 });
@@ -980,7 +961,7 @@ impl eframe::App for MaximaEguiApp {
 
                                         let button_size = vec2(100.0, 30.0);
 
-                                        ui.label("Locate an existing game install:");
+                                        ui.label(&self.locale.localization.modals.game_install.locate_installed);
                                         if let Some(resp) = &self.installer_state.locate_response {
                                             match resp {
                                                 InteractThreadLocateGameResponse::Success => {
@@ -989,7 +970,8 @@ impl eframe::App for MaximaEguiApp {
                                                 },
                                                 InteractThreadLocateGameResponse::Error(err) => {
                                                     ui.spacing_mut().item_spacing.x = 0.0;
-                                                    egui::Label::new(egui::RichText::new("Locate Failed.").color(Color32::RED)).ui(ui);
+                                                    
+                                                    egui::Label::new(egui::RichText::new(&self.locale.localization.modals.game_install.locate_failed).color(Color32::RED)).ui(ui);
                                                     ui.horizontal_wrapped(|ui| {
                                                         ui.label("Please report this on ");
                                                         ui.hyperlink_to("GitHub Issues", "https://github.com/ArmchairDevelopers/Maxima/issues/new");
@@ -1012,7 +994,7 @@ impl eframe::App for MaximaEguiApp {
                                                 }
                                             }
                                         } else if self.installer_state.locating {
-                                            ui.heading("Locating...");
+                                            ui.heading(&self.locale.localization.modals.game_install.locate_in_progress);
                                         } else {
                                             ui.horizontal(|ui| {
                                                 let size = vec2(400.0 - (24.0 + ui.style().spacing.item_spacing.x*2.0), 30.0);
@@ -1020,7 +1002,7 @@ impl eframe::App for MaximaEguiApp {
                                                 ui.add_sized(button_size, egui::Button::new("BROWSE"));
                                                 ui.add_enabled_ui(PathBuf::from(&self.installer_state.locate_path).exists(), |ui| {
 
-                                                    if ui.add_sized(button_size, egui::Button::new("LOCATE")).clicked() {
+                                                    if ui.add_sized(button_size, egui::Button::new(&self.locale.localization.modals.game_install.locate_action.to_ascii_uppercase())).clicked() {
                                                         self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::LocateGameRequest(slug.clone(), self.installer_state.locate_path.clone())).unwrap();
                                                         self.installer_state.locating = true;
                                                     }
@@ -1028,7 +1010,7 @@ impl eframe::App for MaximaEguiApp {
                                             });
                                         }
                                         ui.label("");
-                                        ui.label("Install a fresh copy:");
+                                        ui.label(&self.locale.localization.modals.game_install.fresh_download);
                                         ui.add_enabled_ui(!self.installer_state.locating, |ui| {
                                             let size = vec2(500.0 - (24.0 + ui.style().spacing.item_spacing.x*2.0), 30.0);
                                             ui.horizontal(|ui| {
@@ -1040,7 +1022,7 @@ impl eframe::App for MaximaEguiApp {
                                             let path = PathBuf::from(self.installer_state.install_folder.clone());
                                             let valid = path.exists();
                                             ui.add_enabled_ui(valid, |ui| {
-                                                if ui.add_sized(button_size, egui::Button::new("INSTALL")).clicked() {
+                                                if ui.add_sized(button_size, egui::Button::new(&self.locale.localization.modals.game_install.fresh_action)).clicked() {
                                                     if self.installing_now.is_none() {
                                                         self.installing_now = Some(QueuedDownload { slug: game.slug.clone(), offer: game.offer.clone(), downloaded_bytes: 0, total_bytes: 0 });
                                                     } else {
@@ -1053,12 +1035,12 @@ impl eframe::App for MaximaEguiApp {
                                             });
                                             if !self.installer_state.install_folder.is_empty() {
                                                 ui.horizontal_wrapped(|folder_hint| {
-                                                    egui::Label::new(egui::RichText::new("Game will be installed at: ")).selectable(false).ui(folder_hint);
+                                                    egui::Label::new(&self.locale.localization.modals.game_install.fresh_path_confirmation).selectable(false).ui(folder_hint);
                                                     egui::Label::new(egui::RichText::new(format!("{}",
                                                         path.join(slug).display())).color(Color32::WHITE)).selectable(false).ui(folder_hint);
                                                 });
                                                 if !valid {
-                                                    egui::Label::new(egui::RichText::new("Invalid Path").color(Color32::RED)).ui(ui);
+                                                    egui::Label::new(egui::RichText::new(&self.locale.localization.modals.game_install.fresh_path_invalid).color(Color32::RED)).ui(ui);
                                                 }
                                             }
                                         });

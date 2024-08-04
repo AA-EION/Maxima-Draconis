@@ -3,7 +3,7 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Rect, Rounding, Stroke, Ui, Vec2};
 use maxima::rtm::client::BasicPresence;
 
-use crate::{bridge_thread, ui_image::UIImage, widgets::enum_dropdown::enum_dropdown, MaximaEguiApp, FRIEND_INGAME_COLOR};
+use crate::{bridge_thread, main, translation_manager::positional_replace, widgets::enum_dropdown::enum_dropdown, MaximaEguiApp, FRIEND_INGAME_COLOR};
 
 use strum_macros::EnumIter;
 
@@ -33,16 +33,6 @@ pub struct FriendsViewBar {
   pub friend_sel : String,
 }
 
-pub enum UIFriendImageWrapper {
-  /// The user doesn't have an avatar or otherwise the app doesn't want it
-  DoNotLoad,
-  /// Avatar exists but is not loaded
-  Unloaded(String),
-  /// Avatar is being loaded
-  Loading,
-  /// Avatar can be rendered
-  Available(Arc<UIImage>)
-}
 
 pub struct UIFriend {
   pub name : String,
@@ -50,14 +40,8 @@ pub struct UIFriend {
   pub online : BasicPresence,
   pub game : Option<String>,
   pub game_presence : Option<String>,
-  pub avatar: UIFriendImageWrapper,
 }
 
-impl UIFriend {
-  pub fn set_avatar_loading_flag(&mut self) {
-    self.avatar = UIFriendImageWrapper::Loading;
-  }
-}
 
 const F9B233: Color32 = Color32::from_rgb(249, 178, 51);
 const DARK_GREY: Color32 = Color32::from_rgb(64, 64, 64);
@@ -66,6 +50,12 @@ const PFP_CORNER_RADIUS: f32 = 2.0;
 const PFP_ELEMENT_SIZE: f32 = PFP_SIZE + PFP_CORNER_RADIUS * 2.0;
 const FRIEND_HIGHLIGHT_ROUNDING: Rounding = Rounding { nw: 6.0, ne: 4.0, sw: 6.0, se: 4.0 }; // the status border is flawed somehow, this "fixes" it slightly more than if i didn't
 const ITEM_SPACING: Vec2 = vec2(5.0, 5.0);
+
+fn ease_out_cubic(x: f32) -> f32 {
+  let ffs_rust = 1.0 - x;
+  return 1.0 - ffs_rust.powf(3.0);
+}
+
 pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
   puffin::profile_function!();
   let matcher = SkimMatcherV2::default();
@@ -85,7 +75,7 @@ pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
   } || app.force_friends;
   app.force_friends = false; // reset, it won't go away without this
   
-  let hovering_friends = context.animate_bool_with_time(egui::Id::new("FriendsListWidthAnimator"), friend_rect_hovered, ui.style().animation_time*2.0);
+  let hovering_friends = context.animate_bool_with_time_and_easing(egui::Id::new("FriendsListWidthAnimator"), friend_rect_hovered, ui.style().animation_time*2.0, ease_out_cubic);
   let hover_diff = 300.0 - PFP_ELEMENT_SIZE;
   app.friends_width = PFP_ELEMENT_SIZE + (hovering_friends * hover_diff);
 
@@ -133,9 +123,9 @@ pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
           }
           let combo_width = (ui.available_width() / 2.0) - ui.spacing().item_spacing.x; //a lot of accounting for shit when i'm just gonna make it a fixed width anyway
           ui.horizontal(|ui| {
-            let dropdown0 = enum_dropdown(ui, "FriendsListStatusFilterComboBox".to_owned(), &mut app.friends_view_bar.page, combo_width, &app.locale).inner.is_some();
-            let dropdown1 = enum_dropdown(ui, "FriendsListFilterTypeComboBox".to_owned(), &mut app.friends_view_bar.status_filter, combo_width, &app.locale).inner.is_some();
-            if dropdown0 || dropdown1 {
+            let dropdown0 = enum_dropdown(ui, "FriendsListStatusFilterComboBox".to_owned(), &mut app.friends_view_bar.page, combo_width, "", &app.locale);
+            let dropdown1 = enum_dropdown(ui, "FriendsListFilterTypeComboBox".to_owned(), &mut app.friends_view_bar.status_filter, combo_width, "", &app.locale);
+            if dropdown0.inner.is_some() || dropdown1.inner.is_some() {
               app.force_friends = true;
             }
           });
@@ -194,24 +184,7 @@ pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
           puffin::profile_scope!("friend");
           let buttons = app.friends_view_bar.friend_sel.eq(&friend.id) && friend_rect_hovered;
           if buttons { app.force_friends = true; }
-          let how_buttons = context.animate_bool(Id::new("friendlistbuttons_".to_owned()+&friend.id), buttons);
-          let avatar: Option<&Arc<UIImage>> = match &friend.avatar {
-            UIFriendImageWrapper::DoNotLoad => {
-              None
-            },
-            UIFriendImageWrapper::Unloaded(url) => {
-              let _ = app.backend.backend_commander.send(bridge_thread::MaximaLibRequest::GetUserAvatarRequest(friend.id.clone(), url.to_string()));
-              friend.set_avatar_loading_flag();
-              None
-            },
-            UIFriendImageWrapper::Loading => {
-              None
-            },
-            UIFriendImageWrapper::Available(img) => {
-              Some(img)
-            },
-          };
-          let game_hack: String;
+          let how_buttons = context.animate_bool_with_easing(Id::new("friendlistbuttons_".to_owned()+&friend.id), buttons, ease_out_cubic);
           let (friend_status, friend_color) = 
           match friend.online {
             BasicPresence::Unknown => (&app.locale.localization.friends_view.status.unknown as &String, Color32::DARK_RED),
@@ -221,20 +194,12 @@ pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
             BasicPresence::Online => {
               
               if let Some(game) = &friend.game  {
-                if app.locale.localization.friends_view.status.prepend { // Do any languages actually do this?      
-                  if let Some(presence) = &friend.game_presence {
-                    game_hack = format!("{} {}: {}", &game, &app.locale.localization.friends_view.status.playing, &presence);
-                  } else {
-                    game_hack = format!("{} {}", &game, &app.locale.localization.friends_view.status.playing);
-                  }
+                ( if let Some(presence) = &friend.game_presence {
+                  &positional_replace!(&app.locale.localization.friends_view.status.presence_rich, "game", &game, "rich", &presence)
                 } else {
-                  if let Some(presence) = &friend.game_presence {
-                    game_hack = format!("{} {}: {}", &app.locale.localization.friends_view.status.playing, &game, &presence);
-                  } else {
-                    game_hack = format!("{} {}", &app.locale.localization.friends_view.status.playing, &game);
-                  }
-                }
-                (&game_hack, FRIEND_INGAME_COLOR)
+                  &positional_replace!(&app.locale.localization.friends_view.status.presence_basic, "game", &game)
+                }, 
+                FRIEND_INGAME_COLOR)
                 
               } else {
                 (&app.locale.localization.friends_view.status.online, Color32::GREEN)
@@ -242,77 +207,83 @@ pub fn friends_view(app : &mut MaximaEguiApp, ui: &mut Ui) {
             },
           };
 
-          let (f_res, f_painter) = ui.allocate_painter(vec2(width, PFP_ELEMENT_SIZE + ((button_height + button_gap) * how_buttons)), egui::Sense::click());
-          let mut highlight_rect = f_res.rect.clone();
-          highlight_rect.set_height(PFP_ELEMENT_SIZE);
-          if f_res.clicked() {
-            if buttons {
-              app.friends_view_bar.friend_sel = String::new();
-            } else {
-              app.friends_view_bar.friend_sel = friend.id.clone();
-            }
-          }
-
-          if how_buttons > 0.0 {
-            let size = vec2((width - (ui.style().spacing.item_spacing.x * 2.0)) / 3.0, PFP_ELEMENT_SIZE * 0.6);
-
-            let rect_0 = Rect {
-              min: pos2(f_res.rect.min.x, f_res.rect.max.y - size.y),
-              max: pos2(f_res.rect.min.x + size.x, f_res.rect.max.y)
-            };
-
-            let rect_1 = Rect {
-              min: pos2(rect_0.max.x + ui.spacing().item_spacing.x, rect_0.min.y),
-              max: pos2(rect_0.max.x + size.x + ui.spacing().item_spacing.x, rect_0.max.y)
-            };
-
-            let rect_2 = Rect {
-              min: pos2(rect_1.max.x + ui.spacing().item_spacing.x, rect_1.min.y),
-              max: pos2(rect_1.max.x + size.x + ui.spacing().item_spacing.x, rect_1.max.y)
-            };
-
+          ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add_enabled_ui(false, |buttons| {
-              if buttons.put(rect_0, egui::Button::new(app.locale.localization.friends_view.friend_actions.profile.to_ascii_uppercase())).clicked()
-              || buttons.put(rect_1, egui::Button::new(app.locale.localization.friends_view.friend_actions.chat.to_ascii_uppercase())).clicked()
-              || buttons.put(rect_2, egui::Button::new(app.locale.localization.friends_view.friend_actions.unfriend.to_ascii_uppercase())).clicked() {
-                app.friends_view_bar.friend_sel = String::new();
-              }
-            });
-            ui.spacing_mut().item_spacing.y = ITEM_SPACING.y;
-          }
+            let (main_res, main_painter) = ui.allocate_painter(vec2(width, PFP_ELEMENT_SIZE), egui::Sense::click());
+            
+            if (how_buttons <= 0.0) && !ui.is_rect_visible(main_res.rect.with_min_y(main_res.rect.min.y - (PFP_ELEMENT_SIZE*3.0))) { return; }
 
-          if f_res.hovered() || buttons {
-            f_painter.rect_filled(highlight_rect, FRIEND_HIGHLIGHT_ROUNDING, Color32::WHITE);
-          }
+            if main_res.clicked() {
+              if buttons { app.friends_view_bar.friend_sel = String::new();     }
+              else       { app.friends_view_bar.friend_sel = friend.id.clone(); }
+            }
+            if main_res.is_pointer_button_down_on() || main_res.hovered() || buttons {
+              main_painter.rect_filled(main_res.rect, FRIEND_HIGHLIGHT_ROUNDING, Color32::WHITE);
+            }
+            
+            if how_buttons > 0.0 {
+              let (_, buttons_rect) = ui.allocate_space(vec2(width, (button_height + button_gap) * how_buttons));
+              let size = vec2((width - (ui.style().spacing.item_spacing.x * 2.0)) / 3.0, PFP_ELEMENT_SIZE * 0.6);
 
-          let pfp_rect = Rect {
-            min: f_res.rect.min + vec2(2.0, 2.0),
-            max: f_res.rect.min + vec2(2.0, 2.0) + vec2(PFP_SIZE, PFP_SIZE)
-          };
+              // visibility check is mostly for lazy loading avatars, but if we don't need to let egui cull things, why make it?
+              if !ui.is_rect_visible(main_res.rect.with_min_y(main_res.rect.min.y - (PFP_ELEMENT_SIZE*3.0)).with_max_y(buttons_rect.max.y)) { return; }
 
-          let outline_rect = Rect {
-            min: pfp_rect.min - vec2(1.0, 1.0),
-            max: pfp_rect.max + vec2(1.0, 1.0)
-          };
+              let rect_0 = Rect {
+                min: pos2(buttons_rect.min.x,          buttons_rect.max.y - size.y),
+                max: pos2(buttons_rect.min.x + size.x, buttons_rect.max.y         ),
+              };
 
-          if let Some(pfp) = avatar {
-            f_painter.image(pfp.renderable, pfp_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-          } else {
-            f_painter.image(app.user_pfp_renderable, pfp_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-          }
+              let rect_1 = Rect {
+                min: pos2(rect_0.max.x +          ui.spacing().item_spacing.x, rect_0.min.y),
+                max: pos2(rect_0.max.x + size.x + ui.spacing().item_spacing.x, rect_0.max.y),
+              };
 
-          f_painter.rect(outline_rect, Rounding::same(4.0), Color32::TRANSPARENT, Stroke::new(2.0, friend_color));
+              let rect_2 = Rect {
+                min: pos2(rect_1.max.x +          ui.spacing().item_spacing.x, rect_0.min.y),
+                max: pos2(rect_1.max.x + size.x + ui.spacing().item_spacing.x, rect_0.max.y),
+              };
 
-          let text_col = if f_res.hovered() || buttons {
-            Color32::BLACK
-          } else {
-            Color32::WHITE
-          };
+              let button_clip_rect = if buttons_rect.min.y < ui.clip_rect().min.y { buttons_rect.with_min_y(ui.clip_rect().min.y) } else { buttons_rect };
+              let button_clip_rect = if button_clip_rect.max.y > ui.clip_rect().max.y { button_clip_rect.with_max_y(ui.clip_rect().max.y) } else { button_clip_rect };
+              ui.add_enabled_ui(false, |buttons| {
+                buttons.set_clip_rect(button_clip_rect);
+                if buttons.is_rect_visible(button_clip_rect)
+                && buttons.put(rect_0, egui::Button::new(app.locale.localization.friends_view.friend_actions.profile.to_ascii_uppercase()) ).clicked()
+                || buttons.put(rect_1, egui::Button::new(app.locale.localization.friends_view.friend_actions.chat.to_ascii_uppercase())    ).clicked()
+                || buttons.put(rect_2, egui::Button::new(app.locale.localization.friends_view.friend_actions.unfriend.to_ascii_uppercase())).clicked() {
+                  app.friends_view_bar.friend_sel = String::new();
+                }
+              });
+            }
 
-          f_painter.text(pfp_rect.center() + vec2(PFP_SIZE/1.5,  2.0), Align2::LEFT_BOTTOM, &friend.name, FontId::proportional(15.0), text_col);
-          f_painter.text(pfp_rect.center() + vec2(PFP_SIZE/1.5,  2.0), Align2::LEFT_TOP, friend_status, FontId::proportional(10.0), text_col);
-        }
+            let pfp_rect = Rect {
+              min: main_res.rect.min + vec2(2.0, 2.0),
+              max: main_res.rect.min + vec2(2.0, 2.0) + vec2(PFP_SIZE, PFP_SIZE)
+            };
+
+            let outline_rect = Rect {
+              min: pfp_rect.min - vec2(1.0, 1.0),
+              max: pfp_rect.max + vec2(1.0, 1.0)
+            };
+
+            if let Some(pfp) = app.img_cache.get(crate::ui_image::UIImageType::Avatar(friend.id.clone())) {
+              main_painter.image(pfp.id(), pfp_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            } else {
+              main_painter.image(app.img_cache.placeholder_avatar.id(), pfp_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+  
+            main_painter.rect(outline_rect, Rounding::same(4.0), Color32::TRANSPARENT, Stroke::new(2.0, friend_color));
+
+            let text_col = if main_res.is_pointer_button_down_on() || main_res.hovered() || buttons {
+              Color32::BLACK
+            } else {
+              Color32::WHITE
+            };
+  
+            main_painter.text(pfp_rect.center() + vec2(PFP_SIZE/1.5,  2.0), Align2::LEFT_BOTTOM, &friend.name, FontId::proportional(15.0), text_col);
+            main_painter.text(pfp_rect.center() + vec2(PFP_SIZE/1.5,  2.0), Align2::LEFT_TOP, friend_status, FontId::proportional(10.0), text_col);
+          });
+        } // friend loop
         ui.allocate_space(ui.available_size());
       });
     });
