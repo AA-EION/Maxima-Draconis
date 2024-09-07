@@ -84,7 +84,12 @@ struct Args {
 #[tokio::main]
 async fn main() {
     init_logger();
-    ffmpeg::init().unwrap();
+    let ffmpeg_success = if let Err(err) = ffmpeg::init() {
+        log::error!("Unable to initialize ffmpeg {err:?}");
+        false
+    } else {
+        true
+    };
     let mut args = Args::parse();
 
     if !cfg!(debug_assertions) {
@@ -124,7 +129,7 @@ async fn main() {
         "Maxima",
         native_options,
         Box::new(move |cc| {
-            let app = MaximaEguiApp::new(cc, args);
+            let app = MaximaEguiApp::new(cc, args, ffmpeg_success);
             // Run initialization code that needs access to the UI here, but DO NOT run any long-runtime functions here,
             // as it's before the UI is shown
             if args.no_login {
@@ -343,7 +348,7 @@ const F9B233: Color32 = Color32::from_rgb(249, 178, 51);
 const WIDGET_HOVER: Color32 = Color32::from_rgb(255, 188, 61);
 
 impl MaximaEguiApp {
-    fn new(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, args: Args, ffmpeg_success: bool) -> Self {
         let style: Style = Style {
             spacing: Spacing {
                 scroll: ScrollStyle {
@@ -464,7 +469,7 @@ impl MaximaEguiApp {
             game_view_bg_renderer: GameViewBgRenderer::new(cc),
             app_bg_renderer: AppBgRenderer::new(cc),
             img_cache,
-            app_bg_media_player: if settings.videos {
+            app_bg_media_player: if settings.videos && ffmpeg_success {
                 Some(Player::new(&cc.egui_ctx))
             } else { None },
             locale: TranslationManager::new(&settings.language),
