@@ -6,14 +6,14 @@ steps:
     commands:
       - CURRENT_TIME=$(date +%s)
       - ELAPSED_TIME=$(($CURRENT_TIME - $CI_PIPELINE_STARTED))
-      - ELAPSED_TIME_STR=$(date -u -d @${ELAPSED_TIME} +'%Mm%Ss')
+      - ELAPSED_TIME_STR=$(date -u -d @$ELAPSED_TIME +'%Mm%Ss')
       - |
         WEBHOOK_DATA=$(cat <<EOF
         {
           "embeds": [
             {
               "title": "Maxima CI",
-              "description": "Pipeline [#${CI_PIPELINE_URL}](${CI_PIPELINE_NUMBER}) of branch `${CI_COMMIT_BRANCH}` passed in ${ELAPSED_TIME}",
+              "description": "Pipeline [#${CI_PIPELINE_URL}](${CI_PIPELINE_NUMBER}) of branch `${CI_COMMIT_BRANCH}` passed in ${ELAPSED_TIME_STR}",
               "color": 8482378
             }
           ]
