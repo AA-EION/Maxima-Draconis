@@ -23,7 +23,7 @@ steps:
         )
       - echo $WEBHOOK_DATA
 
-      - WEBHOOK_URL="https://discord.com/api/webhooks/${DISCORD_WEBHOOK_ID}/${DISCORD_WEBHOOK_TOKEN}"
+      - WEBHOOK_URL="https://discord.com/api/webhooks/$DISCORD_WEBHOOK_ID/$DISCORD_WEBHOOK_TOKEN"
       - "curl X POST -H \"Content-Type: application/json\" -d \"$WEBHOOK_DATA\" $WEBHOOK_URL"
     secrets: [ discord_webhook_id, discord_webhook_token ]
 
