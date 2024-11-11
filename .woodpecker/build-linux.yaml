@@ -19,7 +19,7 @@ steps:
         from_secret: discord_webhook_token
       message: >
         {{#success build.status}}
-          Build {{build.number}} (linux/amd64) succeeded.
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) passed in {{since build.started}}
         {{else}}
-          Build {{build.number}} (linux/amd64) failed.
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) failed in {{since build.started}}
         {{/success}}
