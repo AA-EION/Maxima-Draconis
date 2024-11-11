@@ -19,7 +19,8 @@ steps:
         from_secret: discord_webhook_token
       message: >
         {{#success build.status}}
-          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) passed in {{since build.started}}
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` passed in {{since build.started}}
         {{else}}
-          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) failed in {{since build.started}}
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` failed in {{since build.started}}
         {{/success}}
+      color: "#816e4a"
