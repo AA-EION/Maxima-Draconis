@@ -1,0 +1,11 @@
+when:
+  - event: push
+
+steps:
+  - name: build
+    image: clux/muslrust:nightly-2024-08-24
+    environment:
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    commands:
+      - apt-get -y install pkg-config libssl-dev build-essential protobuf-compiler
+      - cargo build --release --target x86_64-unknown-linux-musl
