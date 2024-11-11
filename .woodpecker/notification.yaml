@@ -1,4 +1,10 @@
+skip_clone: true
+
 steps:
+  - name: build
+    image: curlimages/curl:8.11.0
+    commands:
+      - echo $CI_PIPELINE_STARTED
   - name: notification
     image: appleboy/drone-discord
     settings:
@@ -12,9 +18,12 @@ steps:
         {{else}}
           Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` failed in {{since build.started}}
         {{/success}}
-      color: "#816e4a"
 
 depends_on:
   - build-linux
 
 runs_on: [ success, failure ]
+
+# Linter wants a `when`, despite depends_on
+when:
+  - repo: ArmchairDevelopers/Maxima
