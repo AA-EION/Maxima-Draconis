@@ -14,7 +14,7 @@ steps:
           "embeds": [
             {
               "title": "Maxima CI",
-              "description": "Pipeline [#${CI_PIPELINE_NUMBER}](${CI_PIPELINE_URL}) of branch `${CI_COMMIT_BRANCH}` passed in ${ELAPSED_TIME_STR}",
+              "description": "Pipeline [#${CI_PIPELINE_NUMBER}](${CI_PIPELINE_URL}) of branch \`${CI_COMMIT_BRANCH}\` passed in ${ELAPSED_TIME_STR}",
               "color": 8482378
             }
           ]
