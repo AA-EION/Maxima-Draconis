@@ -4,20 +4,23 @@ steps:
   - name: build
     image: curlimages/curl:8.11.0
     commands:
-      - echo $CI_PIPELINE_STARTED
-  - name: notification
-    image: appleboy/drone-discord
-    settings:
-      webhook_id:
-        from_secret: discord_webhook_id
-      webhook_token:
-        from_secret: discord_webhook_token
-      message: >
-        {{#success build.status}}
-          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` passed in {{since build.started}}
-        {{else}}
-          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` failed in {{since build.started}}
-        {{/success}}
+      - CURRENT_TIME=$(date +%s)
+      - ELAPSED_TIME=$(($CURRENT_TIME - $CI_PIPELINE_STARTED))
+      - ELAPSED_TIME_STR=$(date -u -d @${ELAPSED_TIME} +'%Mm%Ss')
+      - |
+        WEBHOOK_DATA=$(cat <<EOF
+        {
+          "embeds": [
+            {
+              "title": "Maxima CI",
+              "description": "Pipeline [#${CI_PIPELINE_URL}](${CI_PIPELINE_NUMBER}) of branch `${CI_COMMIT_BRANCH}` passed in ${ELAPSED_TIME}",
+              "color": 8482378
+            }
+          ]
+        }
+        EOF
+        )
+      - echo $WEBHOOK_DATA
 
 depends_on:
   - build-linux
