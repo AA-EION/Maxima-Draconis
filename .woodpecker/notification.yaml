@@ -9,7 +9,6 @@ steps:
       - ELAPSED_TIME_STR=$(date -u -d @$ELAPSED_TIME +'%Mm%Ss')
       - echo $CURRENT_TIME $CI_PIPELINE_STARTED $CI_PIPELINE_FINISHED $ELAPSED_TIME $ELAPSED_TIME_STR
 
-      # Status
       - |
         if [  "$CI_PIPELINE_STATUS" == "success" ]; then
           STATUS="passed";
