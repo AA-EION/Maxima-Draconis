@@ -7,10 +7,11 @@ steps:
       - CURRENT_TIME=$(date +%s)
       - ELAPSED_TIME=$(($CURRENT_TIME - $CI_PIPELINE_STARTED))
       - ELAPSED_TIME_STR=$(date -u -d @$ELAPSED_TIME +'%Mm%Ss')
-      - echo $CURRENT_TIME $CI_PIPELINE_STARTED $ELAPSED_TIME $ELAPSED_TIME_STR
+      - echo $CURRENT_TIME $CI_PIPELINE_STARTED $CI_PIPELINE_FINISHED $ELAPSED_TIME $ELAPSED_TIME_STR
 
       # Status
-      - if [  "$CI_PIPELINE_STATUS" == "success" ]; then
+      - |
+        if [  "$CI_PIPELINE_STATUS" == "success" ]; then
           STATUS="passed";
           STATUS_COLOR=$((16#00FF00));
         else
