@@ -3,6 +3,11 @@ skip_clone: true
 steps:
   - name: build
     image: curlimages/curl:8.11.0
+    environment:
+      WEBHOOK_ID:
+        from_secret: discord_webhook_id
+      WEBHOOK_TOKEN:
+        from_secret: discord_webhook_token
     commands:
       - CURRENT_TIME=$(date +%s)
       - ELAPSED_TIME=$(($CURRENT_TIME - $CI_PIPELINE_STARTED))
@@ -14,7 +19,7 @@ steps:
           "embeds": [
             {
               "title": "Maxima CI",
-              "description": "Pipeline [#${CI_PIPELINE_NUMBER}](${CI_PIPELINE_URL}) of branch \`${CI_COMMIT_BRANCH}\` passed in ${ELAPSED_TIME_STR}",
+              "description": "Pipeline [#${CI_PIPELINE_NUMBER}](${CI_PIPELINE_URL}) of branch \`${CI_COMMIT_BRANCH}\` passed in $ELAPSED_TIME_STR",
               "color": 8482378
             }
           ]
@@ -22,6 +27,9 @@ steps:
         EOF
         )
       - echo $WEBHOOK_DATA
+
+      - WEBHOOK_URL="https://discord.com/api/webhooks/${WEBHOOK_ID}/${WEBHOOK_TOKEN}"
+      - curl -X POST -H "Content-Type: application/json" -d "$WEBHOOK_DATA" $WEBHOOK_URL
 
 depends_on:
   - build-linux
