@@ -1,0 +1,20 @@
+steps:
+  - name: notification
+    image: appleboy/drone-discord
+    settings:
+      webhook_id:
+        from_secret: discord_webhook_id
+      webhook_token:
+        from_secret: discord_webhook_token
+      message: >
+        {{#success build.status}}
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` passed in {{since build.started}}
+        {{else}}
+          Pipeline [#{{build.number}}]({{build.link}}) (linux/amd64) of branch `{{build.branch}}` failed in {{since build.started}}
+        {{/success}}
+      color: "#816e4a"
+
+depends_on:
+  - build-linux
+
+runs_on: [ success, failure ]
