@@ -3,11 +3,6 @@ skip_clone: true
 steps:
   - name: build
     image: curlimages/curl:8.11.0
-    environment:
-      WEBHOOK_ID:
-        from_secret: discord_webhook_id
-      WEBHOOK_TOKEN:
-        from_secret: discord_webhook_token
     commands:
       - CURRENT_TIME=$(date +%s)
       - ELAPSED_TIME=$(($CURRENT_TIME - $CI_PIPELINE_STARTED))
@@ -28,8 +23,9 @@ steps:
         )
       - echo $WEBHOOK_DATA
 
-      - WEBHOOK_URL="https://discord.com/api/webhooks/${WEBHOOK_ID}/${WEBHOOK_TOKEN}"
+      - WEBHOOK_URL="https://discord.com/api/webhooks/${DISCORD_WEBHOOK_ID}/${DISCORD_WEBHOOK_TOKEN}"
       - "curl X POST -H \"Content-Type: application/json\" -d \"$WEBHOOK_DATA\" $WEBHOOK_URL"
+    secrets: [ discord_webhook_id, discord_webhook_token ]
 
 depends_on:
   - build-linux
