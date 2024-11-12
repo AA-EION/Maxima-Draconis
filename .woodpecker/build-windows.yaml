@@ -5,7 +5,7 @@ labels:
   platform: windows/amd64
 
 steps:
-  - name: build
+  - name: install rust
     image: powershell
     commands:
       - |
@@ -14,7 +14,10 @@ steps:
         if (!(Get-Command rustc -ErrorAction SilentlyContinue)) {
           echo "Installing Rust..."
           Invoke-WebRequest -Uri https://win.rustup.rs -OutFile rustup-init.exe
-          ./rustup-init.exe -y
+          ./rustup-init.exe -y --toolchain nightly
         }
 
+  - name: build
+    image: powershell
+    commands:
       - rustc --version
