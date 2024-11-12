@@ -8,5 +8,11 @@ steps:
   - name: build
     image: powershell
     commands:
-      - echo "Hello World"
-      - bazel
+      - |
+        if (!(Get-Command rustc -ErrorAction SilentlyContinue)) {
+          echo "Installing Rust..."
+          iex ((New-Object System.Net.WebClient).DownloadFile('https://win.rustup.rs/x86_64'));
+          rustup-init.exe -y
+        }
+
+      - rustc --version
