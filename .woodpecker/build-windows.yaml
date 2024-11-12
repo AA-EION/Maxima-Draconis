@@ -4,8 +4,10 @@ when:
 labels:
   platform: windows/amd64
 
+skip_clone: true
+
 steps:
   - name: build
-    image: cmd
+    image: mcr.microsoft.com/windows/servercore:ltsc2022
     commands:
       - echo "Hello World"
