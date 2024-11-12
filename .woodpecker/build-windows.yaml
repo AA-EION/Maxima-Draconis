@@ -6,6 +6,7 @@ labels:
 
 steps:
   - name: build
-    image: cmd
+    image: powershell
     commands:
       - echo "Hello World"
+      - bazel
