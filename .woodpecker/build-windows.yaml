@@ -1,24 +1,16 @@
-when:
-  - event: [push, manual]
-
 labels:
   platform: windows/amd64
 
+workspace:
+  base: C:\tmp\maxima
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    pull: false
+
 steps:
-  - name: install rust
-    image: powershell
-    commands:
-      - |
-        $ProgressPreference = 'SilentlyContinue'
-
-        if (!(Get-Command rustc -ErrorAction SilentlyContinue)) {
-          echo "Installing Rust..."
-          Invoke-WebRequest -Uri https://win.rustup.rs -OutFile rustup-init.exe
-          ./rustup-init.exe -y --toolchain nightly
-        }
-
   - name: build
-    image: powershell
+    image: mcr.microsoft.com/windows/servercore:ltsc2022
     commands:
-      - rustup default nightly
-      - cargo build --release
+      - git
