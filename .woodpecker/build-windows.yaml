@@ -1,0 +1,11 @@
+when:
+  - event: [push, manual]
+    platform: windows/amd64
+
+steps:
+  - name: build
+    image: cmd
+    environment:
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    commands:
+      - echo "Hello World"

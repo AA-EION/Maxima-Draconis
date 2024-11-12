@@ -39,6 +39,7 @@ steps:
 
 depends_on:
   - build-linux
+  - build-windows
 
 runs_on: [ success, failure ]
 
