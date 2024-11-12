@@ -10,7 +10,7 @@ steps:
   - name: build
     image: mcr.microsoft.com/windows/servercore:ltsc2022
     commands:
-      - echo "Hello World"
+      - powershell.exe /c 'echo "Hello World"'
 
 workspace:
   base: C:\tmp
