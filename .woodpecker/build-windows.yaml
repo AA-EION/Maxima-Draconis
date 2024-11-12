@@ -20,4 +20,5 @@ steps:
   - name: build
     image: powershell
     commands:
-      - rustc --version
+      - rustup default nightly
+      - cargo build --release
