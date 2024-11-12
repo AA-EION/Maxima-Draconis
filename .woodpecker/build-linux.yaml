@@ -1,6 +1,8 @@
 when:
   - event: [push, manual]
-    platform: linux/amd64
+
+labels:
+  platform: linux/amd64
 
 steps:
   - name: build
