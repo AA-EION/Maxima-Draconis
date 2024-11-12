@@ -11,5 +11,6 @@ steps:
     image: mcr.microsoft.com/windows/servercore:ltsc2022
     commands:
       - echo "Hello World"
-    workspace:
-      base: C:\tmp
+
+workspace:
+  base: C:\tmp
