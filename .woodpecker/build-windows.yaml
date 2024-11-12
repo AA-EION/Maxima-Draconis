@@ -10,7 +10,7 @@ steps:
   - name: build
     image: mcr.microsoft.com/windows/servercore:ltsc2022
     commands:
-      - powershell.exe /c 'echo "Hello World"'
+      - git
 
 workspace:
-  base: C:\tmp
+  base: C:\tmp\maxima
