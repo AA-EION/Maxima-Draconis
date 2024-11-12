@@ -5,7 +5,5 @@ when:
 steps:
   - name: build
     image: cmd
-    environment:
-      RUSTFLAGS: "-C target-feature=+crt-static"
     commands:
       - echo "Hello World"

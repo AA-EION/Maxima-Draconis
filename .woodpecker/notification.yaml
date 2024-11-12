@@ -39,10 +39,8 @@ steps:
 
 depends_on:
   - build-linux
-  - build-windows
 
 runs_on: [ success, failure ]
 
-# Linter wants a `when`, despite depends_on
 when:
-  - repo: ArmchairDevelopers/Maxima
+  - platform: linux/amd64
