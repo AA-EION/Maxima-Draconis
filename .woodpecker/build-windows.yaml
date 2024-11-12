@@ -4,13 +4,8 @@ when:
 labels:
   platform: windows/amd64
 
-skip_clone: true
-
 steps:
   - name: build
-    image: mcr.microsoft.com/windows/servercore:ltsc2022
+    image: cmd
     commands:
-      - git
-
-workspace:
-  base: C:\tmp\maxima
+      - echo "Hello World"
