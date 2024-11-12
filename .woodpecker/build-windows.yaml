@@ -9,9 +9,11 @@ steps:
     image: powershell
     commands:
       - |
+        $ProgressPreference = 'SilentlyContinue'
+
         if (!(Get-Command rustc -ErrorAction SilentlyContinue)) {
           echo "Installing Rust..."
-          iex ((New-Object System.Net.WebClient).DownloadFile('https://win.rustup.rs/x86_64'));
+          Invoke-WebRequest -Uri https://win.rustup.rs -OutFile rustup-init.exe
           rustup-init.exe -y
         }
 
