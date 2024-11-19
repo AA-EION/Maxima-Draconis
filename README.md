@@ -1,13 +1,15 @@
-# Maxima
+# MAXIMA
 ## A free and open-source replacement for the EA Desktop Launcher
 ![Logo](images/1500x500.jpg)
 
 > [!WARNING]
-> Maxima is in beta. Parts of it may not be fully stable, and we're actively fixing bugs and adding features. Please create an [issue](https://github.com/ArmchairDevelopers/Maxima/issues) if you notice strange behavior.
+> Maxima is in a very alpha state. Parts of it may not be fully stable, and we are actively fixing bugs and adding features. As such, we recommend backing up save files before using Maxima, just to be safe. Please create an [issue](https://github.com/ArmchairDevelopers/Maxima/issues) if you notice strange behavior.
 
 Maxima is an open-source replacement for the EA Desktop/Origin game launcher, running natively on Linux and Windows, with MacOS support in progress.
 
-Maxima itself is a library (`maxima-lib`), with povided CLI (`maxima-cli`), TUI (`maxima-tui`), and GUI (`maxima-ui`) frontends. Other launchers compatible with Maxima's license may implement it as a backend. It's used by our sister project, [KYBER](https://uplink.kyber.gg/news/features-overview).
+Maxima itself is a server (`maxima_server`) accessed through a client (`maxima_lib`). This provides support for multiple simultaneous frontends, meaning you can, for example, run the CLI and GUI at the same time, and their states will be synced.
+
+We, by default, provide CLI (`maxima_cli`), TUI (`maxima_tui`), and GUI (`maxima_ui`) frontends. Other launchers compatible with Maxima's license may implement it as a backend. It's used by our sister project, [KYBER](https://uplink.kyber.gg/news/features-overview).
 
 ![UI](images/UI.png)
 
@@ -22,8 +24,7 @@ Maxima itself is a library (`maxima-lib`), with povided CLI (`maxima-cli`), TUI 
  - Playing games installed with EA Desktop on Maxima + vice versa
  - Displaying your in-game status to your friends, and viewing your friends' status'
  - Locating games
- - Running games under [wine-ge](https://github.com/GloriousEggroll/wine-ge-custom) on Linux/SteamDeck
-   - `wine-ge` is automatically installed, but base `wine` must already be installed on the system. We're looking into implementing [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) to fix this.
+ - Running games under wine ([umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)) on Linux/SteamDeck
 
 **In-Dev:**
  - MacOS support
@@ -32,18 +33,18 @@ Maxima itself is a library (`maxima-lib`), with povided CLI (`maxima-cli`), TUI 
 **Planned:**
  - Library documentation/examples
  - Support for installing DLCs
- - Full EA Desktop interopability. Games installed with EA Desktop already appear on Maxima, but to take it a step further we'd like the ability to, for example, start a download on EA Desktop and continue it on Maxima.
+ - Full EA Desktop interopability. Games installed with EA Desktop already appear on Maxima, but to take it a step further we'd like the ability to, for example, start a download on EA Desktop and continue it on Maxima
  - Cleaner/Stabler downloader implementation
  - Progressive/Selective installs
-   - Some games are able to start without being fully installed, and some games contain language-specific files.
+   - Some games are able to start without being fully installed, and some games contain language-specific files
  - Support for the store (buying games)
  - Friend Adding/Removing/Inviting
  - Status setting; locked to "online" at the moment
  
 **Unsupported:**
- - Battlefield 3/4 are currently unsupported due to how battlelog does game launching. This is on our radar, but isn't a huge priority at the moment.
+ - Battlefield 3/4 are currently unsupported due to how battlelog does game launching. This is on our radar, but isn't a huge priority at the moment
    - Please file an issue if you find more games that don't work
- - Old games like Dead Space 2 and BFBC2 are unsupported due to being pre-"Download-In-Place" era games. They have a different manifest format which we need to make a parser for.
+ - Old games like Dead Space 2 and BFBC2 are unsupported due to being pre-"Download-In-Place" era games. They have a different manifest format which we need to make a parser for
 
 # CLI Usage
 `maxima-cli` standalone will launch an interactive CLI mode to install and launch games.
@@ -54,5 +55,5 @@ Maxima itself is a library (`maxima-lib`), with povided CLI (`maxima-cli`), TUI 
 It's the farthest you can get from the Origin.
 
 ## Maintainers:
- - [Sean Kahler](https://github.com/BattleDash) (Lib, Bootstrap, Service)
+ - [Sean Kahler](https://github.com/BattleDash) (Server, Lib, Proto, Bootstrap)
  - [Nick Whelan](https://github.com/headassbtw) (UI)
