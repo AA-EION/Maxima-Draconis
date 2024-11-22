@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::util::native::maxima_dir;
+use crate::{core::error::CoreError, util::native::maxima_dir};
 
 use super::{nucleus_connect_token_refresh, token_info::NucleusTokenInfo, TokenResponse};
 
@@ -237,6 +237,10 @@ impl AuthStorage {
         self.save_if_dirty()?;
 
         Ok(Some(access_token))
+    }
+
+    pub async fn access_token_or_err(&mut self) -> Result<String, CoreError> {
+        self.access_token().await?.ok_or(CoreError::Unauthenticated)
     }
 
     /// Add an account from a token response and set it as the currently selected one

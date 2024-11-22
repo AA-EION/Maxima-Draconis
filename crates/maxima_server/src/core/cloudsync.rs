@@ -6,13 +6,13 @@ use std::{
 use anyhow::{bail, Context, Result};
 use derive_getters::Getters;
 use futures::StreamExt;
-use tracing::debug;
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
 };
+use tracing::debug;
 
 use super::{auth::storage::LockedAuthStorage, endpoints::API_CLOUDSYNC, library::OwnedOffer};
 
@@ -417,6 +417,7 @@ impl<'a> CloudSyncLock<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct CloudSyncClient {
     auth: LockedAuthStorage,
     client: Client,
@@ -429,8 +430,7 @@ impl CloudSyncClient {
             client: ClientBuilder::default()
                 .gzip(true)
                 .build()
-                .context("Failed to build CloudSync HTTP client")
-                .unwrap(),
+                .expect("Failed to build CloudSync HTTP client"),
         }
     }
 
@@ -525,7 +525,9 @@ mod tests {
             bail!("Test cannot run when logged out");
         }
 
-        let mut library = GameLibrary::new(auth.clone()).await;
+        let library = GameLibrary::new(auth.clone()).await;
+        let mut library = library.lock().await;
+
         let offer = library
             .game_by_base_slug("star-wars-battlefront-2")
             .await
@@ -548,7 +550,9 @@ mod tests {
             bail!("Test cannot run when logged out");
         }
 
-        let mut library = GameLibrary::new(auth.clone()).await;
+        let library = GameLibrary::new(auth.clone()).await;
+        let mut library = library.lock().await;
+
         let offer = library
             .game_by_base_slug("star-wars-battlefront-2")
             .await

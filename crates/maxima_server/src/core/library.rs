@@ -1,7 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{bail, Result};
 use derive_getters::Getters;
+use tokio::sync::Mutex;
 
 use crate::util::registry::{parse_partial_registry_path, parse_registry_path};
 
@@ -9,16 +10,13 @@ use crate::util::registry::{parse_partial_registry_path, parse_registry_path};
 use crate::unix::fs::case_insensitive_path;
 
 use super::{
-    auth::storage::LockedAuthStorage,
-    dip::{DiPManifest, DIP_RELATIVE_PATH},
-    locale::Locale,
-    service_layer::{
+    auth::storage::LockedAuthStorage, dip::{DiPManifest, DIP_RELATIVE_PATH}, launch::ActiveGameContext, locale::Locale, service_layer::{
         ServiceGameProductType, ServiceGetLegacyCatalogDefsRequestBuilder,
         ServiceGetPreloadedOwnedGamesRequest, ServiceGetPreloadedOwnedGamesRequestBuilder,
         ServiceLayerClient, ServiceLegacyOffer, ServicePlatform, ServiceStorefront, ServiceUser,
         ServiceUserGameProduct, SERVICE_REQUEST_GETLEGACYCATALOGDEFS,
         SERVICE_REQUEST_GETPRELOADEDOWNEDGAMES,
-    },
+    }
 };
 
 #[derive(Clone, Getters)]
@@ -238,15 +236,20 @@ pub struct GameLibrary {
     service_layer: ServiceLayerClient,
     library: Vec<OwnedTitle>,
     last_request: u64,
+
+    contexts: Vec<ActiveGameContext>,
 }
 
+pub type LockedGameLibrary = Arc<Mutex<GameLibrary>>;
+
 impl GameLibrary {
-    pub async fn new(auth: LockedAuthStorage) -> Self {
-        Self {
+    pub async fn new(auth: LockedAuthStorage) -> LockedGameLibrary {
+        Arc::new(Mutex::new(Self {
             service_layer: ServiceLayerClient::new(auth),
             library: Vec::new(),
             last_request: 0,
-        }
+            contexts: Vec::new(),
+        }))
     }
 
     pub async fn games(&mut self) -> &Vec<OwnedTitle> {
@@ -371,5 +374,9 @@ impl GameLibrary {
             ])
             .platforms(vec![ServicePlatform::Pc])
             .build()?)
+    }
+
+    pub fn add_context(&mut self, context: ActiveGameContext) {
+        self.contexts.push(context);
     }
 }
