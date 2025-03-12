@@ -231,6 +231,14 @@ impl RtmClient {
             force_disconnect_session_key: None,
         }).await.ok_or(anyhow!("RTM login failed"))?;
 
+        send_and_forget_rtm_request!(self.conn_man, PresenceUpdate, PresenceUpdateV1, {
+            status: "".to_owned(),
+            basic_presence_type: BasicPresence::Away as i32,
+            user_defined_presence: "".to_owned(),
+            rich_presence: None
+        })
+        .await?;
+
         for ele in res.connected_sessions {
             let platform = PlatformV1::try_from(ele.platform)?;
             if platform != PlatformV1::Pc {
