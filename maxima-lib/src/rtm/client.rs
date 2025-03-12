@@ -175,13 +175,19 @@ impl RtmClient {
                     return;
                 }
 
-                let id = presence.player.as_ref().unwrap().player_id.to_owned();
-                presence_store
-                    .lock()
-                    .await
-                    .insert(id.to_owned(), rich.unwrap());
-
-                debug!("Updated {}'s presence", id);
+                match presence.player.as_ref() {
+                    Some(player) => {
+                        let id = player.player_id.to_owned();
+                        presence_store
+                            .lock()
+                            .await
+                            .insert(id.to_owned(), rich.unwrap());
+                        debug!("Updated {}'s presence", id);
+                    },
+                    None => {
+                        debug!("Failed to update presence");
+                    }
+                }
             }
             _ => {
                 warn!("Got unhandled RPC update {:?}", body);
