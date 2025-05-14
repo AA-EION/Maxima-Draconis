@@ -17,6 +17,13 @@ use super::{
     auth::storage::LockedAuthStorage, endpoints::API_SERVICE_AGGREGATION_LAYER, locale::Locale,
 };
 
+const LARGE_AVATAR_PATH: &str =
+    "https://eaavatarservice.akamaized.net/production/avatar/prod/1/599/416x416.JPEG";
+const MEDIUM_AVATAR_PATH: &str =
+    "https://eaavatarservice.akamaized.net/production/avatar/prod/1/599/208x208.JPEG";
+const SMALL_AVATAR_PATH: &str =
+    "https://eaavatarservice.akamaized.net/production/avatar/prod/1/599/40x40.JPEG";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedQuery {
@@ -49,7 +56,7 @@ pub struct ServiceLayerGraphQLRequest {
     operation: &'static str,
     key: &'static str,
     hash: [u8; 32],
-    r#type: ServiceLayerRequestType
+    r#type: ServiceLayerRequestType,
 }
 
 macro_rules! load_graphql_request {
@@ -61,7 +68,7 @@ macro_rules! load_graphql_request {
             operation: $operation,
             key: $key,
             hash,
-            r#type: ServiceLayerRequestType::$type
+            r#type: ServiceLayerRequestType::$type,
         }
     }};
 }
@@ -72,6 +79,7 @@ macro_rules! define_graphql_request {
     }}
 }
 
+define_graphql_request!(ServiceAggregationLayer, addonSearch, me); // Input: ServiceAddonSearchRequest, Output: AddonSearchResult
 define_graphql_request!(ServiceAggregationLayer, availableBuilds, availableBuilds); // Input: ServiceAvailableBuildsRequest, Output: ServiceAvailableBuild[]
 define_graphql_request!(ServiceAggregationLayer, downloadUrl, downloadUrl); // Input: ServiceDownloadUrlRequest, Output: ServiceDownloadUrlMetadata
 define_graphql_request!(ServiceAggregationLayer, GameImages, game); // Input: ServiceGameImagesRequest, Output: ServiceGame
@@ -290,6 +298,13 @@ service_layer_type!(GetUserPlayerRequest, {
     // but I'm not sure what they are.
 });
 
+service_layer_type!(AddonSearchRequest, {
+    master_title_id: String,
+    category_id: String,
+    offer_ids: Vec<String>,
+    platform: String,
+});
+
 // Responses
 
 service_layer_type!(Image, {
@@ -299,8 +314,11 @@ service_layer_type!(Image, {
 });
 
 service_layer_type!(AvatarList, {
+    #[serde(deserialize_with = "ServiceImage::deserialize_large_avatar")]
     large: ServiceImage,
+    #[serde(deserialize_with = "ServiceImage::deserialize_medium_avatar")]
     medium: ServiceImage,
+    #[serde(deserialize_with = "ServiceImage::deserialize_small_avatar")]
     small: ServiceImage,
 });
 
@@ -489,7 +507,9 @@ impl ServiceAvailableBuilds {
     }
 
     pub fn build(&self, id: &str) -> Option<&ServiceAvailableBuild> {
-        self.builds.iter().find(|b| b.game_version() == &Some(id.to_owned()))
+        self.builds
+            .iter()
+            .find(|b| b.game_version() == &Some(id.to_owned()))
     }
 }
 
@@ -624,13 +644,54 @@ service_layer_type!(LegacyOffer, {
 
 impl ServiceLegacyOffer {
     pub fn has_cloud_save(&self) -> bool {
-        !self.cloud_save_configuration_override.clone().unwrap_or_default().is_empty()
+        !self
+            .cloud_save_configuration_override
+            .clone()
+            .unwrap_or_default()
+            .is_empty()
     }
 }
 
-service_layer_type!(RecentGames, {
+service_layer_type!(AddonOffer, {
+        offer_id: String,
+        offer_type: String,
+        finance_id: String,
+        default_locale: String,
+        platform: crate::core::ecommerce::CommercePlatform,
+        image_server: String,
+        game_edition_type_facet_key_rank_desc: String,
+        long_description: String,
+        display_name: String,
+        short_description: String,
+        pack_art_small: String,
+        pack_art_medium: String,
+        pack_art_large: String,
+        origin_display_type: String,
+        is_published: bool,
+        published_date: String,
+        cdn_asset_root: String,
+        origin_store_preview: bool,
+        is_owned: bool,
+        user_can_purchase: bool,
+        price: f32,
+        display_price: String,
+        list_price: f64,
+        display_list_price: String,
+        currency_type: String,
+        currency: String,
+        is_discount: bool,
+    }
+);
 
+service_layer_type!(AddonSearchResultRoot, {
+    addonSearch: ServiceAddonSearchResult,
 });
+
+service_layer_type!(AddonSearchResult, {
+    addonOffers: Vec<ServiceAddonOffer>,
+});
+
+service_layer_type!(RecentGames, {});
 
 service_layer_type!(HeroBackgroundImageRequest, {
     game_slug: String,
@@ -649,3 +710,45 @@ service_layer_type!(GameHub, {
 service_layer_type!(GameHubCollection, {
     items: Vec<ServiceGameHub>,
 });
+
+// Serde treats a field being null differently from the field not being there, so we need to do custom deserialization to handle this.
+impl ServiceImage {
+    fn deserialize_large_avatar<'de, D>(deserializer: D) -> Result<ServiceImage, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            ServiceImage::deserialize(deserializer).unwrap_or(ServiceImage {
+                height: Some(416),
+                width: Some(416),
+                path: LARGE_AVATAR_PATH.to_owned(),
+            }),
+        )
+    }
+
+    fn deserialize_medium_avatar<'de, D>(deserializer: D) -> Result<ServiceImage, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            ServiceImage::deserialize(deserializer).unwrap_or(ServiceImage {
+                width: Some(208),
+                height: Some(208),
+                path: MEDIUM_AVATAR_PATH.to_owned(),
+            }),
+        )
+    }
+
+    fn deserialize_small_avatar<'de, D>(deserializer: D) -> Result<ServiceImage, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            ServiceImage::deserialize(deserializer).unwrap_or(ServiceImage {
+                width: Some(40),
+                height: Some(40),
+                path: SMALL_AVATAR_PATH.to_owned(),
+            }),
+        )
+    }
+}

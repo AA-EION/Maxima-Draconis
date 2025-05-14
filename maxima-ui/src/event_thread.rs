@@ -24,11 +24,15 @@ pub enum MaximaEventRequest {
     ShutdownRequest,
 }
 
-pub struct EventThread {
-}
+pub struct EventThread {}
 
 impl EventThread {
-    pub fn new(ctx: &Context, maxima: LockedMaxima,  rtm_cmd_listener: Receiver<MaximaEventRequest>, rtm_responder: Sender<MaximaEventResponse>) -> Self {
+    pub fn new(
+        ctx: &Context,
+        maxima: LockedMaxima,
+        rtm_cmd_listener: Receiver<MaximaEventRequest>,
+        rtm_responder: Sender<MaximaEventResponse>,
+    ) -> Self {
         let context = ctx.clone();
 
         tokio::task::spawn(async move {
@@ -49,7 +53,6 @@ impl EventThread {
         ctx: &Context,
         maxima_arc: LockedMaxima,
     ) -> Result<()> {
-
         let mut maxima = maxima_arc.lock().await;
 
         let friends: ServiceFriends = maxima
@@ -97,9 +100,7 @@ impl EventThread {
             }
 
             match request? {
-                MaximaEventRequest::SubscribeToFriendPresence => {
-
-                }
+                MaximaEventRequest::SubscribeToFriendPresence => {}
                 MaximaEventRequest::ShutdownRequest => break 'outer Ok(()),
             }
 

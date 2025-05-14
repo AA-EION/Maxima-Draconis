@@ -34,6 +34,7 @@ use super::{
         game::{handle_all_game_info_request, handle_game_info_request},
         igo::handle_show_igo_window_request,
         license::handle_license_request,
+        offer::handle_query_offers_request,
         profile::{
             handle_presence_request, handle_profile_request, handle_query_friends_request,
             handle_query_image_request, handle_query_presence_request, handle_set_presence_request,
@@ -134,7 +135,7 @@ pub fn get_os_pid(context: &ActiveGameContext) -> Result<u32> {
         }
 
         let mut cmd = process.cmd()[0].to_owned();
-        
+
         // Wine path handling
         if cfg!(unix) && cmd.starts_with("Z:") {
             cmd = cmd.replace("Z:", "").replace('\\', "/");
@@ -210,10 +211,13 @@ impl Connection {
                     .to_str()
                     .unwrap()
                     .to_owned();
-    
+
                     pid = get_wine_pid(&context.launch_id(), &filename).await;
                 } else {
-                    warn!("Failed to find game process while looking for PID {}", os_pid);
+                    warn!(
+                        "Failed to find game process while looking for PID {}",
+                        os_pid
+                    );
                 }
             }
         }
@@ -399,6 +403,7 @@ impl Connection {
             GetAuthCode handle_auth_code_request,
             GetPresence handle_presence_request,
             SetPresence handle_set_presence_request,
+            QueryOffers handle_query_offers_request,
             QueryPresence handle_query_presence_request,
             QueryFriends handle_query_friends_request,
             QueryEntitlements handle_query_entitlements_request,
