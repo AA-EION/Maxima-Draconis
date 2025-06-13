@@ -3,7 +3,6 @@ fn main() -> std::io::Result<()> {
     tonic_build::configure().build_client(true).compile_protos(
         &[
             "src/social/proto/eadp/social/presence/v1/presence_service.proto",
-            "src/social/proto/eadp/social/gameinvite/v1/game_invite_service.proto",
         ],
         &["src/social/proto/"],
     )?;

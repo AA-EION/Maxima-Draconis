@@ -3,7 +3,7 @@ use thiserror::Error;
 pub mod eadp {
     pub mod common {
         pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/eadp.common.v1.rs"));
+            tonic::include_proto!("eadp.common.v1");
             impl PlayerNetworkId {
                 pub fn ea() -> Self {
                     Self {
@@ -27,7 +27,7 @@ pub mod eadp {
             }
         }
         pub mod v2 {
-            include!(concat!(env!("OUT_DIR"), "/eadp.common.v2.rs"));
+            tonic::include_proto!("eadp.common.v2");
         }
     }
     pub mod social {
