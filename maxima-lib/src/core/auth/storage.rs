@@ -5,7 +5,6 @@ use crate::core::auth::hardware::HardwareHashError;
 use crate::ooa::LicenseError;
 use crate::util::native::{maxima_dir, NativeError};
 use log::info;
-use reqwest::header::ToStrError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -59,7 +58,9 @@ pub enum AuthError {
     #[error(transparent)]
     PCSign(#[from] HardwareHashError),
     #[error(transparent)]
-    HeaderStr(#[from] http::header::ToStrError),
+    HeaderStrHttp(#[from] http::header::ToStrError),
+    #[error(transparent)]
+    HeaderStrReqwest(#[from] reqwest::header::ToStrError),
 
     #[error("no token was provided")]
     NoToken,

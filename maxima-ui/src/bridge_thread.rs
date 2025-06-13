@@ -11,6 +11,8 @@ use crate::{
     views::friends_view::UIFriend,
     GameDetails, GameInfo, GameSettings,
 };
+use maxima::social::client::{SocialClient, SocialRequest};
+use maxima::social::SocialError;
 use maxima::{
     content::manager::{
         ContentManager, ContentManagerError, QueuedGameBuilder, QueuedGameBuilderError,
@@ -140,6 +142,8 @@ pub enum BackendError {
     RegistryError(#[from] RegistryError),
     #[error(transparent)]
     Rtm(#[from] RtmError),
+    #[error(transparent)]
+    SocialClient(#[from] SocialError),
     #[error(transparent)]
     SendResponse(#[from] SendError<MaximaLibResponse>),
     #[error(transparent)]

@@ -9,11 +9,12 @@ use maxima::core::{
     },
     LockedMaxima,
 };
+use maxima::social::client::{SocialClient, SocialEvent, SocialRequest, UserPresence};
 
 // TODO(headassbtw): integrate this into the enum too (out of scope for the PR i wrote this in)
 pub struct EventThreadFriendStatusResponse {
     pub id: String,
-    pub presence: maxima::rtm::client::RichPresence,
+    pub presence: UserPresence,
 }
 
 pub enum MaximaEventResponse {
@@ -77,27 +78,26 @@ impl EventThread {
         info!("Subscribed to {} players", players.len());
 
         rtm.subscribe(&players).await?;
+
+        let mut social_rx = maxima.social().subscribe().await;
+
         drop(maxima);
 
         'outer: loop {
             let mut maxima = maxima_arc.lock().await;
             maxima.rtm().heartbeat().await?;
+            drop(maxima);
 
-            {
-                let store = maxima.rtm().presence_store().lock().await;
-                for entry in store.iter() {
-                    let _ = rtm_responder.send(MaximaEventResponse::FriendStatusResponse(
-                        EventThreadFriendStatusResponse {
-                            id: entry.0.to_string(),
-                            presence: entry.1,
-                        },
-                    ));
-                    // This can cause excessive repainting if it keeps updating friends we know about
-                    egui::Context::request_repaint(&ctx);
+            if let Ok(event) = social_rx.try_recv() {
+                match event {
+                    SocialEvent::FriendPresence { id, presence } => {
+                        let _ = rtm_responder.send(MaximaEventResponse::FriendStatusResponse(
+                            EventThreadFriendStatusResponse { id, presence },
+                        ));
+                    }
+                    SocialEvent::Error(_) => {}
                 }
             }
-
-            drop(maxima);
 
             let request = rtm_cmd_listener.try_recv();
             if request.is_err() {

@@ -1,9 +1,10 @@
 use log::{debug, info};
 
 use crate::core::service_layer::{
-    ServiceFriends, ServiceGetMyFriendsRequestBuilder, ServiceLayerError,
+    ServiceFriend, ServiceFriends, ServiceGetMyFriendsRequestBuilder, ServiceLayerError,
     SERVICE_REQUEST_GETMYFRIENDS,
 };
+use crate::social::client::{UserPresence, UserPresenceBasic};
 use crate::{
     lsx::{
         connection::LockedConnectionState,
@@ -17,7 +18,6 @@ use crate::{
         },
     },
     make_lsx_handler_response,
-    rtm::client::{BasicPresence, RichPresenceBuilder},
     util::native::{platform_path, NativeError, SafeStr},
 };
 
@@ -103,7 +103,7 @@ pub async fn handle_set_presence_request(
         maxima
             .rtm()
             .set_presence(
-                BasicPresence::Online,
+                crate::rtm::client::BasicPresence::Online,
                 &format!("{}: {}", name, presence),
                 &offer_id,
             )
@@ -121,34 +121,46 @@ pub async fn handle_query_presence_request(
 
     let mut state = state.write().await;
     let mut maxima = state.maxima().await;
-    let presence_store = maxima.rtm().presence_store().lock().await;
+    let maxima_friends = maxima.friends(0).await?;
+    let presence_store = maxima.social().presence_store().lock().await;
 
-    for user in request.Users {
+    for user in &request.Users {
+        let friend = maxima_friends
+            .iter()
+            .find(|a| a.id().eq(&user.to_string()))
+            .ok_or(LSXRequestError::UserNotOnFriendsList)?;
+        // maybe use placeholders instead of throwing an error?
+        // it's very important but not necessarily "critical" - headassbtw
+
         let presence = match presence_store.get(&user.to_string()) {
-            Some(p) => p,
+            Some(p) => p.clone(),
             None => continue,
         };
 
-        let game = if let Some(game) = presence.game() {
-            game.to_owned()
-        } else {
-            String::new()
-        };
-
         friends.push(LSXFriend {
-            attr_TitleId: "".to_string(),
-            attr_MultiplayerId: "".to_string(),
-            attr_Persona: "------".to_string(),
-            attr_RichPresence: presence.status().to_string(),
-            attr_GamePresence: game,
+            attr_TitleId: presence.offer_id.clone().unwrap_or(String::new()),
+            attr_MultiplayerId: presence.multiplayer_id.unwrap_or(String::new()),
+            attr_Persona: friend.display_name().clone(),
+            attr_RichPresence: presence.rich_presence.unwrap_or(String::new()),
+            attr_GamePresence: presence.game_presence.unwrap_or(String::new()), // TODO(headassbtw): cross-reference this with EAD (once it's not 00:47 and i have friends on)
             attr_Title: "".to_string(),
-            attr_UserId: user,
-            attr_PersonaId: "0".to_string(),
-            attr_AvatarId: "".to_string(),
-            attr_Group: "".to_string(),
-            attr_GroupId: "".to_string(),
-            attr_Presence: LSXPresence::Ingame,
-            attr_State: LSXFriendState::None,
+            attr_UserId: user.clone(),
+            attr_PersonaId: friend.psd().clone(),
+            attr_AvatarId: format!("user:{}", friend.id()),
+            attr_Group: presence.group_name.unwrap_or(String::new()),
+            attr_GroupId: presence.group_id.unwrap_or(String::new()),
+            attr_Presence: if presence.offer_id.is_some() {
+                if presence.joinable_invite_only.unwrap_or(false) {
+                    LSXPresence::JoinableInviteOnly
+                } else if presence.joinable.unwrap_or(false) {
+                    LSXPresence::Joinable
+                } else {
+                    LSXPresence::Ingame
+                }
+            } else {
+                presence.basic.into()
+            },
+            attr_State: LSXFriendState::Mutual,
         });
     }
 
@@ -163,7 +175,6 @@ pub async fn handle_query_friends_request(
     let mut maxima = state.maxima().await;
 
     let friends = maxima.friends(0).await?;
-    let presence_store = maxima.rtm().presence_store().lock().await;
 
     let mut lsx_friends = Vec::new();
     for ele in friends {
@@ -171,46 +182,39 @@ pub async fn handle_query_friends_request(
             continue;
         }
 
-        let mut presence = presence_store.get(ele.id()).unwrap_or_else(|| {
-            RichPresenceBuilder::default()
-                .basic(BasicPresence::Offline)
-                .status(String::new())
-                .game(None)
-                .build()
-                .unwrap()
-        });
+        let presence_store = maxima.social().presence_store.lock().await;
 
-        let mut lsx_presence = match presence.basic() {
-            BasicPresence::Unknown => LSXPresence::Unknown,
-            BasicPresence::Offline => LSXPresence::Offline,
-            BasicPresence::Dnd => LSXPresence::Busy,
-            BasicPresence::Away => LSXPresence::Idle,
-            BasicPresence::Online => LSXPresence::Online,
+        let mut presence = match presence_store.get(ele.id()) {
+            Some(p) => p.clone(),
+            None => UserPresence {
+                basic: UserPresenceBasic::Offline,
+                ..Default::default()
+            },
         };
-
-        let game = if let Some(game) = presence.game() {
-            game.to_owned()
-        } else {
-            String::new()
-        };
-
-        if !game.is_empty() {
-            lsx_presence = LSXPresence::Ingame;
-        }
 
         lsx_friends.push(LSXFriend {
-            attr_TitleId: "".to_string(),
-            attr_MultiplayerId: "".to_string(),
-            attr_Persona: ele.unique_name().to_string(),
-            attr_RichPresence: presence.status().to_string(),
-            attr_GamePresence: game,
+            attr_TitleId: presence.offer_id.clone().unwrap_or(String::new()),
+            attr_MultiplayerId: presence.multiplayer_id.unwrap_or(String::new()),
+            attr_Persona: ele.display_name().clone(), // display name
+            attr_RichPresence: presence.rich_presence.unwrap_or(String::new()),
+            attr_GamePresence: presence.game_presence.unwrap_or(String::new()),
             attr_Title: "".to_string(),
             attr_UserId: ele.id().parse()?,
-            attr_PersonaId: ele.pd().parse()?,
-            attr_AvatarId: format!("user:{}", ele.id()).to_string(),
-            attr_Group: "".to_string(),
-            attr_GroupId: "".to_string(),
-            attr_Presence: lsx_presence,
+            attr_PersonaId: ele.psd().clone(),
+            attr_AvatarId: format!("user:{}", ele.id().clone()),
+            attr_Group: presence.group_name.unwrap_or(String::new()),
+            attr_GroupId: presence.group_id.unwrap_or(String::new()),
+            attr_Presence: if presence.offer_id.is_some() {
+                if presence.joinable_invite_only.unwrap_or(false) {
+                    LSXPresence::JoinableInviteOnly
+                } else if presence.joinable.unwrap_or(false) {
+                    LSXPresence::Joinable
+                } else {
+                    LSXPresence::Ingame
+                }
+            } else {
+                presence.basic.into()
+            },
             attr_State: LSXFriendState::Mutual,
         });
     }

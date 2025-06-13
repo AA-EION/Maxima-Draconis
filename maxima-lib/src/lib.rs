@@ -9,6 +9,7 @@ pub mod core;
 pub mod lsx;
 pub mod ooa;
 pub mod rtm;
+pub mod social;
 pub mod util;
 
 #[cfg(unix)]

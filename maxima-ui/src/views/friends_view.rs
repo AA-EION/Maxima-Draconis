@@ -1,12 +1,12 @@
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Rect, Rounding, Stroke, Ui, Vec2};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
-use maxima::rtm::client::BasicPresence;
 
 use crate::{
     translation_manager::positional_replace, widgets::enum_dropdown::enum_dropdown, MaximaEguiApp,
     FRIEND_INGAME_COLOR,
 };
 
+use maxima::social::client::UserPresenceBasic;
 use strum_macros::EnumIter;
 
 #[derive(Debug, PartialEq, Default, EnumIter)]
@@ -40,7 +40,7 @@ pub struct FriendsViewBar {
 pub struct UIFriend {
     pub name: String,
     pub id: String,
-    pub online: BasicPresence,
+    pub online: UserPresenceBasic,
     pub game: Option<String>,
     pub game_presence: Option<String>,
 }
@@ -171,11 +171,10 @@ pub fn friends_view(app: &mut MaximaEguiApp, ui: &mut Ui) {
             FriendsViewBarPage::All => true,
             FriendsViewBarPage::Online => {
               match obj.online {
-                BasicPresence::Unknown => false,
-                BasicPresence::Offline => false,
-                BasicPresence::Dnd => true,
-                BasicPresence::Away => true,
-                BasicPresence::Online => true,
+                  UserPresenceBasic::Unknown => false,
+                  UserPresenceBasic::Offline => false,
+                  UserPresenceBasic::Online => true,
+                  UserPresenceBasic::Away => true,
               }
             },
             FriendsViewBarPage::Pending => false,
@@ -212,11 +211,11 @@ pub fn friends_view(app: &mut MaximaEguiApp, ui: &mut Ui) {
           let how_buttons = context.animate_bool_with_easing(Id::new("friendlistbuttons_".to_owned()+&friend.id), buttons, ease_out_cubic);
           let (friend_status, friend_color) =
           match friend.online {
-            BasicPresence::Unknown => (&app.locale.localization.friends_view.status.unknown as &String, Color32::DARK_RED),
-            BasicPresence::Offline => (&app.locale.localization.friends_view.status.offline, Color32::GRAY),
-            BasicPresence::Dnd => (&app.locale.localization.friends_view.status.do_not_disturb, Color32::RED),
-            BasicPresence::Away => (&app.locale.localization.friends_view.status.away, Color32::GOLD),
-            BasicPresence::Online => {
+              UserPresenceBasic::Unknown => (&app.locale.localization.friends_view.status.unknown as &String, Color32::DARK_RED),
+              UserPresenceBasic::Offline => (&app.locale.localization.friends_view.status.offline, Color32::GRAY),
+              //UserPresenceBasic::Dnd => (&app.locale.localization.friends_view.status.do_not_disturb, Color32::RED),
+              UserPresenceBasic::Away => (&app.locale.localization.friends_view.status.away, Color32::GOLD),
+              UserPresenceBasic::Online => {
 
               if let Some(game) = &friend.game  {
                 ( if let Some(presence) = &friend.game_presence {

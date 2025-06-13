@@ -13,8 +13,8 @@ use prost::{
     bytes::{Buf, BufMut, BytesMut},
     Message,
 };
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,

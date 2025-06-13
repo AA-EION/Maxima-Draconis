@@ -66,6 +66,7 @@ use crate::{
     content::manager::{ContentManager, ContentManagerError},
     lsx::{self, service::LSXServerError, types::LSXRequestType},
     rtm::client::{BasicPresence, RtmClient},
+    social::client::SocialClient,
     util::native::{maxima_dir, NativeError},
 };
 
@@ -102,6 +103,9 @@ pub struct Maxima {
 
     #[getter(skip)]
     rtm: RtmClient,
+
+    #[getter(skip)]
+    social: SocialClient,
 
     #[getter(skip)]
     request_cache: DynamicCache<String>,
@@ -145,7 +149,9 @@ impl Maxima {
     pub async fn new_with_options(
         options: MaximaOptions,
     ) -> Result<LockedMaxima, MaximaCreationError> {
-        rustls::crypto::ring::default_provider().install_default().unwrap();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .unwrap(); // TODO(headassbtw) error handling
         let lsx_port = if let Ok(lsx_port) = env::var("MAXIMA_LSX_PORT") {
             lsx_port.parse::<u16>()?
         } else {
@@ -213,7 +219,8 @@ impl Maxima {
             lsx_connections: 0,
             cloud_sync: CloudSyncClient::new(auth_storage.clone()),
             content_manager: ContentManager::new(auth_storage.clone(), false).await?,
-            rtm: RtmClient::new(auth_storage),
+            rtm: RtmClient::new(auth_storage.clone()),
+            social: SocialClient::new(auth_storage),
             request_cache,
             dummy_local_user,
             pending_events: Vec::new(),
@@ -422,6 +429,10 @@ impl Maxima {
 
     pub fn rtm(&mut self) -> &mut RtmClient {
         &mut self.rtm
+    }
+
+    pub fn social(&mut self) -> &mut SocialClient {
+        &mut self.social
     }
 
     pub fn set_lsx_port(&mut self, port: u16) {
