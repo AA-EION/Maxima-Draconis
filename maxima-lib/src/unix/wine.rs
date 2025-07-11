@@ -393,6 +393,13 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             ],
         ),
         (
+            "HKEY_LOCAL_MACHINE\\Software\\Origin",
+            &[
+                ("InstallSuccessful", "true"),
+                ("ClientPath", "C:/Windows/System32/conhost.exe"),
+            ],
+        ),
+        (
             "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\EA Desktop",
             &[("InstallSuccessful", "true")],
         ),
