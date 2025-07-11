@@ -432,7 +432,7 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         "regedit",
         Some(vec![path.safe_str()?]),
         None,
-        false,
+        true,
         CommandType::Run,
     )
     .await?;
