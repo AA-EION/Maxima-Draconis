@@ -375,7 +375,7 @@ fn extract_archive<R: Read + Sized>(
     Ok(())
 }
 
-pub async fn setup_wine_registry() -> Result<()> {
+pub async fn setup_wine_registry() -> Result<(), NativeError> {
     run_wine_command(
         "reg",
         Some(vec![
