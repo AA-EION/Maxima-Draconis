@@ -1,4 +1,5 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::iter::once;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
