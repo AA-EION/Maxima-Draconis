@@ -89,8 +89,11 @@ impl DllInjector {
                 return Err(InjectionError::WriteProcessMemoryFailed(GetLastError()));
             }
 
-            let kernel32_cstring = CString::new("kernel32.dll").unwrap();
-            let kernel32_handle = GetModuleHandleA(kernel32_cstring.as_ptr());
+            let kernel32_wide: Vec<u16> = OsStr::new("kernel32.dll")
+                .encode_wide()
+                .chain(once(0))
+                .collect();
+            let kernel32_handle = GetModuleHandleW(kernel32_wide.as_ptr());
             if kernel32_handle.is_null() {
                 return Err(InjectionError::GetModuleHandleFailed(GetLastError()));
             }
