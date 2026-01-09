@@ -280,6 +280,8 @@ pub async fn start_game(
 
             if needs_license_update(&content_id).await? {
                 request_and_save_license(&auth, &content_id, path.to_owned().into()).await?;
+            } else {
+                info!("Existing game license is still valid, not updating");
             }
         }
     }
