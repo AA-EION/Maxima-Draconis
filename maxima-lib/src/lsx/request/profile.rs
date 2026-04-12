@@ -90,7 +90,10 @@ pub async fn handle_set_presence_request(
     let arc = state.write().await.maxima_arc();
     let mut maxima = arc.lock().await;
 
-    let playing = maxima.playing().as_ref().unwrap();
+    // when connecting to lsx from outside outside of maxima playing isn't set so this has to be a check not an unwrap
+    let Some(playing) = maxima.playing().as_ref() else {
+        return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
+    };
     if playing.mode().is_online_offline() {
         return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
     }
