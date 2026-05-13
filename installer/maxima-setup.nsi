@@ -14,8 +14,12 @@
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
 
-; Where the cross-compiled binaries live
-!define BIN_DIR "..\target\x86_64-pc-windows-gnu\release"
+; Binary directory — override at compile time with /DBIN_DIR="..."
+; Default is the macOS cross-compilation path (installer/build.sh).
+; CI Windows native builds pass /DBIN_DIR="..\target\release"
+!ifndef BIN_DIR
+  !define BIN_DIR "..\target\x86_64-pc-windows-gnu\release"
+!endif
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "MaximaSetup.exe"

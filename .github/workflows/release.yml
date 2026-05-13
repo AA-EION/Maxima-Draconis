@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  # ── macOS: build MaximaHelper.app ──────────────────────────────────────────
+  build-helper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build MaximaHelper.app
+        run: bash MaximaHelper/build.sh --output ./dist --no-register
+
+      - name: Zip MaximaHelper.app
+        run: |
+          cd dist
+          zip -r --symlinks MaximaHelper.zip MaximaHelper.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maxima-helper
+          path: dist/MaximaHelper.zip
+
+  # ── Windows: build binaries + NSIS installer ──────────────────────────────
+  build-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Maxima
+        run: cargo build --release
+
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Build installer
+        run: |
+          $env:PATH += ";C:\Program Files (x86)\NSIS"
+          makensis /DBIN_DIR="..\target\release" installer\maxima-setup.nsi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maxima-installer
+          path: installer/MaximaSetup.exe
+
+  # ── Create GitHub Release ─────────────────────────────────────────────────
+  release:
+    needs: [build-helper, build-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: maxima-helper
+          path: ./artifacts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: maxima-installer
+          path: ./artifacts
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "Maxima-Draconis ${{ steps.tag.outputs.name }}"
+          body: |
+            ## Assets
+
+            | File | Description |
+            |------|-------------|
+            | `MaximaHelper.zip` | macOS background agent — unzip and place `MaximaHelper.app` in a stable folder, then run `MaximaHelper/build.sh` to register the `qrc://` scheme |
+            | `MaximaSetup.exe` | Windows installer — run inside your CrossOver bottle to install Maxima and register protocol handlers |
+
+            See [README](https://github.com/AA-EION/Maxima-Draconis#setup-on-macos) for setup instructions.
+          draft: false
+          prerelease: true
+          files: |
+            ./artifacts/MaximaHelper.zip
+            ./artifacts/MaximaSetup.exe
