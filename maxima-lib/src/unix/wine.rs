@@ -289,7 +289,17 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             .spawn()?
             .wait_with_output()
             .await?;
+        // Capture both streams. stderr is appended (labelled) so Wine diagnostics
+        // surface in WineError::Command instead of being silently dropped.
         output_str = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.stderr.is_empty() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            if !output_str.is_empty() {
+                output_str.push('\n');
+            }
+            output_str.push_str("[stderr] ");
+            output_str.push_str(&stderr_str);
+        }
         status = output.status;
     } else {
         status = child.spawn()?.wait().await?;

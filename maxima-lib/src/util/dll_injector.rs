@@ -57,7 +57,7 @@ impl DllInjector {
                 .encode_wide()
                 .chain(once(0))
                 .collect();
-            let dll_path_size = dll_path_wide.len() * size_of::<u16>();
+            let dll_path_size = dll_path_wide.len() * mem::size_of::<u16>();
 
             let remote_memory = VirtualAllocEx(
                 process_handle,
