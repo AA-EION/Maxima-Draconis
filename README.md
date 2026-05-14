@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="maxima-resources/assets/logo.png" width="120" alt="Maxima logo" />
+  <img src="images/1500x500.jpg" alt="Maxima-Draconis banner" />
 </p>
 
-<h1 align="center">Maxima</h1>
+<h1 align="center">Maxima-Draconis</h1>
 
 <p align="center">
-  A free, open-source replacement for the EA Desktop Launcher.
+  EA authentication and launch backend for <a href="https://github.com/AA-EION/Draconis">Draconis</a>.
 </p>
 
 <p align="center">
@@ -17,103 +17,125 @@
 ---
 
 > [!WARNING]
-> Maxima is pre-pre-pre-alpha software, released early to support [KYBER](https://github.com/ArmchairDevelopers/Kyber). Expect rough edges.
+> This is a **fork** of [ArmchairDevelopers/Maxima](https://github.com/ArmchairDevelopers/Maxima) primarily maintained for [Draconis](https://github.com/AA-EION/Draconis) on macOS/CrossOver. The code is still portable to the other OSes upstream supports (native Windows + Linux), but only the macOS/CrossOver path is actively tested. If you want a vanilla build on Linux or native Windows, the upstream repo may be a better fit.
 
-**This is the Maxima-Draconis fork** — the EA authentication and launch backend for [Draconis](https://github.com/AA-EION/Draconis), a native macOS launcher for Titanfall 2. This fork is tested and maintained exclusively for **Titanfall 2 on macOS via CrossOver / Wine**. It may work in other configurations, but none are tested or supported here. For a general-purpose build, use [ArmchairDevelopers/Maxima](https://github.com/ArmchairDevelopers/Maxima).
-
-> [!IMPORTANT]
-> **Maxima does not run natively on macOS.** It is a Windows application that runs inside a CrossOver or Wine bottle. The Mac host only needs `MaximaHelper.app`, a lightweight background agent that bridges EA's `qrc://` login redirect from the macOS side into the bottle. Without it, the EA OAuth flow stalls because macOS browsers cannot forward `qrc://` links into Wine.
+**Maxima is an open-source replacement for the EA Desktop Launcher.** It handles the EA authentication handshake and license resolution that EA-published games require at startup. On macOS, it runs entirely **inside a CrossOver or Wine bottle** — it is a Windows application, not a native Mac app. The only Mac-native piece is `MaximaHelper.app`, a lightweight background agent that bridges EA's `qrc://` OAuth redirect from your browser into the bottle.
 
 ---
 
-## What this fork supports
-
-**Tested and maintained:**
-- EA authentication — OAuth login flow with a `remid`-cookie fallback for when the browser gets stuck on the `qrc://` redirect
-- `link2ea://` and `origin2://` protocol handlers — Steam uses these to launch Titanfall 2 through Maxima inside Wine
-- Offline mode — launch Titanfall 2 using a cached local license without re-authenticating
-- Titanfall 2 launch via Steam on macOS / CrossOver
-
-**In the codebase but not tested in this fork:**
-- Other EA titles
-- Downloading / updating games
-- Cloud save sync
-- Friends and social features
-- Linux / SteamDeck
-- Direct Windows install
-- Epic Games Store
-
----
-
-## How it works
+## How it fits into Draconis
 
 ```
 macOS host
-├── Draconis.app          — native launcher UI (SwiftUI)
-├── MaximaHelper.app      — catches qrc:// from the browser, forwards to Wine
+├── Draconis.app          ← native SwiftUI launcher
+│   └── Resources/
+│       └── MaximaHelper.app  ← bridges qrc:// OAuth from browser → Wine
 │
 └── CrossOver bottle
-    ├── maxima-bootstrap  — handles link2ea:// URIs from Steam
-    ├── maxima-cli        — authenticates with EA, resolves the offer ID
+    ├── maxima-bootstrap.exe  ← catches link2ea:// and origin2:// URIs
+    ├── maxima-cli.exe        ← authenticates with EA, resolves the license
     └── Titanfall2.exe
 ```
 
-When Steam launches Titanfall 2, it sends a `link2ea://` URI → `maxima-bootstrap` catches it inside Wine → `maxima-cli` authenticates with EA and resolves the license → `Titanfall2.exe` launches.
+**Launch sequence:**
+
+1. Draconis starts `Titanfall2.exe` (or `steam.exe -applaunch 1237970 -northstar` for Northstar).
+2. The game emits `link2ea://launchgame/Origin.OFR.50.0002694?...` to request EA auth.
+3. Wine routes that URI to `maxima-bootstrap.exe` (registered by the installer).
+4. `maxima-bootstrap` calls `maxima-cli launch Origin.OFR.50.0002694`.
+5. `maxima-cli` logs into EA (OAuth via browser if needed — `MaximaHelper.app` handles the `qrc://` redirect back into Wine), fetches the Denuvo license token, and feeds it to the game via LSX.
+6. Titanfall 2 launches.
+
+For Northstar mode the same auth chain fires after Steam starts the game.
 
 ---
 
-## Setup on macOS
+## What this fork adds over upstream
 
-**Step 1 — Build `MaximaHelper.app` on your Mac** (outside CrossOver, run once):
+| Change | Detail |
+|--------|--------|
+| **`MaximaHelper.app`** | Native Swift background agent for macOS — replaces the old AppleScript helper. Properly bundle-signed so LaunchServices registers `qrc://`. |
+| **NSIS installer** | Cross-compiled from macOS via `mingw-w64` + `nsis`. Registers all three protocol handlers (`link2ea://`, `origin2://`, `qrc://`) inside Wine. |
+| **Release CI** | GitHub Actions workflow that builds and publishes `MaximaHelper.zip` + `MaximaSetup.exe` — Draconis fetches these automatically at build time. |
+| **Steam-only owner passthrough** | When the EA library lookup fails but the slug is already a valid offer ID (`Origin.OFR.X.Y`), Maxima now passes it directly to EA's license server instead of bailing. Useful when TF2 is owned through Steam only and the accounts aren't linked. |
+| **`origin2://` fix** | The upstream handler hardcoded the Star Wars Battlefront 2 offer ID. Fixed to read the actual `offerIds` from the URL — any EA title can now use `origin2://`. |
+| **Wine registry** | Added the bare `HKEY_LOCAL_MACHINE\Software\Origin` key (without `Electronic Arts\` prefix) that some games require. `regedit` now runs silently (`/S`) with stderr captured, so Wine errors appear in logs instead of hanging silently. |
+| **DLL injector wide strings** | Fixed `GetModuleHandleA` / `LoadLibraryA` → `GetModuleHandleW` / `LoadLibraryW`. DLL injection no longer breaks on non-ASCII installation paths. |
+
+---
+
+## Setup (manual — Draconis automates this)
+
+> If you are using Draconis v0.4.0+, you don't need to do any of this manually. Draconis downloads `MaximaSetup.exe` from the latest release of this repo and installs it into your bottle automatically.
+
+**Prerequisites:** Xcode Command Line Tools (`xcode-select --install`), `brew install mingw-w64 nsis`.
 
 ```bash
-# Requires Xcode Command Line Tools: xcode-select --install
+# 1. Build MaximaHelper.app (runs on macOS host, bridges qrc:// OAuth)
 bash MaximaHelper/build.sh
-```
 
-This compiles and registers a native Swift background agent on your Mac that intercepts `qrc://` URLs from the browser and tunnels them into the Wine bottle during EA login.
-
-**Step 2 — Build the Windows installer on your Mac** (cross-compile, outside CrossOver):
-
-```bash
-# Requires: brew install mingw-w64 nsis
+# 2. Cross-compile the Windows installer
 bash installer/build.sh
 # → produces installer/MaximaSetup.exe
+
+# 3. Run MaximaSetup.exe inside your CrossOver bottle
+#    It installs maxima-cli, maxima-bootstrap, maxima-service,
+#    and registers link2ea://, origin2://, and qrc:// in Wine's registry.
 ```
 
-**Step 3 — Install Maxima inside your CrossOver bottle:**
+---
 
-Run `MaximaSetup.exe` inside the bottle. It registers the `link2ea://`, `origin2://`, and `qrc://` protocol handlers within Wine, installs the background service, and adds start menu shortcuts.
+## Building from source
 
-> In a future [Draconis](https://github.com/AA-EION/Draconis) release, these steps will be handled automatically.
+```bash
+# Windows binaries (cross-compiled on macOS)
+cargo build --release --target x86_64-pc-windows-gnu -p maxima-cli
+cargo build --release --target x86_64-pc-windows-gnu -p maxima-bootstrap
+cargo build --release --target x86_64-pc-windows-gnu -p maxima-service
+
+# macOS helper
+bash MaximaHelper/build.sh
+
+# Full installer (bundles all .exe files)
+bash installer/build.sh
+```
+
+---
+
+## Known limitations
+
+- **Steam-only TF2 owners**: If your TF2 EA license isn't linked to your EA account (it's Steam-only), Maxima will warn and attempt a passthrough. For the cleanest experience, link your accounts at [ea.com](https://www.ea.com). Linking takes about 30 seconds and resolves the warning permanently.
+- **Offline mode**: Implemented in the code and works after a successful first online launch. Draconis does not yet expose it in the UI. License files live at `C:/ProgramData/Maxima/Licenses/` and are valid for roughly two weeks.
+- **NorthstarLauncher.exe**: Incompatible with this setup — it hard-codes a call to `Origin.exe` which doesn't exist in Wine. Northstar mode works fine via `steam.exe -applaunch 1237970 -northstar`, which is how Draconis does it.
 
 ---
 
 ## Project layout
 
 ```
-maxima-lib/               Core library (auth, launch, library)
-maxima-cli/               CLI frontend — authenticates and launches games
-maxima-bootstrap/         Windows bootstrap — handles link2ea:// / origin2:// URIs
-maxima-service/           Background Windows service
-maxima-resources/         Shared assets (icons, etc.)
-MaximaHelper/             Native macOS Swift app — bridges qrc:// from host to Wine
-installer/                NSIS script + cross-build script (macOS → Windows .exe)
+maxima-lib/          Core library — auth, launch, license, library lookup
+maxima-cli/          CLI frontend — authenticates and launches games
+maxima-bootstrap/    Windows bootstrap — handles link2ea:// / origin2:// / qrc://
+maxima-service/      Background Windows service — registry setup, DLL injection
+maxima-tui/          Terminal UI (upstream, not used by Draconis)
+maxima-ui/           Graphical UI (upstream, not used by Draconis)
+maxima-resources/    Shared assets (icons, translations)
+MaximaHelper/        macOS Swift app — bridges qrc:// from host into Wine
+installer/           NSIS script + cross-build script (macOS → Windows .exe)
 ```
 
 ---
 
-## Credits
+## Upstream
 
-Maxima was created and is maintained by [ArmchairDevelopers](https://github.com/ArmchairDevelopers). This fork exists solely to support [Draconis](https://github.com/AA-EION/Draconis) and tracks upstream closely.
+This fork tracks [ArmchairDevelopers/Maxima](https://github.com/ArmchairDevelopers/Maxima) closely. Changes specific to Draconis / macOS / CrossOver are kept in this fork; generic fixes are submitted upstream when appropriate.
 
 **Original creators:**
 - [Sean Kahler](https://github.com/battledash) — creator of Maxima
 - [Nick Whelan](https://github.com/headassbtw) — UI maintainer
 - [Paweł Lidwin](https://github.com/imLinguin) — core maintainer
 
-**Upstream:** [ArmchairDevelopers/Maxima](https://github.com/ArmchairDevelopers/Maxima)  
-**Used by:** [AA-EION/Draconis](https://github.com/AA-EION/Draconis)
+**This fork used by:** [AA-EION/Draconis](https://github.com/AA-EION/Draconis)
 
 ---
 

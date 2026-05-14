@@ -48,6 +48,8 @@ use maxima::{
 
 lazy_static! {
     static ref MANUAL_LOGIN_PATTERN: Regex = Regex::new(r"^(.*):(.*)$").unwrap();
+    // Matches a well-formed EA offer ID like "Origin.OFR.50.0002694"
+    static ref EA_OFFER_ID_PATTERN: Regex = Regex::new(r"^Origin\.OFR\.\d+\.\d+$").unwrap();
 }
 
 #[derive(Subcommand, Debug)]
@@ -317,8 +319,18 @@ async fn startup() -> Result<()> {
                 
                 if let Some(id) = found_offer_id {
                     id
+                } else if EA_OFFER_ID_PATTERN.is_match(&slug) {
+                    // The EA library lookup failed (e.g. Steam-only owner whose TF2 is not
+                    // linked to their EA account), but the slug is already a well-formed EA
+                    // offer ID — pass it through and let EA's license server decide.
+                    warn!(
+                        "Offer '{}' not found in EA library; passing through directly. \
+                         If this fails, link your Steam account at https://www.ea.com",
+                        slug
+                    );
+                    slug.clone()
                 } else {
-                    bail!("No owned offer found for '{}'", slug);
+                    bail!("No owned offer found for '{}'. If this is an EA offer ID, make sure your EA and Steam accounts are linked at https://www.ea.com", slug);
                 }
             } else {
                 slug
@@ -693,12 +705,20 @@ async fn get_user_by_id(maxima_arc: LockedMaxima, user_id: &str) -> Result<()> {
 }
 
 async fn get_game_by_slug(maxima_arc: LockedMaxima, slug: &str) -> Result<()> {
-    let maxima = maxima_arc.lock().await;
+    let mut maxima = maxima_arc.lock().await;
 
-    // match maxima.owned_game_by_slug(slug).await {
-    //     Ok(game) => info!("Game: {}", game.id()),
-    //     Err(err) => error!("{}", err),
-    // };
+    match maxima.mut_library().game_by_base_slug(slug).await? {
+        Some(game) => {
+            info!("Slug:       {}", game.slug());
+            info!("Offer ID:   {}", game.offer_id());
+            info!("Content ID: {}", game.offer().content_id());
+            info!("Display:    {}", game.offer().display_name());
+            info!("Installed:  {}", game.is_installed().await);
+        }
+        None => {
+            bail!("No game found for slug '{}'", slug);
+        }
+    }
 
     Ok(())
 }

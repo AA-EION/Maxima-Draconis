@@ -285,10 +285,21 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     if want_output {
         let output = child
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?
             .wait_with_output()
             .await?;
+        // Capture both streams. stderr is appended (labelled) so Wine diagnostics
+        // surface in WineError::Command instead of being silently dropped.
         output_str = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.stderr.is_empty() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            if !output_str.is_empty() {
+                output_str.push('\n');
+            }
+            output_str.push_str("[stderr] ");
+            output_str.push_str(&stderr_str);
+        }
         status = output.status;
     } else {
         status = child.spawn()?.wait().await?;
@@ -386,6 +397,13 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             &[("InstallSuccessful", "true")],
         ),
         (
+            "HKEY_LOCAL_MACHINE\\Software\\Origin",
+            &[
+                ("InstallSuccessful", "true"),
+                ("ClientPath", "C:/Windows/System32/conhost.exe"),
+            ],
+        ),
+        (
             "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Origin",
             &[
                 ("InstallSuccessful", "true"),
@@ -423,9 +441,9 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
 
     run_wine_command(
         "regedit",
-        Some(vec![path.safe_str()?]),
+        Some(vec!["/S", path.safe_str()?]),
         None,
-        false,
+        true,
         CommandType::Run,
     )
     .await?;

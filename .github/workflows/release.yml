@@ -20,6 +20,16 @@ jobs:
       - name: Build MaximaHelper.app
         run: bash MaximaHelper/build.sh --output ./dist --no-register
 
+      - name: Sanity-check helper bundle
+        # Verify the bundle exists, has the expected binary, and declares qrc:// in Info.plist.
+        run: |
+          set -e
+          test -x ./dist/MaximaHelper.app/Contents/MacOS/MaximaHelper
+          test -f ./dist/MaximaHelper.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" \
+            ./dist/MaximaHelper.app/Contents/Info.plist | grep -q "qrc"
+          echo "✓ MaximaHelper.app looks healthy"
+
       - name: Zip MaximaHelper.app
         run: |
           cd dist
@@ -54,7 +64,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build Maxima
-        run: cargo build --release
+        # Build only the Draconis-relevant crates. maxima-ui pulls rustix 0.37
+        # which breaks on modern nightly; maxima-tui is unused by Draconis.
+        run: cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service
 
       - name: Install NSIS
         run: choco install nsis --yes --no-progress
@@ -64,10 +76,32 @@ jobs:
           $env:PATH += ";C:\Program Files (x86)\NSIS"
           makensis /DBIN_DIR="..\target\release" installer\maxima-setup.nsi
 
+      - name: Sanity-check installer
+        # Don't ship an empty / truncated installer.
+        run: |
+          if (-not (Test-Path installer\MaximaSetup.exe)) {
+            Write-Error "MaximaSetup.exe was not produced"; exit 1
+          }
+          $size = (Get-Item installer\MaximaSetup.exe).Length
+          Write-Host "MaximaSetup.exe size: $size bytes"
+          if ($size -lt 100000) {
+            Write-Error "MaximaSetup.exe is suspiciously small (<100KB)"; exit 1
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: maxima-installer
           path: installer/MaximaSetup.exe
+
+      # Also publish loose binaries so a broken release can be debugged without
+      # re-running the workflow.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maxima-binaries-win64
+          path: |
+            target/release/maxima-cli.exe
+            target/release/maxima-bootstrap.exe
+            target/release/maxima-service.exe
 
   # ── Create GitHub Release ─────────────────────────────────────────────────
   release:

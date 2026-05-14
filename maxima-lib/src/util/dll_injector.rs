@@ -1,11 +1,13 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::iter::once;
 use std::mem;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use thiserror::Error;
 use winapi::shared::minwindef::LPVOID;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
-use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
 use winapi::um::memoryapi::{VirtualAllocEx, VirtualFreeEx, WriteProcessMemory};
 use winapi::um::processthreadsapi::{CreateRemoteThread, OpenProcess};
 use winapi::um::synchapi::WaitForSingleObject;
@@ -20,7 +22,7 @@ pub enum InjectionError {
     CreateRemoteThreadFailed(u32),
     #[error("failed to get kernel32 handle, error code: {0}")]
     GetModuleHandleFailed(u32),
-    #[error("failed to get LoadLibraryA address, error code: {0}")]
+    #[error("failed to get LoadLibraryW address, error code: {0}")]
     GetProcAddressFailed(u32),
     #[error("invalid DLL path")]
     InvalidPath,
@@ -51,10 +53,11 @@ impl DllInjector {
             }
 
             let _process_guard = ProcessHandleGuard(process_handle);
-            let dll_path_cstring =
-                CString::new(dll_path).map_err(|_| InjectionError::InvalidPath)?;
-            let dll_path_bytes = dll_path_cstring.as_bytes_with_nul();
-            let dll_path_size = dll_path_bytes.len();
+            let dll_path_wide: Vec<u16> = OsStr::new(dll_path)
+                .encode_wide()
+                .chain(once(0))
+                .collect();
+            let dll_path_size = dll_path_wide.len() * mem::size_of::<u16>();
 
             let remote_memory = VirtualAllocEx(
                 process_handle,
@@ -77,7 +80,7 @@ impl DllInjector {
             let result = WriteProcessMemory(
                 process_handle,
                 remote_memory,
-                dll_path_bytes.as_ptr() as LPVOID,
+                dll_path_wide.as_ptr() as LPVOID,
                 dll_path_size,
                 &mut bytes_written as *mut usize,
             );
@@ -86,13 +89,16 @@ impl DllInjector {
                 return Err(InjectionError::WriteProcessMemoryFailed(GetLastError()));
             }
 
-            let kernel32_cstring = CString::new("kernel32.dll").unwrap();
-            let kernel32_handle = GetModuleHandleA(kernel32_cstring.as_ptr());
+            let kernel32_wide: Vec<u16> = OsStr::new("kernel32.dll")
+                .encode_wide()
+                .chain(once(0))
+                .collect();
+            let kernel32_handle = GetModuleHandleW(kernel32_wide.as_ptr());
             if kernel32_handle.is_null() {
                 return Err(InjectionError::GetModuleHandleFailed(GetLastError()));
             }
 
-            let load_library_cstring = CString::new("LoadLibraryA").unwrap();
+            let load_library_cstring = CString::new("LoadLibraryW").unwrap();
             let load_library_addr = GetProcAddress(kernel32_handle, load_library_cstring.as_ptr());
 
             if load_library_addr.is_null() {
