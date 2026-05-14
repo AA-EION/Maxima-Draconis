@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="maxima-resources/assets/logo.png" width="120" alt="Maxima logo" />
+  <img src="images/1500x500.jpg" alt="Maxima-Draconis banner" />
 </p>
 
 <h1 align="center">Maxima-Draconis</h1>
