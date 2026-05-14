@@ -143,8 +143,18 @@ jobs:
           ./dist/MaximaHelper.app/Contents/Info.plist | grep -q "qrc"
         echo "✓ MaximaHelper.app looks healthy"
 
+    # actions/upload-artifact strips the leading path component, so uploading
+    # `dist/MaximaHelper.app` directly would flatten Contents/ etc. into the
+    # artifact root and lose the `.app` bundle structure. Zip first to preserve
+    # it — same approach release.yml uses to produce MaximaHelper.zip.
+    - name: Zip MaximaHelper.app
+      if: runner.os == 'macOS'
+      run: |
+        cd dist
+        zip -r --symlinks MaximaHelper.zip MaximaHelper.app
+
     - uses: actions/upload-artifact@v4
       if: runner.os == 'macOS'
       with:
-        name: maxima-helper-app
-        path: dist/MaximaHelper.app
+        name: maxima-helper-zip
+        path: dist/MaximaHelper.zip
