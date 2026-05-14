@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         rust-version: [nightly]
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         experimental: [false]
 
     env:
@@ -119,3 +119,26 @@ jobs:
         path: |
           target/x86_64-unknown-linux-musl/release/maxima-bootstrap
           target/x86_64-unknown-linux-musl/release/maxima-cli
+
+    # ── macOS: validate MaximaHelper.app build ─────────────────────────────
+    # This mirrors what release.yml does so PRs that break the helper get
+    # caught before merge, not on the next tag.
+    - name: Build MaximaHelper.app
+      if: runner.os == 'macOS'
+      run: bash MaximaHelper/build.sh --output ./dist --no-register
+
+    - name: Sanity-check helper bundle
+      if: runner.os == 'macOS'
+      run: |
+        set -e
+        test -x ./dist/MaximaHelper.app/Contents/MacOS/MaximaHelper
+        test -f ./dist/MaximaHelper.app/Contents/Info.plist
+        /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" \
+          ./dist/MaximaHelper.app/Contents/Info.plist | grep -q "qrc"
+        echo "✓ MaximaHelper.app looks healthy"
+
+    - uses: actions/upload-artifact@v4
+      if: runner.os == 'macOS'
+      with:
+        name: maxima-helper-app
+        path: dist/MaximaHelper.app
