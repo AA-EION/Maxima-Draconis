@@ -52,7 +52,8 @@ jobs:
       id: install-depends
       if: runner.os == 'Linux'
       run: |
-        sudo apt-get install -y musl-tools libx11-dev libxcursor-dev libxcb1-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev
+        # X11/xkbcommon libs are only needed by maxima-ui (not built here).
+        sudo apt-get install -y musl-tools
         rustup target add x86_64-unknown-linux-musl
 
     - uses: Swatinem/rust-cache@v2
@@ -64,7 +65,7 @@ jobs:
     - name: Build Maxima
       if: runner.os == 'Windows'
       run: |
-        cargo build --release
+        cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service
 
     - name: Install NSIS
       if: runner.os == 'Windows'
@@ -75,7 +76,7 @@ jobs:
       if: runner.os == 'Windows'
       run: |
         $env:PATH += ";C:\Program Files (x86)\NSIS"
-        makensis installer\maxima-setup.nsi
+        makensis /DBIN_DIR="..\target\release" installer\maxima-setup.nsi
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Windows'
@@ -85,8 +86,6 @@ jobs:
           target/release/maxima-service.exe
           target/release/maxima-bootstrap.exe
           target/release/maxima-cli.exe
-          target/release/maxima-tui.exe
-          target/release/maxima.exe
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Windows'
@@ -96,8 +95,13 @@ jobs:
 
     - name: Build Maxima
       if: runner.os == 'Linux'
+      # Only build the Draconis-relevant crates. maxima-ui pulls accesskit_unix →
+      # zbus 3 → async-io 1.13 → rustix 0.37.28, which doesn't build on modern
+      # nightly (uses `rustc_attrs` which is now a reserved namespace).
+      # maxima-service is windows-only. We skip both here.
       run: |
-        cargo build --release --target x86_64-unknown-linux-musl
+        cargo build --release --target x86_64-unknown-linux-musl \
+          -p maxima-cli -p maxima-bootstrap
       env:
         RUSTFLAGS: "-C target-feature=+crt-static"
 
@@ -107,8 +111,6 @@ jobs:
         ls -l target/x86_64-unknown-linux-musl/release
         chmod +x target/x86_64-unknown-linux-musl/release/maxima-bootstrap
         chmod +x target/x86_64-unknown-linux-musl/release/maxima-cli
-        chmod +x target/x86_64-unknown-linux-musl/release/maxima-tui
-        chmod +x target/x86_64-unknown-linux-musl/release/maxima
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Linux'
@@ -117,5 +119,3 @@ jobs:
         path: |
           target/x86_64-unknown-linux-musl/release/maxima-bootstrap
           target/x86_64-unknown-linux-musl/release/maxima-cli
-          target/x86_64-unknown-linux-musl/release/maxima-tui
-          target/x86_64-unknown-linux-musl/release/maxima
