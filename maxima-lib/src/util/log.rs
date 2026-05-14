@@ -89,10 +89,19 @@ impl log::Log for SimpleLogger {
         println!("{}", colored);
 
         // File sink — best-effort. We don't want logging to ever panic.
+        //
+        // Flushing every line would be wasteful for high-volume Info/Debug
+        // output (Gemini caught this in code review). But for Warn/Error we
+        // *do* want the line on disk before any subsequent crash: those are
+        // exactly the events you read the file to diagnose. So: flush on
+        // Warn/Error, rely on stdio buffering otherwise. The explicit
+        // `Log::flush()` impl below covers the normal shutdown path.
         if let Ok(mut guard) = LOG_FILE.lock() {
             if let Some(file) = guard.as_mut() {
                 let _ = writeln!(file, "{}", plain);
-                let _ = file.flush();
+                if matches!(level, Level::Warn | Level::Error) {
+                    let _ = file.flush();
+                }
             }
         }
     }
