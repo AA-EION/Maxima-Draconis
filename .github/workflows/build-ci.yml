@@ -52,6 +52,10 @@ jobs:
       # builds the Swift helper.
       if: runner.os != 'macOS'
       uses: arduino/setup-protoc@v3
+      with:
+        # Pass the workflow token so the action's call to GitHub's release API
+        # doesn't hit the anonymous rate limit (frequent flake on shared CI IPs).
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Install Dependencies
       id: install-depends
