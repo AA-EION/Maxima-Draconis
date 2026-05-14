@@ -109,6 +109,21 @@ Section "Maxima Core" SEC_CORE
     ; ---- Start Menu Shortcuts ----
     CreateDirectory "$SMPROGRAMS\Maxima"
     CreateShortcut "$SMPROGRAMS\Maxima\Maxima CLI.lnk" "$INSTDIR\maxima-cli.exe" "" "$INSTDIR\maxima-cli.exe" 0
+
+    ; The graphical UI (maxima.exe) and terminal UI (maxima-tui.exe) are
+    ; built but optional - create their shortcuts only when the files were
+    ; actually packaged. Matches the `File /nonfatal` semantics above so a
+    ; CLI-only build doesn't leave dangling links.
+    IfFileExists "$INSTDIR\maxima.exe" make_ui_shortcut skip_ui_shortcut
+    make_ui_shortcut:
+        CreateShortcut "$SMPROGRAMS\Maxima\Maxima.lnk" "$INSTDIR\maxima.exe" "" "$INSTDIR\maxima.exe" 0
+    skip_ui_shortcut:
+
+    IfFileExists "$INSTDIR\maxima-tui.exe" make_tui_shortcut skip_tui_shortcut
+    make_tui_shortcut:
+        CreateShortcut "$SMPROGRAMS\Maxima\Maxima TUI.lnk" "$INSTDIR\maxima-tui.exe" "" "$INSTDIR\maxima-tui.exe" 0
+    skip_tui_shortcut:
+
     CreateShortcut "$SMPROGRAMS\Maxima\Uninstall Maxima.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
 
     ; ---- Uninstaller ----
@@ -117,7 +132,15 @@ Section "Maxima Core" SEC_CORE
     ; Add/Remove Programs entry
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninstall.exe"
-    WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima-cli.exe"
+    ; Prefer the GUI's icon for Add/Remove Programs when available - falls back
+    ; to the CLI icon for CLI-only installs.
+    IfFileExists "$INSTDIR\maxima.exe" use_ui_icon use_cli_icon
+    use_ui_icon:
+        WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima.exe"
+        Goto icon_done
+    use_cli_icon:
+        WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima-cli.exe"
+    icon_done:
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
