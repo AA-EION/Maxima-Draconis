@@ -285,6 +285,7 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     if want_output {
         let output = child
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?
             .wait_with_output()
             .await?;
@@ -386,6 +387,13 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             &[("InstallSuccessful", "true")],
         ),
         (
+            "HKEY_LOCAL_MACHINE\\Software\\Origin",
+            &[
+                ("InstallSuccessful", "true"),
+                ("ClientPath", "C:/Windows/System32/conhost.exe"),
+            ],
+        ),
+        (
             "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Origin",
             &[
                 ("InstallSuccessful", "true"),
@@ -423,9 +431,9 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
 
     run_wine_command(
         "regedit",
-        Some(vec![path.safe_str()?]),
+        Some(vec!["/S", path.safe_str()?]),
         None,
-        false,
+        true,
         CommandType::Run,
     )
     .await?;

@@ -20,6 +20,33 @@ use url::Url;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// Validates that an offer_id is a well-formed EA Origin offer ID.
+///
+/// Pattern: `Origin.OFR.<digits>.<digits>` (e.g. `Origin.OFR.50.0002694`).
+///
+/// This is a defense against command-line injection: protocol handler URLs
+/// (link2ea://, origin2://) are attacker-controlled. Without validation, an
+/// attacker could craft a URL like `link2ea://launchgame/--login=stolen_token`
+/// and `maxima-cli` would interpret `--login` as a flag, bypassing OAuth.
+fn is_valid_ea_offer_id(s: &str) -> bool {
+    let mut parts = s.split('.');
+    if parts.next() != Some("Origin") {
+        return false;
+    }
+    if parts.next() != Some("OFR") {
+        return false;
+    }
+    let Some(major) = parts.next() else { return false };
+    let Some(minor) = parts.next() else { return false };
+    if parts.next().is_some() {
+        return false;
+    }
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor.chars().all(|c| c.is_ascii_digit())
+}
+
 #[derive(Error, Debug)]
 pub(crate) enum RunError {
     #[error(transparent)]
@@ -206,6 +233,19 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
             // segments[0] is the offer ID (e.g. "Origin.OFR.50.0002694")
             let offer_id = segments[0];
 
+            // SECURITY: refuse anything that doesn't match the EA offer ID shape.
+            // A URL like link2ea://launchgame/--login=stolen_token would otherwise
+            // inject a flag into the maxima-cli invocation below.
+            if !is_valid_ea_offer_id(offer_id) {
+                let temp_dir = std::env::temp_dir();
+                let debug_log = temp_dir.join("maxima_execution.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log) {
+                    use std::io::Write;
+                    let _ = writeln!(file, "REJECTED malformed link2ea offer_id: {:?}", offer_id);
+                }
+                return Ok(false);
+            }
+
             let mut child = Command::new(current_exe()?.with_file_name("maxima-cli.exe"));
 
             // Forward environment variables from parent process
@@ -234,33 +274,57 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
         }
 
         if arg.starts_with("origin2") {
+            // origin2://game/launch?offerIds=<offer_id>&cmdParams=<encoded_args>&...
             let url = Url::parse(arg)?;
-            let query = querystring::querify(url.query().unwrap());
-            let _offer_id = query.iter().find(|(x, _)| *x == "offerIds").unwrap().1;
-            let cmd_params = query.iter().find(|(x, _)| *x == "cmdParams").unwrap().1;
+            let query = querystring::querify(url.query().unwrap_or_default());
+            let offer_id = query
+                .iter()
+                .find(|(k, _)| *k == "offerIds")
+                .map(|(_, v)| *v)
+                .unwrap_or_default();
+
+            // SECURITY: same validation as link2ea:// — offer_id comes from an
+            // attacker-controlled URL and must not be allowed to start with `--`.
+            if !is_valid_ea_offer_id(offer_id) {
+                let temp_dir = std::env::temp_dir();
+                let debug_log = temp_dir.join("maxima_execution.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log) {
+                    use std::io::Write;
+                    let _ = writeln!(file, "REJECTED malformed origin2 offer_id: {:?}", offer_id);
+                }
+                return Ok(false);
+            }
 
             let mut child = Command::new(current_exe()?.with_file_name("maxima-cli.exe"));
-            child.env(
-                "MAXIMA_LAUNCH_ARGS",
-                urlencoding::decode(cmd_params)?
-                    .into_owned()
-                    .replace("\\\"", "\""),
-            );
-            println!(
-                "{}",
-                urlencoding::decode(cmd_params)?
-                    .into_owned()
-                    .replace("\\\"", "\"")
-            );
-            child.env("KYBER_INTERFACE_PORT", "3005");
-            child.args(["--mode", "launch", "--offer-id", "Origin.OFR.50.0002148"]);
+
+            // Forward optional cmdParams as launch args
+            if let Some((_, cmd_params)) = query.iter().find(|(k, _)| *k == "cmdParams") {
+                child.env(
+                    "MAXIMA_LAUNCH_ARGS",
+                    urlencoding::decode(cmd_params)?
+                        .into_owned()
+                        .replace("\\\"", "\""),
+                );
+            }
+
+            // Forward KYBER port if present in parent environment
+            if let Ok(port) = std::env::var("KYBER_INTERFACE_PORT") {
+                child.env("KYBER_INTERFACE_PORT", port);
+            }
+
+            child.args(["launch", offer_id]);
             child.spawn()?.wait().await?;
 
             return Ok(true);
         }
 
         if arg.starts_with("qrc") {
-            let query = arg.split("login_successful.html?").collect::<Vec<&str>>()[1];
+            // Guard against malformed qrc:// URLs — splitn(2, ...) gives at most two
+            // segments, so we won't panic on inputs that lack the marker.
+            let parts: Vec<&str> = arg.splitn(2, "login_successful.html?").collect();
+            let Some(query) = parts.get(1) else {
+                return Ok(false);
+            };
             reqwest::get(format!("http://127.0.0.1:31033/auth?{}", query)).await?;
 
             return Ok(true);
