@@ -43,7 +43,7 @@ use maxima::{
     },
     ooa,
     rtm::client::BasicPresence,
-    util::{log::init_logger, native::take_foreground_focus, registry::check_registry_validity},
+    util::{log::init_logger_named, native::take_foreground_focus, registry::check_registry_validity},
 };
 
 lazy_static! {
@@ -126,8 +126,36 @@ struct Args {
     login: Option<String>,
 }
 
+/// Ensure a console window exists so log output is visible.
+///
+/// When `maxima-cli` is spawned by `maxima-bootstrap` (which is built as a
+/// Windows GUI app via `#![windows_subsystem = "windows"]`), the bootstrap
+/// has no console to inherit and the subprocess inherits the same: log
+/// output goes nowhere. We call `AllocConsole()` ourselves so the user can
+/// actually watch the launch progress.
+///
+/// Idempotent: if a console is already attached (e.g. `cmd.exe` invocation),
+/// `AllocConsole` fails harmlessly and we keep using the existing one.
+#[cfg(windows)]
+fn ensure_console_attached() {
+    use winapi::um::consoleapi::AllocConsole;
+    use winapi::um::wincon::GetConsoleWindow;
+    unsafe {
+        if GetConsoleWindow().is_null() {
+            // Return value ignored on purpose — failure means "couldn't create",
+            // which we can't do anything useful about. File logging still works.
+            AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_console_attached() {}
+
 #[tokio::main]
 async fn main() {
+    ensure_console_attached();
+
     let result = startup().await;
 
     if let Some(e) = result.err() {
@@ -217,7 +245,7 @@ pub async fn login_flow(login_override: Option<String>) -> Result<TokenResponse>
 async fn startup() -> Result<()> {
     let args = Args::parse();
 
-    init_logger();
+    init_logger_named("maxima-cli");
 
     info!("Starting Maxima...");
 
