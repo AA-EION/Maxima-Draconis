@@ -10,6 +10,18 @@ Open-source replacement for the EA Desktop Launcher. **Not** a macOS-native app 
 
 The Draconis fork is tested *only* for Titanfall 2 on macOS via CrossOver. Other configurations may work but aren't supported here.
 
+### Multi-OS compatibility principle
+
+Even though the active maintenance target is macOS/CrossOver, **the code must remain compatible with the other OSes upstream supports** — Linux (native + musl) and native Windows. Concretely:
+
+- All `#[cfg(unix)]`, `#[cfg(target_os = "linux")]`, `#[cfg(target_os = "macos")]`, `#[cfg(windows)]`, `#[cfg(not(windows))]` gates that exist in upstream must be preserved when editing the affected file.
+- Don't introduce hard `panic!()` or `unimplemented!()` on a code path that other OSes hit at runtime.
+- Don't add `#[cfg]`-gated dependencies that would skip building on other targets without a clear reason; if you need to, scope the gate as narrowly as possible.
+- `maxima-ui` and `maxima-tui` are **upstream graphical/TUI frontends** that this fork does not actively maintain. They are excluded from this fork's CI (see "CI" section) because `maxima-ui` transitively pulls a `rustix 0.37` version that doesn't build on modern nightly. They remain in `Cargo.toml`'s `[workspace.members]` so a downstream consumer who wants them can build them locally. **Do not delete them.**
+- The Linux CI job builds `maxima-cli` + `maxima-bootstrap` to make sure the cross-platform code paths actually compile on a non-macOS unix. The Windows CI job builds the three Draconis-relevant crates **and** the NSIS installer. If you touch `#[cfg(unix)]` or `#[cfg(windows)]` blocks, make sure those jobs still pass.
+
+In short: macOS/CrossOver is what we **test**, but the codebase is **portable** to the same targets upstream supports.
+
 ---
 
 ## Component layout
@@ -34,6 +46,123 @@ Build outputs:
 - `installer/MaximaSetup.exe` — NSIS bundle that installs everything in the bottle and registers the protocol handlers in Wine's registry. Cross-compiled on macOS via `mingw-w64` + `nsis`.
 - `MaximaHelper/build/MaximaHelper.app` — built on macOS with Xcode CLT.
 - `MaximaHelper.zip` — release asset Draconis downloads at build time.
+
+---
+
+## Workspace inventory
+
+```
+maxima-lib/          Core library — auth, launch, license, library, LSX, RTM,
+                     OOA, cloudsync. All other crates depend on this.
+maxima-cli/          CLI frontend — `maxima-cli launch <offer_id>`, login,
+                     listGames, getGameBySlug, cloudSync, etc. Entry point
+                     invoked by maxima-bootstrap.
+maxima-bootstrap/    Protocol handler binary — registered for link2ea://,
+                     origin2://, qrc:// in Wine's registry. Parses the URL,
+                     validates the offer_id, and shells out to maxima-cli.
+maxima-service/      Windows background service — registry setup, DLL
+                     injection for KYBER. Windows-only (no-op `main` on
+                     other targets). Not exercised in the Draconis flow.
+maxima-tui/          Terminal UI (upstream, ratatui-based). Not built by
+                     this fork's CI; preserved for upstream compat.
+maxima-ui/           Graphical UI (upstream, eframe/egui). Not built by
+                     this fork's CI; preserved for upstream compat.
+maxima-resources/    Shared assets — logo, translations.
+MaximaHelper/        Native macOS Swift app (build.sh + Info.plist +
+                     Sources/main.swift). Bridges qrc:// from the host
+                     browser into the bottle via http://127.0.0.1:31033.
+installer/           NSIS script (maxima-setup.nsi) + cross-build script
+                     (build.sh, uses mingw-w64 + makensis).
+images/              Repo images — banners, screenshots.
+.github/workflows/   build-ci.yml (push CI), release.yml (tag release),
+                     block-upstream-pr.yml (prevent accidental PRs to
+                     upstream).
+```
+
+Key entry points to know:
+
+| File                                          | What it does                                              |
+|-----------------------------------------------|-----------------------------------------------------------|
+| `maxima-cli/src/main.rs`                      | CLI argparse + subcommand dispatch                        |
+| `maxima-bootstrap/src/main.rs`                | Protocol URL parser + validator + `maxima-cli launch` invocation |
+| `maxima-lib/src/core/launch.rs`               | `start_game()` — license, cloud sync, env vars, spawn     |
+| `maxima-lib/src/core/auth/login.rs`           | OAuth flow + `remid`-cookie fallback                      |
+| `maxima-lib/src/lsx/request/license.rs`       | Denuvo token fetch (env override: `MAXIMA_DENUVO_TOKEN`)  |
+| `maxima-lib/src/util/registry.rs`             | Windows registry: install check + protocol registration   |
+| `maxima-lib/src/unix/wine.rs`                 | Wine detection, registry setup via `regedit /S`           |
+| `maxima-lib/src/util/dll_injector.rs`         | KYBER DLL injection (Windows-only)                        |
+| `MaximaHelper/Sources/main.swift`             | NSApplicationDelegate that handles `qrc://` URLs          |
+| `installer/maxima-setup.nsi`                  | NSIS script, takes `/DBIN_DIR` for binary location        |
+
+---
+
+## Deltas vs upstream (`ArmchairDevelopers/Maxima`)
+
+Cumulative summary of everything this fork carries on top of upstream `master`. Use this to understand what's macOS/Draconis-specific vs. plain bug fixes that could be sent upstream.
+
+### Infrastructure (macOS/Draconis-specific)
+
+- **`MaximaHelper/`** — new native Swift macOS background agent. Replaces the upstream AppleScript "helper" with a properly bundle-signable binary that LaunchServices will honor for `qrc://`. Universal binary (arm64 + x86_64), built with `swiftc` from `MaximaHelper/build.sh`. Bundle id `com.armchairdevelopers.maxima.helper`, listens for `qrc://` and forwards to `http://127.0.0.1:31033/auth?...` inside the bottle.
+- **`installer/maxima-setup.nsi` + `installer/build.sh`** — NSIS-based Windows installer that drops `maxima-cli.exe`, `maxima-bootstrap.exe`, `maxima-service.exe` into the bottle, registers `link2ea://`, `origin2://`, `qrc://` in Wine's registry, and adds start menu shortcuts. Cross-compiled on macOS via `mingw-w64` + `nsis`. Supports `/DBIN_DIR=<path>` override to point at any cargo target dir.
+- **`.github/workflows/release.yml`** — three-job release pipeline (macOS builds the helper, Windows builds the installer, Ubuntu collects artifacts and creates the GitHub release). Triggered on `v*` tags.
+- **`.github/workflows/build-ci.yml`** — push CI matrix (Linux/Windows/macOS) running the build + sanity checks on every branch.
+- **`.github/workflows/block-upstream-pr.yml`** — fires on `pull_request_target` and fails if anyone tries to open a PR against upstream from this fork by accident.
+
+### Code changes (could be sent upstream)
+
+- **Bootstrap protocol-handler hardening** (`maxima-bootstrap/src/main.rs`)
+  - `link2ea://` and `origin2://` validate the offer_id against `Origin.OFR.<digits>.<digits>` before invoking `maxima-cli`. Without this, a crafted URL like `link2ea://launchgame/--login=stolen_token` would have made `maxima-cli` interpret `--login` as a flag and bypass OAuth. **(Security)**
+  - `origin2://` now reads the real `offerIds` from the URL instead of the hardcoded `Origin.OFR.50.0002148` upstream had. Works for any EA title. **(Bug)**
+  - `qrc://` handler no longer panics on URLs missing `login_successful.html?` (was indexing `[1]` on a split vec without bounds checking). **(Bug)**
+  - `link2ea://` forwards `KYBER_INTERFACE_PORT` from the parent environment instead of hardcoding `3005`. **(Bug)**
+- **`maxima-cli launch` Steam-only owner passthrough** (`maxima-cli/src/main.rs`) — if EA library lookup fails but the slug already matches the EA offer ID pattern, pass it through with a warning instead of bailing. Lets Steam-only TF2 owners launch without linking accounts. **(Bug/UX)**
+- **`maxima-cli` `GetGameBySlug` subcommand was a no-op stub** — now actually prints slug/offer_id/content_id/display_name/installed. **(Bug)**
+- **`maxima-cli` exhaustive library lookup** — beyond `base_slug` and `base_offer`, scans every game's `slug`/`offer_id`/`product.id`/`product.origin_offer_id`/`offer.content_id`/`product.product.id`. **(Feature, brought in by upstream `9437bcd`.)**
+- **DLL injector wide-string support** (`maxima-lib/src/util/dll_injector.rs`) — switched `GetModuleHandleA`/`LoadLibraryA` to `GetModuleHandleW`/`LoadLibraryW` with UTF-16. Fixes injection on non-ASCII install paths. **(Bug, equivalent to upstream `fix/non-ascii-characters` branch.)**
+- **Wine registry setup** (`maxima-lib/src/unix/wine.rs`)
+  - Added `HKEY_LOCAL_MACHINE\Software\Origin` bare key (some EA titles check this path without the `Electronic Arts\` prefix).
+  - `regedit` runs with `/S` (silent) — no longer blocks on a confirmation dialog in Wine.
+  - stderr is now piped **and** read, so Wine errors surface in `WineError::Command` instead of being swallowed. **(Bug, partial subset of upstream `fix/wine-registry-setup` branch — the part of that branch that *disabled* `link2ea`/`origin2` protocol registration was intentionally NOT taken because this fork needs them.)**
+- **License env override** (`maxima-lib/src/lsx/request/license.rs`) — `MAXIMA_DENUVO_TOKEN` env var short-circuits the license request and returns the token directly. Useful for offline debugging. **(Feature, from upstream `feat/license-token-override`.)**
+- **License-update parity** (`maxima-lib/src/core/launch.rs`) — `OnlineOffline` mode now calls `needs_license_update()` before re-requesting, matching `Online` mode. Avoids redundant license server hits. **(Bug, from upstream `fix/license-update-online-offline`.)**
+
+### Removals
+
+- The original AppleScript-based macOS helper. Replaced by the Swift `MaximaHelper.app` above.
+
+---
+
+## CI
+
+Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)]` in `maxima-ui/src/main.rs` and similar feature gates elsewhere — this is inherited from upstream).
+
+### `build-ci.yml` — push CI
+
+Fires on every push to any branch except `v*` tags. Matrix: Linux, Windows, macOS.
+
+| Job             | What it builds                                                                 |
+|-----------------|-------------------------------------------------------------------------------|
+| ubuntu-latest   | `cargo build --release --target x86_64-unknown-linux-musl -p maxima-cli -p maxima-bootstrap` |
+| windows-latest  | `cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service`, then `makensis /DBIN_DIR="..\target\release"` |
+| macos-latest    | `bash MaximaHelper/build.sh --output ./dist --no-register`, then sanity check that the bundle layout is healthy and `Info.plist` declares `qrc://` |
+
+What CI does **not** validate:
+
+- `maxima-ui` and `maxima-tui` — they pull `rustix 0.37.28` (via `accesskit_unix → zbus 3 → async-process 1.8 → async-io 1.13`) which doesn't build on modern nightly because of the `rustc_attrs` namespace reservation. Excluded from CI to keep the workflow green; the crates themselves are unchanged from upstream.
+- `MaximaSetup.exe` actually installing anything in a Wine bottle. We sanity-check size (>100KB) but never run it.
+- `MaximaHelper.app`'s code signature — the helper is shipped linker-signed (adhoc) and Draconis re-signs it at consumption time with `codesign --force --deep --sign -` to seal the Info.plist. See "Signing gotcha" below.
+
+### `release.yml` — tag release
+
+Fires on `v*` tags or `workflow_dispatch`. Three jobs:
+
+1. **`build-helper`** (macOS) — builds `MaximaHelper.app`, sanity-checks layout + Info.plist, zips with `--symlinks`, uploads `MaximaHelper.zip` artifact.
+2. **`build-installer`** (Windows) — builds the three Draconis-relevant crates, runs `makensis`, sanity-checks installer size >100KB, uploads `MaximaSetup.exe` + a separate `maxima-binaries-win64` artifact with the loose `.exe`s.
+3. **`release`** (Ubuntu) — downloads both artifacts and creates a non-prerelease GitHub release. Asset names are fixed: `MaximaHelper.zip` and `MaximaSetup.exe` (Draconis hardcodes these names in `Scripts/fetch-maxima-helper.sh` and `MaximaService.downloadAndInstall`, so do not rename).
+
+### `block-upstream-pr.yml`
+
+Trivial guard that fires on `pull_request_target` and fails if the PR base is `ArmchairDevelopers/Maxima`. Prevents accidentally sending fork-specific changes upstream.
 
 ---
 
@@ -249,21 +378,36 @@ The remaining branches (`feat/server`, `feature/umu-launcher`, `feat/new-ci`, et
 
 ## Changelog
 
-### Session 2026-05-14
+### Session 2026-05-14 (CI + release pipeline)
+
+#### Fixed — `.github/workflows/build-ci.yml`
+CI had been red on every commit since the workflow was added (5+ master pushes, none green). Two unrelated breakages:
+- **Linux**: `cargo build --release` built the whole workspace, which pulled `maxima-ui → eframe → egui-winit → accesskit_winit → accesskit_unix → zbus 3.15 → async-process 1.8 → async-io 1.13 → rustix 0.37.28`. Recent nightlies (1.97.0-nightly) reserved the `rustc_*` attribute namespace, so rustix 0.37 fails to compile. Restricted Linux to `-p maxima-cli -p maxima-bootstrap`, which only pull rustix 0.38/1.x via tempfile/tokio. Also dropped the X11/xkbcommon apt deps that were only needed by `maxima-ui`. **Cross-OS impact**: none — the excluded crates still live in the workspace and a downstream user on a working toolchain can still `cargo build -p maxima-ui` locally.
+- **Windows**: NSIS script defaulted to `${BIN_DIR}=..\target\x86_64-pc-windows-gnu\release\` but the runner compiles MSVC (`target/release/`). Passed `/DBIN_DIR="..\target\release"` through. Also restricted to the three Draconis-relevant crates.
+
+#### Added — `.github/workflows/build-ci.yml` macOS job
+Added a third matrix entry that builds `MaximaHelper.app` via `MaximaHelper/build.sh` and validates the bundle layout + that `Info.plist` declares `CFBundleURLTypes` with `qrc://`. Catches helper regressions on every PR instead of only at tag time. Rust/protoc/rust-cache steps are gated `if: runner.os != 'macOS'` so the macOS job stays a pure Swift build.
+
+#### Fixed — `.github/workflows/release.yml`
+The release pipeline had the same `cargo build --release` problem and would have failed silently on the next tag. Restricted the Windows job to the Draconis-relevant crates, added installer-size sanity check, added helper-bundle sanity check, and now uploads loose Windows binaries as a separate artifact (debug aid).
+
+### Session 2026-05-14 (code fixes)
 
 #### Fixed — `maxima-lib/src/util/dll_injector.rs`
-DLL injection broke on non-ASCII installation paths (e.g. usernames or bottle paths with accented characters). Root cause: `GetModuleHandleA` / `LoadLibraryA` only accept ANSI strings. Fixed by switching to `GetModuleHandleW` / `LoadLibraryW` with UTF-16 wide strings, matching the `fix/non-ascii-characters` upstream branch.
+DLL injection broke on non-ASCII installation paths (e.g. usernames or bottle paths with accented characters). Root cause: `GetModuleHandleA` / `LoadLibraryA` only accept ANSI strings. Fixed by switching to `GetModuleHandleW` / `LoadLibraryW` with UTF-16 wide strings, matching the `fix/non-ascii-characters` upstream branch. **Cross-OS impact**: file is Windows-only (`use winapi::...`); change benefits native Windows users equally.
 
 #### Fixed — `maxima-lib/src/unix/wine.rs`
 Two issues in `setup_wine_registry()`:
 1. Missing `HKEY_LOCAL_MACHINE\Software\Origin` bare key — some games check for this path without the `Electronic Arts\` prefix and would fail to recognise Origin as installed.
-2. `regedit` was called without the `/S` (silent) flag, causing it to show a confirmation dialog that blocked the launch flow silently in Wine. Also added `Stdio::piped()` for stderr so Wine errors surface in logs instead of disappearing.
+2. `regedit` was called without the `/S` (silent) flag, causing it to show a confirmation dialog that blocked the launch flow silently in Wine. Also added `Stdio::piped()` for stderr and `read+append` for stderr-to-`output_str`, so Wine errors surface in `WineError::Command` instead of disappearing.
+
+**Cross-OS impact**: file is unix-only (`#[cfg(unix)]`). The change benefits Linux + macOS/CrossOver equally; native Windows doesn't compile this file.
 
 #### Fixed — `maxima-bootstrap/src/main.rs`
-The `origin2://` protocol handler had `Origin.OFR.50.0002148` (Star Wars Battlefront 2) hardcoded, making it useless for any other game. Also used wrong CLI syntax (`--mode launch --offer-id X` doesn't exist in this version of maxima-cli). Fixed to read the real `offerIds` from the URL query string and call `maxima-cli launch <offer_id>`. The handler now works generically for any EA title that emits `origin2://`.
+The `origin2://` protocol handler had `Origin.OFR.50.0002148` (Star Wars Battlefront 2) hardcoded, making it useless for any other game. Also used wrong CLI syntax (`--mode launch --offer-id X` doesn't exist in this version of maxima-cli). Fixed to read the real `offerIds` from the URL query string and call `maxima-cli launch <offer_id>`. The handler now works generically for any EA title that emits `origin2://`. **Cross-OS impact**: code is portable (no `#[cfg]` gates); benefits Linux/Windows users of maxima-bootstrap who register `origin2://` natively.
 
 #### Fixed — `maxima-cli/src/main.rs`
-`maxima-cli launch Origin.OFR.X.Y` would bail with `"No owned offer found"` for Steam-only owners whose EA library is empty (TF2 not linked). Added offer_id passthrough: if all library lookups fail but the slug matches the `Origin.OFR.\d+\.\d+` pattern, Maxima passes it directly to the license server with a warning. Users are directed to link accounts at https://www.ea.com for the cleanest experience.
+`maxima-cli launch Origin.OFR.X.Y` would bail with `"No owned offer found"` for Steam-only owners whose EA library is empty (TF2 not linked). Added offer_id passthrough: if all library lookups fail but the slug matches the `Origin.OFR.\d+\.\d+` pattern, Maxima passes it directly to the license server with a warning. Users are directed to link accounts at https://www.ea.com for the cleanest experience. **Cross-OS impact**: portable code; benefits any platform.
 
 #### Fixed — `maxima-cli/src/main.rs`
 `GetGameBySlug` subcommand was a no-op stub (body commented out, returned `Ok(())`). Now prints slug, offer ID, content ID, display name, and installed status.
