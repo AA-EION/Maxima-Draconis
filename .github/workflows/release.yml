@@ -64,9 +64,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build Maxima
-        # Build only the Draconis-relevant crates. maxima-ui pulls rustix 0.37
-        # which breaks on modern nightly; maxima-tui is unused by Draconis.
-        run: cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service
+        # Build the full workspace on Windows. The rustix 0.37 breakage that
+        # blocks maxima-ui on Linux is unix-only (the offending chain is
+        # accesskit_unix → zbus → async-io), so Windows compiles cleanly.
+        # NSIS pulls maxima-tui.exe and maxima.exe in via `File /nonfatal`,
+        # so users get the complete app — the UI is wired up for future use
+        # even if Draconis currently invokes only the CLI side.
+        run: cargo build --release
 
       - name: Install NSIS
         run: choco install nsis --yes --no-progress
@@ -102,6 +106,8 @@ jobs:
             target/release/maxima-cli.exe
             target/release/maxima-bootstrap.exe
             target/release/maxima-service.exe
+            target/release/maxima-tui.exe
+            target/release/maxima.exe
 
   # ── Create GitHub Release ─────────────────────────────────────────────────
   release:

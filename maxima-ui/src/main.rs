@@ -1,4 +1,9 @@
 #![feature(slice_pattern)]
+// Release builds run as a GUI app so no spurious console window pops up behind
+// the egui viewport when launched from the Start Menu shortcut. Debug builds
+// keep the console so `println!` / dbg!() output is still visible during dev.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use clap::{arg, command, Parser};
 use desktop::check_desktop_icon;
 use egui::{

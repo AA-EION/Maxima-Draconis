@@ -17,7 +17,7 @@ Even though the active maintenance target is macOS/CrossOver, **the code must re
 - All `#[cfg(unix)]`, `#[cfg(target_os = "linux")]`, `#[cfg(target_os = "macos")]`, `#[cfg(windows)]`, `#[cfg(not(windows))]` gates that exist in upstream must be preserved when editing the affected file.
 - Don't introduce hard `panic!()` or `unimplemented!()` on a code path that other OSes hit at runtime.
 - Don't add `#[cfg]`-gated dependencies that would skip building on other targets without a clear reason; if you need to, scope the gate as narrowly as possible.
-- `maxima-ui` and `maxima-tui` are **upstream graphical/TUI frontends** that this fork does not actively maintain. They are excluded from this fork's CI (see "CI" section) because `maxima-ui` transitively pulls a `rustix 0.37` version that doesn't build on modern nightly. They remain in `Cargo.toml`'s `[workspace.members]` so a downstream consumer who wants them can build them locally. **Do not delete them.**
+- `maxima-ui` and `maxima-tui` are **upstream graphical/TUI frontends**. They are built and shipped in this fork's Windows installer (`maxima.exe`, `maxima-tui.exe`) — the UI is wired up for future use even though Draconis currently invokes only the CLI side. On Linux they are excluded from CI because `maxima-ui` transitively pulls `rustix 0.37` via `accesskit_unix → zbus → async-io`, which doesn't build on modern nightly. The Windows target uses a different rustix path (no unix backend) and compiles fine, so we ship them there. **Do not delete them from the workspace.**
 - The Linux CI job builds `maxima-cli` + `maxima-bootstrap` to make sure the cross-platform code paths actually compile on a non-macOS unix. The Windows CI job builds the three Draconis-relevant crates **and** the NSIS installer. If you touch `#[cfg(unix)]` or `#[cfg(windows)]` blocks, make sure those jobs still pass.
 
 In short: macOS/CrossOver is what we **test**, but the codebase is **portable** to the same targets upstream supports.
@@ -142,8 +142,8 @@ Fires on every push to any branch except `v*` tags. Matrix: Linux, Windows, macO
 
 | Job             | What it builds                                                                 |
 |-----------------|-------------------------------------------------------------------------------|
-| ubuntu-latest   | `cargo build --release --target x86_64-unknown-linux-musl -p maxima-cli -p maxima-bootstrap` |
-| windows-latest  | `cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service`, then `makensis /DBIN_DIR="..\target\release"` |
+| ubuntu-latest   | `cargo build --release --target x86_64-unknown-linux-musl -p maxima-cli -p maxima-bootstrap` (skips UI/TUI — see "Multi-OS compatibility" above) |
+| windows-latest  | `cargo build --release` (full workspace, produces all 5 binaries — `maxima-cli.exe`, `maxima-bootstrap.exe`, `maxima-service.exe`, `maxima-tui.exe`, `maxima.exe`), then `makensis /DBIN_DIR="..\target\release"` |
 | macos-latest    | `bash MaximaHelper/build.sh --output ./dist --no-register`, then sanity check that the bundle layout is healthy and `Info.plist` declares `qrc://` |
 
 What CI does **not** validate:
@@ -377,6 +377,19 @@ The remaining branches (`feat/server`, `feature/umu-launcher`, `feat/new-ci`, et
 ---
 
 ## Changelog
+
+### Session 2026-05-14 (post-v0.2.0 fixes)
+
+#### Fixed — log output invisible when `maxima-cli` is spawned from `maxima-bootstrap`
+`maxima-bootstrap` is built with `#![windows_subsystem = "windows"]` (release builds) so it has no console of its own. When Wine routes a `link2ea://` URL to it and bootstrap spawns `maxima-cli.exe`, the child inherits the GUI parent's empty stdio — `println!()` from the logger went nowhere and users saw no auth/launch progress. Two-part fix:
+
+1. **`maxima-cli` now calls `AllocConsole()` at the very start of `main` if no console is attached** (Windows-only, `winapi::um::consoleapi`). When invoked from `cmd.exe` the existing console is reused; when invoked from bootstrap a new window pops up. Restores the v0.1.0-and-earlier behavior the user expected.
+2. **The shared logger (`maxima-lib/src/util/log.rs`) now mirrors all output to a file** in addition to stdout. Default location: `%LOCALAPPDATA%\Maxima\Logs\<binary>.log` on Windows, `$XDG_DATA_HOME/maxima/logs/<binary>.log` on unix. Overridable via `MAXIMA_LOG_FILE`. Failure to open the file is non-fatal — stdout-only is still acceptable. Each session writes a `===== maxima log session opened (pid=...) =====` header so distinct invocations are easy to skim.
+
+The combination means: console is the primary UX, file is the durable forensics trail. **Cross-OS impact**: the `AllocConsole` shim is `#[cfg(windows)]`; file logging is portable.
+
+#### Fixed — installer ships incomplete app (missing UI / TUI)
+v0.2.0 restricted the Windows build to `-p maxima-cli -p maxima-bootstrap -p maxima-service`, which silently dropped `maxima.exe` (UI) and `maxima-tui.exe` (TUI) from the installer. The `.nsi` had `File /nonfatal` lines for both so the install kept working, but users got a stripped-down app. Verified that both crates compile cleanly on the Windows target (the `rustix 0.37` block is unix-only — `accesskit_unix → zbus → async-io` is gated `#[cfg(unix)]`, never compiled on Windows). Windows CI and `release.yml` now do `cargo build --release` (full workspace). Linux keeps the `-p` restriction.
 
 ### Session 2026-05-14 (CI + release pipeline)
 

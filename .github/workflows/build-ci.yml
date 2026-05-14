@@ -74,8 +74,13 @@ jobs:
 
     - name: Build Maxima
       if: runner.os == 'Windows'
+      # Windows builds the full workspace — maxima-tui and maxima-ui both
+      # compile fine on the Windows target (the rustix 0.37 issue is
+      # unix-only, since the offending chain is accesskit_unix → zbus →
+      # async-io). NSIS picks them up via `File /nonfatal` so users get
+      # a complete install including the (still-WIP) UI.
       run: |
-        cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-service
+        cargo build --release
 
     - name: Install NSIS
       if: runner.os == 'Windows'
@@ -96,6 +101,8 @@ jobs:
           target/release/maxima-service.exe
           target/release/maxima-bootstrap.exe
           target/release/maxima-cli.exe
+          target/release/maxima-tui.exe
+          target/release/maxima.exe
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Windows'

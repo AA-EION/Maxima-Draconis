@@ -5,6 +5,106 @@
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "FileFunc.nsh"
+!include "LogicLib.nsh"
+
+;---------- Registry Backup / Restore ----------
+;
+; The installer takes ownership of several registry entries that EA Desktop /
+; Origin / other launchers may also want to own (qrc://, link2ea://, origin2://
+; protocol handlers, plus the WOW6432Node Origin\ClientPath entry). When the
+; user uninstalls Maxima, we must restore whatever those entries pointed at
+; before so EA Launcher works again without a reinstall.
+;
+; Strategy: before overwriting any of these entries, copy the current value
+; (if any) into HKLM\Software\Maxima\Backup\<key>. The uninstaller reads that
+; backup and either restores the previous value or deletes the entry outright
+; if nothing was there before.
+;
+; "_existed" sentinel: "1" if there was a value to back up, "0" otherwise.
+
+!define BACKUP_ROOT "Software\Maxima\Backup"
+
+; Back up a single registry value at install time.
+; Usage: !insertmacro BackupValue HKLM "SOFTWARE\WOW6432Node\Origin" "ClientPath" "Origin_ClientPath"
+!macro BackupValue ROOT KEY VALUENAME BACKUPID
+    ClearErrors
+    ReadRegStr $0 ${ROOT} "${KEY}" "${VALUENAME}"
+    ${If} ${Errors}
+        WriteRegStr HKLM "${BACKUP_ROOT}\${BACKUPID}" "_existed" "0"
+    ${Else}
+        WriteRegStr HKLM "${BACKUP_ROOT}\${BACKUPID}" "_existed" "1"
+        WriteRegStr HKLM "${BACKUP_ROOT}\${BACKUPID}" "value"    "$0"
+    ${EndIf}
+!macroend
+
+; Restore (or delete) a backed-up value at uninstall time.
+; Usage: !insertmacro RestoreValue HKLM "SOFTWARE\WOW6432Node\Origin" "ClientPath" "Origin_ClientPath"
+!macro RestoreValue ROOT KEY VALUENAME BACKUPID
+    ClearErrors
+    ReadRegStr $0 HKLM "${BACKUP_ROOT}\${BACKUPID}" "_existed"
+    ${If} $0 == "1"
+        ReadRegStr $0 HKLM "${BACKUP_ROOT}\${BACKUPID}" "value"
+        WriteRegStr ${ROOT} "${KEY}" "${VALUENAME}" "$0"
+    ${Else}
+        DeleteRegValue ${ROOT} "${KEY}" "${VALUENAME}"
+    ${EndIf}
+!macroend
+
+; Back up a URL-protocol handler subtree at install time.
+; Captures the three relevant fields: the default value, "URL Protocol", and
+; shell\open\command's default value. Anything else (e.g. DefaultIcon) is not
+; round-tripped, but EA Launcher's protocol entries don't rely on extras.
+; Usage: !insertmacro BackupProtocol "qrc"
+!macro BackupProtocol PROTOCOL
+    ClearErrors
+    ReadRegStr $0 HKCR "${PROTOCOL}" ""
+    ${If} ${Errors}
+        WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "_existed" "0"
+    ${Else}
+        WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "_existed" "1"
+        WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "default" "$0"
+
+        ClearErrors
+        ReadRegStr $0 HKCR "${PROTOCOL}" "URL Protocol"
+        ${IfNot} ${Errors}
+            WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "URL Protocol" "$0"
+        ${EndIf}
+
+        ClearErrors
+        ReadRegStr $0 HKCR "${PROTOCOL}\shell\open\command" ""
+        ${IfNot} ${Errors}
+            WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "command" "$0"
+        ${EndIf}
+    ${EndIf}
+!macroend
+
+; Restore (or delete) a URL-protocol handler subtree at uninstall time.
+; Usage: !insertmacro RestoreProtocol "qrc"
+!macro RestoreProtocol PROTOCOL
+    ClearErrors
+    ReadRegStr $0 HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "_existed"
+    ${If} $0 == "1"
+        ; Wipe Maxima's entries first so nothing stale lingers, then restore.
+        DeleteRegKey HKCR "${PROTOCOL}"
+
+        ReadRegStr $0 HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "default"
+        WriteRegStr HKCR "${PROTOCOL}" "" "$0"
+
+        ClearErrors
+        ReadRegStr $0 HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "URL Protocol"
+        ${IfNot} ${Errors}
+            WriteRegStr HKCR "${PROTOCOL}" "URL Protocol" "$0"
+        ${EndIf}
+
+        ClearErrors
+        ReadRegStr $0 HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "command"
+        ${IfNot} ${Errors}
+            WriteRegStr HKCR "${PROTOCOL}\shell\open\command" "" "$0"
+        ${EndIf}
+    ${Else}
+        DeleteRegKey HKCR "${PROTOCOL}"
+    ${EndIf}
+!macroend
 
 ;---------- General ----------
 !define PRODUCT_NAME "Maxima"
@@ -68,9 +168,16 @@ Section "Maxima Core" SEC_CORE
 
     ; ---- Windows Registry Setup ----
 
-    ; Origin compatibility: Point EA games to maxima-bootstrap.exe
-    ; 64-bit registry view
+    ; Back up any pre-existing values BEFORE we overwrite them, so the
+    ; uninstaller can restore the user's previous EA Launcher / Origin setup.
     SetRegView 64
+    !insertmacro BackupValue    HKLM "SOFTWARE\WOW6432Node\Origin"             "ClientPath"         "Origin_ClientPath"
+    !insertmacro BackupValue    HKLM "SOFTWARE\Electronic Arts\EA Desktop"     "InstallSuccessful"  "EADesktop_InstallSuccessful"
+    !insertmacro BackupProtocol "qrc"
+    !insertmacro BackupProtocol "link2ea"
+    !insertmacro BackupProtocol "origin2"
+
+    ; Origin compatibility: Point EA games to maxima-bootstrap.exe
     WriteRegStr HKLM "SOFTWARE\WOW6432Node\Origin" "ClientPath" "$INSTDIR\maxima-bootstrap.exe"
 
     ; EA Desktop flag
@@ -109,6 +216,21 @@ Section "Maxima Core" SEC_CORE
     ; ---- Start Menu Shortcuts ----
     CreateDirectory "$SMPROGRAMS\Maxima"
     CreateShortcut "$SMPROGRAMS\Maxima\Maxima CLI.lnk" "$INSTDIR\maxima-cli.exe" "" "$INSTDIR\maxima-cli.exe" 0
+
+    ; The graphical UI (maxima.exe) and terminal UI (maxima-tui.exe) are
+    ; built but optional - create their shortcuts only when the files were
+    ; actually packaged. Matches the `File /nonfatal` semantics above so a
+    ; CLI-only build doesn't leave dangling links.
+    IfFileExists "$INSTDIR\maxima.exe" make_ui_shortcut skip_ui_shortcut
+    make_ui_shortcut:
+        CreateShortcut "$SMPROGRAMS\Maxima\Maxima.lnk" "$INSTDIR\maxima.exe" "" "$INSTDIR\maxima.exe" 0
+    skip_ui_shortcut:
+
+    IfFileExists "$INSTDIR\maxima-tui.exe" make_tui_shortcut skip_tui_shortcut
+    make_tui_shortcut:
+        CreateShortcut "$SMPROGRAMS\Maxima\Maxima TUI.lnk" "$INSTDIR\maxima-tui.exe" "" "$INSTDIR\maxima-tui.exe" 0
+    skip_tui_shortcut:
+
     CreateShortcut "$SMPROGRAMS\Maxima\Uninstall Maxima.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
 
     ; ---- Uninstaller ----
@@ -117,7 +239,15 @@ Section "Maxima Core" SEC_CORE
     ; Add/Remove Programs entry
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninstall.exe"
-    WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima-cli.exe"
+    ; Prefer the GUI's icon for Add/Remove Programs when available - falls back
+    ; to the CLI icon for CLI-only installs.
+    IfFileExists "$INSTDIR\maxima.exe" use_ui_icon use_cli_icon
+    use_ui_icon:
+        WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima.exe"
+        Goto icon_done
+    use_cli_icon:
+        WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\maxima-cli.exe"
+    icon_done:
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
@@ -138,20 +268,25 @@ Section "Uninstall"
     Sleep 2000
     nsExec::ExecToLog 'sc delete MaximaBackgroundService'
 
-    ; Remove protocol handlers
-    DeleteRegKey HKCR "qrc"
-    DeleteRegKey HKCR "link2ea"
-    DeleteRegKey HKCR "origin2"
+    ; Restore protocol handlers to whatever they pointed at before the install
+    ; (typically EA Desktop / Origin Launcher). If they didn't exist pre-install
+    ; the macro just deletes the key, which leaves the system in a clean state
+    ; ready for EA Launcher to register itself on its next run.
+    !insertmacro RestoreProtocol "qrc"
+    !insertmacro RestoreProtocol "link2ea"
+    !insertmacro RestoreProtocol "origin2"
 
-    ; Remove Origin compatibility registry keys
+    ; Restore Origin compatibility values
     SetRegView 64
-    DeleteRegValue HKLM "SOFTWARE\WOW6432Node\Origin" "ClientPath"
-    DeleteRegValue HKLM "SOFTWARE\Electronic Arts\EA Desktop" "InstallSuccessful"
+    !insertmacro RestoreValue HKLM "SOFTWARE\WOW6432Node\Origin"         "ClientPath"        "Origin_ClientPath"
+    !insertmacro RestoreValue HKLM "SOFTWARE\Electronic Arts\EA Desktop" "InstallSuccessful" "EADesktop_InstallSuccessful"
 
     ; Remove Add/Remove Programs entry
     DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}"
 
-    ; Remove install path registry
+    ; Remove install path registry AND the backup subtree (which lived under
+    ; HKLM\Software\Maxima\Backup). DeleteRegKey is recursive so this also
+    ; cleans up the backup we just consumed.
     DeleteRegKey HKLM "Software\Maxima"
 
     ; Remove Start Menu shortcuts
