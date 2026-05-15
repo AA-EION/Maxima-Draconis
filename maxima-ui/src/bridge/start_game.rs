@@ -42,6 +42,7 @@ pub async fn start_game_request(
             path_override: exe_override,
             arguments: args,
             cloud_saves,
+            steam_launch: false,
         },
     )
     .await

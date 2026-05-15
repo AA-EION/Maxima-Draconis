@@ -20,15 +20,32 @@ use url::Url;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// Validates that an offer_id is a well-formed EA Origin offer ID.
+/// Validates that an offer_id is one of the safe identifier shapes we'll
+/// forward to `maxima-cli launch`.
 ///
-/// Pattern: `Origin.OFR.<digits>.<digits>` (e.g. `Origin.OFR.50.0002694`).
+/// Two forms are accepted:
+///
+/// 1. **EA Origin offer id** — `Origin.OFR.<digits>.<digits>` (e.g.
+///    `Origin.OFR.50.0002694`). Emitted by EA Desktop and by games launched
+///    directly outside Steam.
+/// 2. **Pure-numeric Steam App ID** — e.g. `1237970` (Titanfall 2 on Steam).
+///    Emitted by EA-published games when launched from inside Steam, where
+///    the URL looks like `link2ea://launchgame/1237970?platform=steam&theme=tf2`.
+///    `maxima-cli`'s exhaustive library lookup resolves these against the
+///    user's owned games (matching against `product.id`, `offer.content_id`,
+///    etc., not just the slug).
 ///
 /// This is a defense against command-line injection: protocol handler URLs
-/// (link2ea://, origin2://) are attacker-controlled. Without validation, an
-/// attacker could craft a URL like `link2ea://launchgame/--login=stolen_token`
+/// (`link2ea://`, `origin2://`) are attacker-controlled. Without validation,
+/// an attacker could craft a URL like `link2ea://launchgame/--login=stolen_token`
 /// and `maxima-cli` would interpret `--login` as a flag, bypassing OAuth.
+/// Both accepted shapes start with either an ASCII letter or digit, so flag
+/// injection is structurally impossible.
 fn is_valid_ea_offer_id(s: &str) -> bool {
+    is_valid_origin_offer_id(s) || is_valid_steam_app_id(s)
+}
+
+fn is_valid_origin_offer_id(s: &str) -> bool {
     let mut parts = s.split('.');
     if parts.next() != Some("Origin") {
         return false;
@@ -45,6 +62,13 @@ fn is_valid_ea_offer_id(s: &str) -> bool {
         && !minor.is_empty()
         && major.chars().all(|c| c.is_ascii_digit())
         && minor.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_valid_steam_app_id(s: &str) -> bool {
+    // 1..=10 digits covers every Steam App ID issued (current max is ~3M).
+    // Reject empty (covers `link2ea://launchgame/` with no segment) and
+    // anything that includes a non-digit (defends against `12--login=x`).
+    !s.is_empty() && s.len() <= 10 && s.chars().all(|c| c.is_ascii_digit())
 }
 
 #[derive(Error, Debug)]

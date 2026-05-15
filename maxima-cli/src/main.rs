@@ -50,6 +50,148 @@ lazy_static! {
     static ref MANUAL_LOGIN_PATTERN: Regex = Regex::new(r"^(.*):(.*)$").unwrap();
     // Matches a well-formed EA offer ID like "Origin.OFR.50.0002694"
     static ref EA_OFFER_ID_PATTERN: Regex = Regex::new(r"^Origin\.OFR\.\d+\.\d+$").unwrap();
+    // Matches a Steam App ID emitted by `link2ea://launchgame/<id>?platform=steam`
+    static ref STEAM_APP_ID_PATTERN: Regex = Regex::new(r"^\d{1,10}$").unwrap();
+}
+
+/// Hardcoded fallback table for EA-published games available on Steam.
+///
+/// When TF2 (and similar) is launched from inside Steam, the URL Steam emits
+/// is `link2ea://launchgame/<steam_app_id>?platform=steam&theme=...`. Steam
+/// does NOT spawn the game executable — it expects the link2ea handler (us)
+/// to take over the launch entirely: auth + spawn the binary with the right
+/// env vars so TF2 connects to our LSX server.
+///
+/// For Steam-only owners whose EA account is not linked, the EA library
+/// lookup will fail to translate the Steam App ID to an Origin offer ID
+/// AND won't know where the game is installed. This table provides both:
+///   - the EA Origin offer ID to use for license/auth
+///   - the relative path inside Steam's `steamapps/common/` to find the exe
+///
+/// Discovery process at runtime (`resolve_steam_install_path`):
+///   1. Read `HKLM\SOFTWARE\(Wow6432Node\)Valve\Steam\InstallPath` for Steam root
+///   2. Parse `<steam>\steamapps\libraryfolders.vdf` for additional libraries
+///   3. Look for `<library>\steamapps\appmanifest_<app_id>.acf` and its `installdir`
+///   4. Fall back to `<steam_root>\steamapps\common\<install_subdir>\<exe>` from this table
+///
+/// Extend as more EA-on-Steam titles are validated.
+struct SteamGameEntry {
+    steam_app_id: &'static str,
+    origin_offer_id: &'static str,
+    /// Directory name under `steamapps/common/`, e.g. "Titanfall2"
+    install_subdir: &'static str,
+    /// Game executable filename within the install dir, e.g. "Titanfall2.exe"
+    exe_name: &'static str,
+}
+
+const STEAM_GAMES: &[SteamGameEntry] = &[
+    SteamGameEntry {
+        steam_app_id: "1237970",
+        // Note: NOT Origin.OFR.50.0002694 — that's Apex Legends. TF2's real
+        // offer ID is Origin.OFR.50.0001456, confirmed against a real EA
+        // library dump ("titanfall-2 - Titanfall 2 - Origin.OFR.50.0001456").
+        origin_offer_id: "Origin.OFR.50.0001456",
+        install_subdir: "Titanfall2",
+        exe_name: "Titanfall2.exe",
+    },
+];
+
+fn lookup_steam_game(steam_app_id: &str) -> Option<&'static SteamGameEntry> {
+    STEAM_GAMES.iter().find(|g| g.steam_app_id == steam_app_id)
+}
+
+/// Resolve where a given Steam game is installed on disk. Returns the full
+/// path to the game executable (e.g. `C:\...\Steam\steamapps\common\Titanfall2\Titanfall2.exe`)
+/// or `None` if the game isn't installed in any known Steam library.
+///
+/// Lookup order:
+///   1. Steam install path from registry (`HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath`
+///      or `HKLM\SOFTWARE\Valve\Steam\InstallPath`)
+///   2. Common default install locations as a last-resort
+///   3. Parse libraryfolders.vdf to find additional Steam library folders
+///   4. Verify the executable exists at `<library>\steamapps\common\<subdir>\<exe>`
+#[cfg(windows)]
+fn resolve_steam_install_path(game: &SteamGameEntry) -> Option<PathBuf> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let mut steam_roots: Vec<PathBuf> = Vec::new();
+
+    // 1. Registry — try both views since Steam installs as 32-bit on most systems
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for key in &[
+        "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+        "SOFTWARE\\Valve\\Steam",
+    ] {
+        if let Ok(subkey) = hklm.open_subkey(key) {
+            if let Ok(path) = subkey.get_value::<String, _>("InstallPath") {
+                steam_roots.push(PathBuf::from(path));
+            }
+        }
+    }
+
+    // 2. Common defaults (covers fresh Wine bottles where the registry key
+    //    may not have been written yet, or when running outside Wine)
+    for default in &[
+        "C:\\Program Files (x86)\\Steam",
+        "C:\\Program Files\\Steam",
+    ] {
+        let p = PathBuf::from(default);
+        if p.exists() && !steam_roots.contains(&p) {
+            steam_roots.push(p);
+        }
+    }
+
+    // 3. For each Steam root, gather library folders from libraryfolders.vdf
+    //    and search for the game.
+    for root in &steam_roots {
+        let mut libraries: Vec<PathBuf> = vec![root.clone()];
+
+        // Parse libraryfolders.vdf for extra library paths. VDF is a simple
+        // key-value format; we don't need a full parser — just grep "path".
+        let vdf_paths = [
+            root.join("steamapps").join("libraryfolders.vdf"),
+            root.join("config").join("libraryfolders.vdf"),
+        ];
+        for vdf in &vdf_paths {
+            if let Ok(content) = std::fs::read_to_string(vdf) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    // Lines look like:   "path"   "C:\\SteamLibrary"
+                    if let Some(rest) = trimmed.strip_prefix("\"path\"") {
+                        if let Some(start) = rest.find('"') {
+                            let after = &rest[start + 1..];
+                            if let Some(end) = after.find('"') {
+                                let extra = PathBuf::from(after[..end].replace("\\\\", "\\"));
+                                if !libraries.contains(&extra) {
+                                    libraries.push(extra);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Verify the executable exists in each library
+        for lib in &libraries {
+            let exe = lib
+                .join("steamapps")
+                .join("common")
+                .join(game.install_subdir)
+                .join(game.exe_name);
+            if exe.exists() {
+                return Some(exe);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_steam_install_path(_game: &SteamGameEntry) -> Option<PathBuf> {
+    None
 }
 
 #[derive(Subcommand, Debug)]
@@ -489,14 +631,112 @@ async fn startup(args: Args) -> Result<()> {
                         slug
                     );
                     slug.clone()
+                } else if STEAM_APP_ID_PATTERN.is_match(&slug) {
+                    // Slug is a Steam App ID. The exhaustive library lookup above
+                    // should have matched it via product.id / offer.content_id for
+                    // any user whose Steam and EA accounts are linked. If we got
+                    // here the accounts are not linked, so fall back to the static
+                    // STEAM_GAMES table — the EA license server only accepts
+                    // Origin offer IDs, not Steam IDs, so a passthrough would
+                    // just fail with a less helpful error.
+                    if let Some(game) = lookup_steam_game(&slug) {
+                        warn!(
+                            "Steam App ID '{}' not in EA library (Steam/EA accounts not linked?); \
+                             using hardcoded fallback offer ID '{}'. Link your accounts at \
+                             https://www.ea.com to remove this warning.",
+                            slug, game.origin_offer_id
+                        );
+                        game.origin_offer_id.to_string()
+                    } else {
+                        bail!(
+                            "Steam App ID '{}' is not in this user's EA library and has no \
+                             hardcoded fallback. Link your Steam and EA accounts at https://www.ea.com, \
+                             or open an issue if this is an EA-published game on Steam that should be supported.",
+                            slug
+                        );
+                    }
                 } else {
                     bail!("No owned offer found for '{}'. If this is an EA offer ID, make sure your EA and Steam accounts are linked at https://www.ea.com", slug);
                 }
             } else {
-                slug
+                slug.clone()
             };
 
-            start_game(&offer_id, game_path, game_args, login, maxima_arc.clone()).await
+            // If the slug was a Steam App ID, the game is installed under
+            // Steam's library, not EA Desktop's. `launch::start_game` would
+            // bail with `NotInstalled` because EA's metadata doesn't know
+            // about the Steam install. Discover the actual location from
+            // Steam's registry + libraryfolders.vdf and pass it as an
+            // explicit game_path override.
+            let resolved_game_path = if game_path.is_none() && STEAM_APP_ID_PATTERN.is_match(&slug) {
+                lookup_steam_game(&slug)
+                    .and_then(resolve_steam_install_path)
+                    .and_then(|p| p.to_str().map(|s| s.to_owned()))
+                    .map(|p| {
+                        info!("Discovered Steam install for app {}: {}", slug, p);
+                        p
+                    })
+                    .or_else(|| {
+                        warn!(
+                            "Could not auto-discover Steam install path for app {}. \
+                             If this game is installed in a non-standard location, \
+                             pass --game-path manually.",
+                            slug
+                        );
+                        None
+                    })
+            } else {
+                game_path
+            };
+
+            // Steam DRM stub in EA-on-Steam titles (notably TF2) exits with
+            // code 100010 ("Steam not detected") if launched without the
+            // SteamAppId / SteamGameId env vars set. EA Desktop's Link2EA.exe
+            // sets these when it spawns the game; we have to do the same.
+            // The env vars propagate from this process through bootstrap to
+            // the actual game executable via Command::env inheritance.
+            let is_steam_launch = STEAM_APP_ID_PATTERN.is_match(&slug);
+            if is_steam_launch {
+                info!("Setting Steam env vars (SteamAppId={}) for Steam-launched game", slug);
+                std::env::set_var("SteamAppId", &slug);
+                std::env::set_var("SteamGameId", &slug);
+                // Steam also normally exports these — set defaults so anything
+                // that polls the env directly doesn't see them unset.
+                if std::env::var("SteamClientLaunch").is_err() {
+                    std::env::set_var("SteamClientLaunch", "1");
+                }
+                if std::env::var("SteamPath").is_err() {
+                    std::env::set_var("SteamPath", "C:\\Program Files (x86)\\Steam");
+                }
+            }
+
+            // Auto-inject launch args known to be required for Wine/Steam
+            // launches. These are the same defaults flightcore-ng uses
+            // (see catornot/flightcore-ng wine_run.rs L23-31):
+            //   -noOriginStartup : skip the Origin "starting" wait that hangs
+            //                      forever in Wine since EA Desktop isn't present
+            //   -multiple        : allow multiple game instances (avoids the
+            //                      "another instance already running" check that
+            //                      can fire when Steam + Maxima race the launch)
+            // Only add them if the user didn't already specify them.
+            let mut final_game_args = game_args;
+            if is_steam_launch {
+                let has_no_origin = final_game_args
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("-noOriginStartup"));
+                let has_multiple = final_game_args
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("-multiple"));
+                if !has_no_origin {
+                    final_game_args.insert(0, "-noOriginStartup".to_string());
+                }
+                if !has_multiple {
+                    final_game_args.insert(0, "-multiple".to_string());
+                }
+                info!("Auto-injected Steam launch args; final args: {:?}", final_game_args);
+            }
+
+            start_game(&offer_id, resolved_game_path, final_game_args, login, is_steam_launch, maxima_arc.clone()).await
         }
         Mode::ListGames => list_games(maxima_arc.clone()).await,
         Mode::LocateGame { path } => locate_game(maxima_arc.clone(), &path).await,
@@ -575,7 +815,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, maxima_arc.clone()).await?;
+    start_game(&offer_id, None, Vec::new(), None, false, maxima_arc.clone()).await?;
 
     Ok(())
 }
@@ -1018,6 +1258,7 @@ async fn start_game(
     game_path_override: Option<String>,
     game_args: Vec<String>,
     login: Option<String>,
+    steam_launch: bool,
     maxima_arc: LockedMaxima,
 ) -> Result<()> {
     {
@@ -1039,6 +1280,7 @@ async fn start_game(
         path_override: game_path_override,
         arguments: game_args,
         cloud_saves: true,
+        steam_launch,
     };
 
     if login.is_none() {

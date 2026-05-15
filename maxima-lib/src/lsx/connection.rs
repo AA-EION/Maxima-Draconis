@@ -109,6 +109,17 @@ pub struct ConnectionState {
     challenge: String,
     encryption: EncryptionState,
     pid: u32,
+    /// Game version reported by the client in the LSX challenge response.
+    /// Captured during challenge so subsequent handlers (e.g. GetAllGameInfo)
+    /// can reflect the real version back instead of the hardcoded "0" /
+    /// "1.0.1.3" — TF2 reads InstalledVersion / AvailableVersion to verify
+    /// its install isn't tampered with, and mismatches trigger an "Engine
+    /// Error: File corruption detected" dialog.
+    game_version: Option<String>,
+    /// Title reported by the client in the LSX challenge response (e.g.
+    /// "Titanfall2"). Used for diagnostic output and reflected in
+    /// GetAllGameInfoResponse.
+    game_title: Option<String>,
     /// Message responses that are waiting to be sent
     queued_messages: Vec<String>,
 }
@@ -119,6 +130,11 @@ impl ConnectionState {
     /// Enable encryption on the packet after next
     pub fn enable_encryption(&mut self, encryption_key: [u8; 16]) {
         self.encryption = EncryptionState::Ready(encryption_key);
+    }
+
+    pub fn set_game_metadata(&mut self, version: String, title: String) {
+        self.game_version = Some(version);
+        self.game_title = Some(title);
     }
 
     pub async fn maxima(&mut self) -> MutexGuard<'_, Maxima> {
@@ -270,6 +286,8 @@ impl Connection {
             challenge: CHALLENGE_KEY.to_string(),
             encryption: EncryptionState::Disabled,
             pid: pid.unwrap_or(0),
+            game_version: None,
+            game_title: None,
             queued_messages: Vec::new(),
         }));
 

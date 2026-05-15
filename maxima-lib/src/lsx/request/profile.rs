@@ -38,6 +38,17 @@ pub async fn handle_profile_request(
     let name = player.unique_name();
     debug!("Got profile for {} {:?}", &name, path);
 
+    // When the game was launched from a Steam context, the user IS a Steam
+    // subscriber for this title — the EntitlementSource in GetAllGameInfo
+    // is already "STEAM", and TF2's DRM stub treats a contradiction between
+    // those two fields (entitlement says Steam, profile says "not a Steam
+    // subscriber") as a tamper signal and triggers "Engine Error: File
+    // corruption detected".
+    //
+    // Detect by env var SteamAppId which maxima-cli sets when invoked via a
+    // `link2ea://launchgame/<numeric>?platform=steam` URL.
+    let is_steam_launch = std::env::var("SteamAppId").is_ok();
+
     make_lsx_handler_response!(Response, GetProfileResponse, {
        attr_Persona: name.to_owned(),
        attr_SubscriberLevel: 0,
@@ -47,8 +58,8 @@ pub async fn handle_profile_request(
        attr_UserId: user.id().parse::<u64>()?,
        attr_GeoCountry: "US".to_string(),
        attr_AvatarId: path.safe_str()?.to_string(),
-       attr_IsSubscriber: false,
-       attr_IsSteamSubscriber: false,
+       attr_IsSubscriber: is_steam_launch,
+       attr_IsSteamSubscriber: is_steam_launch,
        attr_PersonaId: player.psd().parse::<u64>()?,
        attr_IsUnderAge: false,
        attr_UserIndex: 0,
