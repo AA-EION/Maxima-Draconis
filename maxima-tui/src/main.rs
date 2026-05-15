@@ -445,6 +445,7 @@ async fn start_game(
         path_override: game_path_override,
         arguments: game_args,
         cloud_saves: true,
+        steam_launch: false,
     };
 
     if login.is_none() {

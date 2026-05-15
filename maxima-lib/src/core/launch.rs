@@ -87,6 +87,13 @@ pub struct LaunchOptions {
     pub path_override: Option<String>,
     pub arguments: Vec<String>,
     pub cloud_saves: bool,
+    /// When true, the game is being launched from Steam context (the user
+    /// clicked Play in Steam, which emitted `link2ea://launchgame/<steam_app_id>?platform=steam`).
+    /// The EA env vars passed to the game are flipped from "EA" to "Steam"
+    /// for `EAExternalSource` / `EALaunchOwner` / `EAEntitlementSource` so the
+    /// game's launch context matches what it expects from Steam DRM and
+    /// Steamworks, avoiding "corrupted files" / "wrong entitlement" rejections.
+    pub steam_launch: bool,
 }
 
 pub enum LaunchMode {
@@ -196,7 +203,12 @@ pub async fn start_game(
                 None => return Err(LaunchError::NoOfferFound(offer_id.clone())),
             };
 
-            if !offer.is_installed().await {
+            // Skip the EA-side install check when the caller supplied an
+            // explicit path_override. This covers the Steam-launched case
+            // where the game lives in Steam's library and EA Desktop has no
+            // record of it — `offer.is_installed()` would return false even
+            // though the binary is right there on disk.
+            if options.path_override.is_none() && !offer.is_installed().await {
                 return Err(LaunchError::NotInstalled(offer.offer_id().clone()));
             }
 
@@ -324,18 +336,25 @@ pub async fn start_game(
     let user = maxima.local_user().await?;
     let launch_id = Uuid::new_v4().to_string();
 
+    // Source / owner / entitlement env vars: "EA" for EA-Desktop-launched
+    // games, "Steam" for games launched via Steam (the user clicked Play in
+    // Steam). When mismatched, TF2 (and likely other EA-on-Steam titles)
+    // throws a "corrupted game files" error because its DRM stub expects the
+    // ownership tag to match its install context.
+    let source_tag = if options.steam_launch { "Steam" } else { "EA" };
+
     child
         .current_dir(PathBuf::from(path).safe_parent()?)
         .env("MXLaunchId", launch_id.to_owned())
         .env("EAAuthCode", "unavailable")
         .env("EAEgsProxyIpcPort", "0")
-        .env("EAEntitlementSource", "EA")
-        .env("EAExternalSource", "EA")
+        .env("EAEntitlementSource", source_tag)
+        .env("EAExternalSource", source_tag)
         .env("EAFreeTrialGame", "false")
         .env("EAGameLocale", maxima.locale.full_str())
         .env("EAGenericAuthToken", access_token.to_owned())
         .env("EALaunchCode", "unavailable")
-        .env("EALaunchOwner", "EA")
+        .env("EALaunchOwner", source_tag)
         .env(
             "EALaunchEAID",
             user.player()

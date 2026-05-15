@@ -28,9 +28,20 @@ pub async fn handle_challenge_response(
     };
 
     info!(
-        "Game Connected - Name: {}, Offer ID: {}, Multiplayer Id: {}",
-        message.title, message.content_id, message.multiplayer_id
+        "Game Connected - Name: {}, Offer ID: {}, Multiplayer Id: {}, Version: {}",
+        message.title, message.content_id, message.multiplayer_id, message.version
     );
+
+    // Capture the game version + title so subsequent handlers (notably
+    // GetAllGameInfo) can reflect the real installed version back to the
+    // client. Without this, the handler returns hardcoded InstalledVersion="0"
+    // and AvailableVersion="1.0.1.3" which TF2 (current build is 9.12.1.3)
+    // reads as a version mismatch — triggering its "Engine Error: File
+    // corruption detected" tamper-detection dialog.
+    {
+        let mut s = state.write().await;
+        s.set_game_metadata(message.version.clone(), message.title.clone());
+    }
 
     let encryption_key = make_lsx_key(seed);
     state.write().await.enable_encryption(encryption_key);
