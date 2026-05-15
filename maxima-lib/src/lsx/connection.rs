@@ -209,48 +209,61 @@ impl Connection {
         stream.set_nonblocking(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
 
+        let mut pid: Result<u32, NativeError> = Ok(0);
+
         let maxima: MutexGuard<'_, Maxima> = maxima_arc.lock().await;
-        let context: &ActiveGameContext = match maxima.playing() {
-            Some(context) => context,
+        match maxima.playing() {
             None => {
-                stream.shutdown(std::net::Shutdown::Both)?;
-                return Err(LSXConnectionError::GameContext);
+                // Game was launched externally (e.g. Steam Northstar mode via
+                // `steam.exe -applaunch 1237970 -northstar`) rather than
+                // through `maxima-cli launch`. Accept the connection anyway —
+                // LSX only needs the TCP socket; the PID/Kyber path is skipped
+                // because there is no ActiveGameContext to interrogate.
+                //
+                // Without this, TF2 + Northstar launched via Steam would have
+                // its LSX connection rejected immediately, preventing online
+                // play even when Maxima is running in the background.
+                //
+                // Ported from catornot/Maxima@patch-external-lsx, which itself
+                // originated as upstream PR #42 (p0358).
+                warn!("External LSX connection (the game was not started through Maxima)");
             }
-        };
+            Some(context) => {
+                // The PID system is mainly for Kyber injection
+                pid = get_os_pid(context);
+                if cfg!(unix) {
+                    if let Ok(os_pid) = pid {
+                        let sys = System::new_all();
+                        if let Some(process) = sys.process(Pid::from_u32(os_pid)) {
+                            let filename = PathBuf::from(
+                                process.cmd()[0]
+                                    .to_owned()
+                                    .replace("Z:", "")
+                                    .replace('\\', "/"),
+                            )
+                            .file_name()
+                            .ok_or(NativeError::FileName)?
+                            .to_str()
+                            .ok_or(NativeError::Stringify)?
+                            .to_owned();
 
-        // The PID system is mainly for Kyber injection
-        let mut pid = get_os_pid(context);
-        if cfg!(unix) {
-            if let Ok(os_pid) = pid {
-                let sys = System::new_all();
-                if let Some(process) = sys.process(Pid::from_u32(os_pid)) {
-                    let filename = PathBuf::from(
-                        process.cmd()[0]
-                            .to_owned()
-                            .replace("Z:", "")
-                            .replace('\\', "/"),
-                    )
-                    .file_name()
-                    .ok_or(NativeError::FileName)?
-                    .to_str()
-                    .ok_or(NativeError::Stringify)?
-                    .to_owned();
+                            pid = get_wine_pid(&context.launch_id(), &filename).await;
+                        } else {
+                            warn!(
+                                "Failed to find game process while looking for PID {}",
+                                os_pid
+                            );
+                        }
+                    }
+                }
 
-                    pid = get_wine_pid(&context.launch_id(), &filename).await;
-                } else {
-                    warn!(
-                        "Failed to find game process while looking for PID {}",
-                        os_pid
-                    );
+                match &pid {
+                    Err(err) => warn!("Error while finding game PID: {}", err),
+                    Ok(0) => warn!("Failed to find PID through launch ID, things may not work!"),
+                    _ => {}
                 }
             }
-        }
-
-        if let Err(ref err) = pid {
-            warn!("Error while finding game PID: {}", err);
-        } else if pid.as_ref().unwrap() == &0 {
-            warn!("Failed to find PID through launch ID, things may not work!");
-        }
+        };
 
         let state = Arc::new(RwLock::new(ConnectionState {
             maxima: maxima_arc.clone(),

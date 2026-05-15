@@ -268,7 +268,20 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
             }
 
             child.args(["launch", offer_id]);
-            child.spawn()?.wait().await?;
+            let status = child.spawn()?.wait().await?;
+
+            // Propagate non-zero exits as errors so handle_launch_args logs
+            // them to maxima_execution.log and maxima_bootstrap_error.log via
+            // the existing centralized error-reporting path. Previously we
+            // logged manually and still returned Ok(true), which made failures
+            // look like successes in the log.
+            if !status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("maxima-cli (link2ea) exited non-zero: code={:?}", status.code()),
+                )
+                .into());
+            }
 
             return Ok(true);
         }
@@ -313,7 +326,15 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
             }
 
             child.args(["launch", offer_id]);
-            child.spawn()?.wait().await?;
+            let status = child.spawn()?.wait().await?;
+
+            if !status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("maxima-cli (origin2) exited non-zero: code={:?}", status.code()),
+                )
+                .into());
+            }
 
             return Ok(true);
         }

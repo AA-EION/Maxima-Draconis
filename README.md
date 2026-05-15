@@ -102,6 +102,30 @@ bash installer/build.sh
 
 ---
 
+## Northstar online play
+
+Northstar works with Maxima, but requires two things:
+
+**1. Launch via Steam, not via `NorthstarLauncher.exe`.**  
+`NorthstarLauncher.exe` hard-codes a call to `Origin.exe` which doesn't exist in Wine. Pass the `-northstar` flag to Steam instead so it invokes `Titanfall2.exe` directly with the Northstar hooks loaded:
+
+```
+steam.exe -applaunch 1237970 -northstar
+```
+
+Draconis already does this automatically.
+
+**2. Add `-noOriginStartup` to your Northstar launch arguments.**  
+Without it, Northstar tries to start Origin at launch, which hangs forever in Wine since there is no Origin install. The correct set of arguments is:
+
+```
+-noOriginStartup -multiple -northstar
+```
+
+Thanks to [catornot](https://github.com/catornot) for identifying this requirement and for contributing the external LSX connection patch that makes Northstar online play work in this fork. See [catornot/flightcore-ng](https://github.com/catornot/flightcore-ng/blob/221e4444b6f1813c2401deed9f21d95494bad1ed/flightcore-ng-core/src/dev/wine/wine_run.rs#L23-L31) for reference.
+
+---
+
 ## Known limitations
 
 - **Steam-only TF2 owners**: If your TF2 EA license isn't linked to your EA account (it's Steam-only), Maxima will warn and attempt a passthrough. For the cleanest experience, link your accounts at [ea.com](https://www.ea.com). Linking takes about 30 seconds and resolves the warning permanently.
@@ -136,6 +160,9 @@ This fork tracks [ArmchairDevelopers/Maxima](https://github.com/ArmchairDevelope
 - [Paweł Lidwin](https://github.com/imLinguin) — core maintainer
 
 **This fork used by:** [AA-EION/Draconis](https://github.com/AA-EION/Draconis)
+
+**Contributors to this fork:**
+- [catornot](https://github.com/catornot) — external LSX connection patch enabling Northstar online play, and identifying the `-noOriginStartup` launch argument required for Wine
 
 ---
 

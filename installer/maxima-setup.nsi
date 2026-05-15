@@ -54,8 +54,31 @@
 ; Captures the three relevant fields: the default value, "URL Protocol", and
 ; shell\open\command's default value. Anything else (e.g. DefaultIcon) is not
 ; round-tripped, but EA Launcher's protocol entries don't rely on extras.
+;
+; Upgrade guard: if Maxima is already installed (detected via the
+; HKLM\Software\Maxima\InstallPath reg key the prior install wrote), this
+; is an upgrade. We skip the backup phase entirely so that:
+;   - we don't overwrite a real EA-handler backup with Maxima's own values,
+;   - we don't write a brand-new backup that points at a Maxima binary
+;     (which the uninstaller would then "restore" to a deleted path).
+; The first install captures the pre-Maxima state; subsequent upgrades
+; leave that backup untouched.
+;
+; View safety: SetRegView default before HKCR reads so this macro is
+; independent of caller state (the install section sets view 64 for HKLM
+; ops, which would otherwise leak into HKCR).
+;
 ; Usage: !insertmacro BackupProtocol "qrc"
 !macro BackupProtocol PROTOCOL
+    SetRegView default
+
+    ClearErrors
+    ReadRegStr $9 HKLM "Software\Maxima" "InstallPath"
+    ${IfNot} ${Errors}
+        DetailPrint "BackupProtocol(${PROTOCOL}): upgrade detected, preserving original backup"
+        Goto skip_backup_${PROTOCOL}
+    ${EndIf}
+
     ClearErrors
     ReadRegStr $0 HKCR "${PROTOCOL}" ""
     ${If} ${Errors}
@@ -76,11 +99,30 @@
             WriteRegStr HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "command" "$0"
         ${EndIf}
     ${EndIf}
+    skip_backup_${PROTOCOL}:
+!macroend
+
+; Upgrade-safe wrapper around BackupValue with the same guard as
+; BackupProtocol. Use for HKLM values that must be round-tripped on
+; uninstall (Origin\ClientPath, EA Desktop\InstallSuccessful).
+; Usage: !insertmacro BackupValueUpgradeSafe HKLM "Key" "Name" "BackupId"
+!macro BackupValueUpgradeSafe ROOT KEY VALUENAME BACKUPID
+    ClearErrors
+    ReadRegStr $9 HKLM "Software\Maxima" "InstallPath"
+    ${If} ${Errors}
+        !insertmacro BackupValue ${ROOT} "${KEY}" "${VALUENAME}" "${BACKUPID}"
+    ${Else}
+        DetailPrint "BackupValueUpgradeSafe(${BACKUPID}): upgrade detected, preserving original backup"
+    ${EndIf}
 !macroend
 
 ; Restore (or delete) a URL-protocol handler subtree at uninstall time.
+; Forces view default so HKCR reads/writes match the install-time store
+; (BackupProtocol also runs under view default - they must agree or the
+; uninstaller "restores" nothing and leaves dangling Maxima keys behind).
 ; Usage: !insertmacro RestoreProtocol "qrc"
 !macro RestoreProtocol PROTOCOL
+    SetRegView default
     ClearErrors
     ReadRegStr $0 HKLM "${BACKUP_ROOT}\Protocol_${PROTOCOL}" "_existed"
     ${If} $0 == "1"
@@ -114,7 +156,7 @@
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
 
-; Binary directory — override at compile time with /DBIN_DIR="..."
+; Binary directory - override at compile time with /DBIN_DIR="..."
 ; Default is the macOS cross-compilation path (installer/build.sh).
 ; CI Windows native builds pass /DBIN_DIR="..\target\release"
 !ifndef BIN_DIR
@@ -170,20 +212,40 @@ Section "Maxima Core" SEC_CORE
 
     ; Back up any pre-existing values BEFORE we overwrite them, so the
     ; uninstaller can restore the user's previous EA Launcher / Origin setup.
+    ;
+    ; HKLM\SOFTWARE\WOW6432Node\* and HKLM\SOFTWARE\Electronic Arts\* are
+    ; backed up under the 64-bit view so the values match where EA Desktop
+    ; / Origin writes them on a real 64-bit Windows install.
     SetRegView 64
-    !insertmacro BackupValue    HKLM "SOFTWARE\WOW6432Node\Origin"             "ClientPath"         "Origin_ClientPath"
-    !insertmacro BackupValue    HKLM "SOFTWARE\Electronic Arts\EA Desktop"     "InstallSuccessful"  "EADesktop_InstallSuccessful"
+    !insertmacro BackupValueUpgradeSafe HKLM "SOFTWARE\WOW6432Node\Origin"             "ClientPath"         "Origin_ClientPath"
+    !insertmacro BackupValueUpgradeSafe HKLM "SOFTWARE\Electronic Arts\EA Desktop"     "InstallSuccessful"  "EADesktop_InstallSuccessful"
+
+    ; HKCR protocol handlers are SHARED keys on Windows (not WOW64-redirected
+    ; for URL protocol associations), but NSIS still resolves HKCR through
+    ; whichever view is currently active. Force back to default so the
+    ; backups and the subsequent writes target the same store the OS
+    ; serves to both 32-bit and 64-bit URL-resolving processes.
+    ;
+    ; This is the critical fix for the v0.2.0 -> v0.2.1 upgrade regression
+    ; where view-64 leaked into HKCR writes and left 32-bit consumers
+    ; (Titanfall2.exe, Origin emitting link2ea://) looking at stale or
+    ; missing handlers.
+    SetRegView default
     !insertmacro BackupProtocol "qrc"
     !insertmacro BackupProtocol "link2ea"
     !insertmacro BackupProtocol "origin2"
 
     ; Origin compatibility: Point EA games to maxima-bootstrap.exe
+    ; (back under view 64 - same store as the BackupValue above).
+    SetRegView 64
     WriteRegStr HKLM "SOFTWARE\WOW6432Node\Origin" "ClientPath" "$INSTDIR\maxima-bootstrap.exe"
 
     ; EA Desktop flag
     WriteRegStr HKLM "SOFTWARE\Electronic Arts\EA Desktop" "InstallSuccessful" "true"
 
     ; ---- Protocol Handlers ----
+    ; Reset view for HKCR writes - see comment above the BackupProtocol calls.
+    SetRegView default
 
     ; qrc:// protocol (EA login redirection)
     WriteRegStr HKCR "qrc" "" "URL:Maxima Protocol"
@@ -272,11 +334,14 @@ Section "Uninstall"
     ; (typically EA Desktop / Origin Launcher). If they didn't exist pre-install
     ; the macro just deletes the key, which leaves the system in a clean state
     ; ready for EA Launcher to register itself on its next run.
+    ;
+    ; RestoreProtocol forces SetRegView default internally so HKCR
+    ; operations target the same store the installer's BackupProtocol used.
     !insertmacro RestoreProtocol "qrc"
     !insertmacro RestoreProtocol "link2ea"
     !insertmacro RestoreProtocol "origin2"
 
-    ; Restore Origin compatibility values
+    ; Restore Origin compatibility values (view 64 - matches install-time)
     SetRegView 64
     !insertmacro RestoreValue HKLM "SOFTWARE\WOW6432Node\Origin"         "ClientPath"        "Origin_ClientPath"
     !insertmacro RestoreValue HKLM "SOFTWARE\Electronic Arts\EA Desktop" "InstallSuccessful" "EADesktop_InstallSuccessful"
