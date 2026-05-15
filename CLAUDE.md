@@ -431,6 +431,90 @@ The `link2ea://` and `origin2://` handlers passed the URL-derived `offer_id` dir
 #### Fixed — `maxima-bootstrap/src/main.rs` (panic in qrc:// handler)
 The `qrc://` handler did `arg.split("login_successful.html?").collect::<Vec<&str>>()[1]` — indexing `[1]` panics if the marker is absent. Replaced with `splitn(2, ...).get(1)` and a graceful early return.
 
+### Session 2026-05-15 (Steam App ID launch support + LSX fixes) — PR #4
+
+#### Fixed — Bootstrap rejecting Steam App IDs (root cause of "Maxima never appears")
+
+`is_valid_ea_offer_id()` only accepted `Origin.OFR.<digits>.<digits>` patterns. When Steam launches an EA game via `link2ea://launchgame/1237970?platform=steam`, the offer segment is the numeric Steam App ID — which was being rejected, so maxima-bootstrap silently exited without invoking maxima-cli. Added `is_valid_steam_app_id()` (non-empty, ≤10 chars, all ASCII digits) and made `is_valid_ea_offer_id()` accept both forms.
+
+#### Added — Steam App ID → EA offer ID lookup table in maxima-cli
+
+When `maxima-cli launch 1237970` is called (Steam App ID), the new `STEAM_GAMES` table maps it to the real EA offer ID (`Origin.OFR.50.0001456` for TF2), resolves the install path from `HKLM\SOFTWARE\Valve\Steam\InstallPath` + `libraryfolders.vdf`, sets `SteamAppId` / `SteamGameId` / `SteamClientLaunch` / `SteamPath` env vars, and injects `-noOriginStartup -multiple` launch args. The `steam_launch: bool` flag is passed through `LaunchOptions` to `start_game()`.
+
+#### Fixed — `is_installed()` check failing for Steam-only games
+
+`start_game()` was calling `offer.is_installed()` which checks the EA library. Steam-installed TF2 is not in the EA library, so the check always failed with `LaunchError::NotInstalled`. Fixed by skipping the check when `path_override` is set.
+
+#### Fixed — `EAExternalSource` / `EALaunchOwner` / `EAEntitlementSource` env vars
+
+When `steam_launch` is true, these env vars are now set to `"Steam"` instead of `"EA"`. TF2 reads them to verify the launch context matches the entitlement source reported by LSX.
+
+#### Fixed — `GetAllGameInfo` returning wrong version (triggering "File corruption detected")
+
+`GetAllGameInfoResponse` hardcoded `InstalledVersion="0"` and `AvailableVersion="1.0.1.3"`. TF2's current build is `9.12.1.3` — the mismatch triggered its tamper-detection dialog. Fixed by capturing the real version from the LSX challenge response (`message.version`) into `ConnectionState.game_version` and echoing it back in `GetAllGameInfoResponse`. `game_title` is also captured and echoed in `attr_DisplayName`.
+
+#### Fixed — `IsSubscriber` / `IsSteamSubscriber` inconsistency
+
+`GetProfileResponse` hardcoded both subscriber fields to `false`. When `EntitlementSource="STEAM"`, TF2 treats `IsSteamSubscriber=false` as a contradiction and triggers the tamper check. These fields are now set based on whether `SteamAppId` is set in the environment.
+
+#### Fixed — `IsProgressiveInstallationAvailableResponse` hardcoded ItemId
+
+Response hardcoded `attr_ItemId="Origin.OFR.50.0001456"`. Now echoes back `request.attr_ItemId`, making the handler correct for any game.
+
+#### Fixed — `maxima-bootstrap` non-zero exit codes swallowed
+
+After `wait().await`, the exit code was never checked. Added logging for non-zero exit codes to `maxima_execution.log`.
+
+#### Ported — External LSX connections (Northstar / Steam launch)
+
+Ported `catornot/Maxima@patch-external-lsx` (upstream PR #42 by p0358): when the game was not started through maxima-cli (`maxima.playing()` is `None`), `Connection::new()` now accepts the connection with a warning instead of returning `LSXConnectionError::GameContext`. `handle_set_presence_request` also handles the `playing() == None` case gracefully. This enables Northstar and any externally-launched game to maintain an LSX connection.
+
+---
+
+## Open issues being investigated
+
+### "Engine Error: File corruption detected" after `IsProgressiveInstallationAvailableResponse`
+
+**Status as of 2026-05-15.** TF2 launched from Steam via Maxima completes authentication and gets through the LSX handshake up to `IsProgressiveInstallationAvailableResponse`, then closes the LSX connection and shows the error dialog. The game never reaches `RequestLicense` or `GetAuthCode`.
+
+**Full LSX sequence observed:**
+```
+Challenge → ChallengeAccepted
+GetConfig → GetConfigResponse
+GetProfile → GetProfileResponse (IsSubscriber=true, IsSteamSubscriber=true)
+GetSetting → GetSettingResponse
+GetGameInfo → GetGameInfoResponse
+GetAllGameInfo → GetAllGameInfoResponse (InstalledVersion=9.12.1.3, EntitlementSource=STEAM)
+IsProgressiveInstallationAvailable → IsProgressiveInstallationAvailableResponse
+[connection closed — no RequestLicense or GetAuthCode]
+```
+
+**What has been tried and ruled out:**
+- Northstar hooks (`wsock32.dll`) — removed, same result
+- `IsSubscriber=false` / `IsSteamSubscriber=false` — fixed to true, same result
+- `InstalledVersion="0"` → real version — fixed, same result
+- `ItemId` hardcoded vs echoed — fixed, same result
+- `EAExternalSource=EA` vs `Steam` — tried both, same result
+
+**Hypothesis:** TF2 may be performing a local file-integrity check independently of LSX (DRM stub reading the install manifest or a `.dlf` file) before completing the LSX flow. The "File corruption detected" message may not be LSX-driven at all. The game closes LSX *after* the check fails, not *because* LSX responded incorrectly.
+
+**Next steps when resuming:**
+1. Check if `C:\ProgramData\Electronic Arts\EA Services\License\` contains a valid `.dlf` for `Origin.OFR.50.0001456`.
+2. Check if `C:\Program Files (x86)\Origin Games\Titanfall2\__Installer\` or equivalent Steam path has a manifest that TF2 validates.
+3. Try running with `MAXIMA_DENUVO_TOKEN` env override to skip the license server and see if the error still appears.
+4. Compare what EA Desktop sends in `GetAllGameInfo` for a working installation — specifically `FullGamePurchased`, `FullGameReleased`, `HasExpiration`, and `UpToDate`.
+
+---
+
+## Pending code quality items (from PR #4 Gemini review)
+
+These are medium-priority, not blocking. Address in a follow-up PR.
+
+1. **Blocking I/O in async** — `std::fs::read_to_string` (libraryfolders.vdf parse) is called inside the `startup` async fn. Replace with `tokio::fs::read_to_string` or wrap in `tokio::task::spawn_blocking`. (`maxima-cli/src/main.rs`)
+2. **Hardcoded SteamPath fallback** — `C:\Program Files (x86)\Steam` is used as fallback when registry lookup fails. Should use the resolved path from the registry lookup instead. (`maxima-cli/src/main.rs` — `resolve_steam_install_path`)
+3. **`attr_EntitlementSource` hardcoded to `"STEAM"`** — `GetAllGameInfoResponse` always returns `"STEAM"`. Should be dynamic: `"STEAM"` when `steam_launch=true`, `"EA"` otherwise, to avoid tamper-check failures in non-Steam EA games. (`maxima-lib/src/lsx/request/game.rs`)
+4. **`SteamAppId` env var used as IPC in LSX handler** — `GetProfile` reads `std::env::var("SteamAppId")` to decide `IsSubscriber`. This relies on global process state. Cleaner approach: add a `steam_launch: bool` field to `ConnectionState`, populate it from `ActiveGameContext` at connection init, and read it from `state` in the handler. (`maxima-lib/src/lsx/connection.rs`, `maxima-lib/src/lsx/request/profile.rs`)
+
 ---
 
 ## Open issues being investigated
@@ -501,3 +585,4 @@ Do not delete this section until the user confirms TF2 launches with Maxima visi
 - **DLL injection on macOS / CrossOver**: `maxima-service`'s DLL injector is Windows-only by design. CrossOver / Wine does not support `CreateRemoteThread` injection. The service is installed by the NSIS installer but its injection path is never exercised in the Draconis flow.
 - **Cloud saves, downloads, friends**: All implemented upstream and present in the codebase, but untested in the Draconis / CrossOver configuration.
 - **Offline mode after first launch**: The `LaunchMode::Offline` path exists but Draconis does not yet expose it in the UI. License cache lives at `C:/ProgramData/Maxima/Licenses/<content_id>.dlf` and is valid for approximately two weeks.
+- **Steam-only games table is TF2-only**: `STEAM_GAMES` in `maxima-cli` only has an entry for TF2 (`1237970`). Other EA games launched via Steam App ID would not be recognized. Extend the table or add a dynamic fallback for other titles.
