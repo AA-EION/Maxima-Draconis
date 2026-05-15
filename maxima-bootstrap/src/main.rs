@@ -268,7 +268,25 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
             }
 
             child.args(["launch", offer_id]);
-            child.spawn()?.wait().await?;
+            let status = child.spawn()?.wait().await?;
+
+            // Bootstrap historically ignored maxima-cli's exit code: if the
+            // child crashed or aborted, bootstrap still returned Ok(true) and
+            // the log read "Result: Success", making the failure invisible.
+            // Surface non-zero exits so maxima_execution.log shows when the
+            // launch actually failed.
+            if !status.success() {
+                let temp_dir = std::env::temp_dir();
+                let debug_log = temp_dir.join("maxima_execution.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log) {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        file,
+                        "maxima-cli (link2ea) exited non-zero: code={:?}",
+                        status.code()
+                    );
+                }
+            }
 
             return Ok(true);
         }
@@ -313,7 +331,20 @@ async fn run(args: &[String]) -> Result<bool, RunError> {
             }
 
             child.args(["launch", offer_id]);
-            child.spawn()?.wait().await?;
+            let status = child.spawn()?.wait().await?;
+
+            if !status.success() {
+                let temp_dir = std::env::temp_dir();
+                let debug_log = temp_dir.join("maxima_execution.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log) {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        file,
+                        "maxima-cli (origin2) exited non-zero: code={:?}",
+                        status.code()
+                    );
+                }
+            }
 
             return Ok(true);
         }

@@ -126,25 +126,74 @@ struct Args {
     login: Option<String>,
 }
 
-/// Ensure a console window exists so log output is visible.
+/// Ensure a console window exists AND that Rust's stdio is wired up to it.
 ///
-/// When `maxima-cli` is spawned by `maxima-bootstrap` (which is built as a
-/// Windows GUI app via `#![windows_subsystem = "windows"]`), the bootstrap
-/// has no console to inherit and the subprocess inherits the same: log
-/// output goes nowhere. We call `AllocConsole()` ourselves so the user can
-/// actually watch the launch progress.
+/// When `maxima-cli` is spawned by `maxima-bootstrap` (built as a Windows GUI
+/// app via `#![windows_subsystem = "windows"]`), the child process inherits
+/// the parent's stdio — which is null/invalid because bootstrap has no
+/// console. Two things break:
 ///
-/// Idempotent: if a console is already attached (e.g. `cmd.exe` invocation),
-/// `AllocConsole` fails harmlessly and we keep using the existing one.
+/// 1. No console window appears at all (until we call `AllocConsole`).
+/// 2. Even after `AllocConsole`, Rust's `println!` / `eprintln!` still write
+///    to the invalid handles they inherited. `AllocConsole` does NOT
+///    automatically redirect existing std handles — it only creates the
+///    console window. We have to point `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE`
+///    / `STD_INPUT_HANDLE` at `CONOUT$` / `CONIN$` ourselves.
+///
+/// Without step 2 the v0.2.1 fix is decorative: the console window pops up
+/// but stays blank because the logger writes go nowhere.
+///
+/// Idempotent: if a console is already attached (`cmd.exe` invocation),
+/// `AllocConsole` fails harmlessly and we still rewire the std handles to
+/// `CONOUT$` (which resolves to the existing console).
 #[cfg(windows)]
 fn ensure_console_attached() {
+    use std::ptr::null_mut;
     use winapi::um::consoleapi::AllocConsole;
+    use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::processenv::SetStdHandle;
     use winapi::um::wincon::GetConsoleWindow;
+    use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+
     unsafe {
         if GetConsoleWindow().is_null() {
-            // Return value ignored on purpose — failure means "couldn't create",
-            // which we can't do anything useful about. File logging still works.
+            // Failure here means we already had a console (rare given the null
+            // check) or the OS refused to give us one; either way, file
+            // logging still works as a fallback.
             AllocConsole();
+        }
+
+        // Rewire std handles to the (possibly freshly allocated) console.
+        // Each `CreateFileA` opens an independent handle; passing the same
+        // handle to multiple `SetStdHandle` calls is technically allowed but
+        // fragile (closing one closes them all).
+        let open_console = |name: &[u8]| -> *mut winapi::ctypes::c_void {
+            CreateFileA(
+                name.as_ptr() as *const i8,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+
+        let stdout = open_console(b"CONOUT$\0");
+        if stdout != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_OUTPUT_HANDLE, stdout);
+        }
+
+        let stderr = open_console(b"CONOUT$\0");
+        if stderr != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_ERROR_HANDLE, stderr);
+        }
+
+        let stdin = open_console(b"CONIN$\0");
+        if stdin != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_INPUT_HANDLE, stdin);
         }
     }
 }
@@ -152,11 +201,94 @@ fn ensure_console_attached() {
 #[cfg(not(windows))]
 fn ensure_console_attached() {}
 
-#[tokio::main]
-async fn main() {
-    ensure_console_attached();
+/// Install a panic hook that writes the panic message to a dedicated file
+/// before unwinding. Without this, panics that happen *before* the regular
+/// logger is initialized (or that hit `eprintln!` when stderr is unattached)
+/// disappear silently — exactly the failure mode that made the v0.2.1
+/// "nothing shows" bug so hard to diagnose.
+///
+/// File location matches the rest of the file logging:
+///   - Windows: %LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log
+///   - Unix:    $XDG_DATA_HOME/maxima/logs/maxima-cli.panic.log (or ~/.local/share/...)
+fn install_panic_hook() {
+    let log_path: Option<std::path::PathBuf> = {
+        #[cfg(windows)]
+        {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("APPDATA"))
+                .map(std::path::PathBuf::from)
+                .map(|p| p.join("Maxima").join("Logs").join("maxima-cli.panic.log"))
+        }
+        #[cfg(unix)]
+        {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
+                })
+                .map(|p| p.join("maxima").join("logs").join("maxima-cli.panic.log"))
+        }
+    };
 
-    let result = startup().await;
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort: never let the panic hook itself panic.
+        if let Some(ref path) = log_path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    file,
+                    "\n===== PANIC at {:?} (pid={}) =====\n{}",
+                    std::time::SystemTime::now(),
+                    std::process::id(),
+                    info
+                );
+                let _ = file.flush();
+            }
+        }
+        // Also try stderr (works once stdio is reattached to the console).
+        eprintln!("FATAL: {}", info);
+    }));
+}
+
+/// Plain (non-tokio) `main`. The order is load-bearing:
+///
+/// 1. Panic hook BEFORE anything fallible so a panic in any subsequent step
+///    is captured on disk.
+/// 2. Console + stdio reattach BEFORE any println / clap output so error
+///    messages reach the user.
+/// 3. Logger init BEFORE `Args::parse()` so clap's exit-on-error path can
+///    hit the file sink.
+/// 4. Argument parsing.
+/// 5. Tokio runtime constructed manually so a panic in runtime setup (e.g.
+///    IOCP init under Wine) is caught by the panic hook above — `#[tokio::main]`
+///    would construct the runtime *before* user code, defeating step 1.
+fn main() {
+    install_panic_hook();
+    ensure_console_attached();
+    init_logger_named("maxima-cli");
+
+    let args = Args::parse();
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to build tokio runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let result = runtime.block_on(startup(args));
 
     if let Some(e) = result.err() {
         match std::env::var("RUST_BACKTRACE") {
@@ -242,10 +374,10 @@ pub async fn login_flow(login_override: Option<String>) -> Result<TokenResponse>
     Ok(token_res?)
 }
 
-async fn startup() -> Result<()> {
-    let args = Args::parse();
-
-    init_logger_named("maxima-cli");
+async fn startup(args: Args) -> Result<()> {
+    // Args parsing and logger initialization happen in `main()` so a clap
+    // exit hits the file sink and the panic hook is already installed by
+    // the time the runtime is built.
 
     info!("Starting Maxima...");
 

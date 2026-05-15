@@ -433,6 +433,67 @@ The `qrc://` handler did `arg.split("login_successful.html?").collect::<Vec<&str
 
 ---
 
+## Open issues being investigated
+
+### v0.2.1 — nothing appears on TF2 launch from Steam (UI/TUI/CLI all invisible)
+
+**Reported 2026-05-14.** User on v0.2.1 (latest, with `AllocConsole` fix in `maxima-cli` and full UI/TUI in installer). When launching TF2 from Steam, no Maxima window appears at all — not the CLI console, not the UI, not the TUI. In earlier versions the CLI window at least popped up. Diagnostics from the user are still pending.
+
+**Code audit conducted 2026-05-14. Findings, in priority order (each independently capable of producing the reported symptom):**
+
+#### Finding 1 — NSIS `SetRegView` chaos (most likely root cause)
+
+[installer/maxima-setup.nsi:173](installer/maxima-setup.nsi:173) sets `SetRegView 64` for the `HKLM\SOFTWARE\WOW6432Node\Origin` writes and **never resets it** before the HKCR protocol writes at lines ~186-201 or the `BackupProtocol` calls at lines ~176-178. Consequences:
+
+- 32-bit Wine consumers (TF2, Origin, anything emitting `link2ea://` from a 32-bit process) resolve HKCR through the **32-bit view** (`HKLM\Software\Classes\Wow6432Node\...`). They never see the entries v0.2.1 wrote under the 64-bit view.
+- `BackupProtocol` (lines 58-79) and `RestoreProtocol` (lines 83-107) inherit whatever view leaked in from the caller — i.e. they back up the 64-bit view and miss any 32-bit-view registrations entirely. On a v0.2.0→v0.2.1 upgrade this means the v0.2.0 entries (written under whatever view the old `.nsi` used — most likely 32-bit by default for a 32-bit NSIS installer) are never read, never overwritten, never even noticed.
+- Possible end state after upgrade: v0.2.1's "Maxima" entries are in 64-bit view; TF2 still resolves via 32-bit view and finds v0.2.0's stale entries (or nothing at all if the old uninstaller fired). Either way the dispatch is unpredictable and on at least some setups Wine ends up with no working handler.
+
+**Fix:** In [installer/maxima-setup.nsi](installer/maxima-setup.nsi):
+- Add `SetRegView 32` (or `SetRegView default`) immediately before line 186 (HKCR writes) and before line 176-178 (`BackupProtocol` calls).
+- Inside both `BackupProtocol` and `RestoreProtocol` macros, set the view explicitly at entry — ideally back up *both* views and document the choice.
+- In `BackupProtocol`, also guard against backing up Maxima's own values: read the existing `\shell\open\command` first, and if it points at `maxima-bootstrap.exe`, set `_existed=0` (treat as "no prior handler") so the uninstaller will simply delete the keys instead of restoring stale Maxima paths.
+
+#### Finding 2 — `AllocConsole()` does not reattach stdio
+
+[maxima-cli/src/main.rs:140-150](maxima-cli/src/main.rs:140) calls `AllocConsole()` but never reattaches `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE` / Rust's stdio FDs. When bootstrap (GUI subsystem) spawns maxima-cli, the child inherits invalid stdio handles. `AllocConsole` creates a window but does NOT redirect existing handles — meaning the console pops up but `println!` and the `log.rs` writer at line 89 write to dead pipes. User sees a blank/silent console, or (depending on timing) no console at all.
+
+**Fix:** After `AllocConsole()` succeeds, do `SetStdHandle(STD_OUTPUT_HANDLE, CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE, ...))` for stdout and stderr, and call `freopen("CONOUT$", "w", ...)` equivalents for the C runtime (Rust's stdout/stderr are buffered on top of these FDs). Without this, AllocConsole is decorative only.
+
+#### Finding 3 — `#[tokio::main]` runs before `ensure_console_attached`
+
+[maxima-cli/src/main.rs:155](maxima-cli/src/main.rs:155): `#[tokio::main]` desugars to runtime construction *before* user code. Any panic in IOCP/thread-pool init under Wine kills the process before AllocConsole. Same risk applies to `init_logger_named`, which runs after `Args::parse()` at line 246.
+
+**Fix:** Convert `main` to a plain `fn main()` that (1) calls `ensure_console_attached()`, (2) installs a panic hook that writes to `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log`, (3) calls `init_logger_named()`, (4) parses args, (5) builds the tokio runtime manually with `tokio::runtime::Runtime::new()` and `block_on(startup())`. This guarantees console + file logger exist before *anything* fallible runs.
+
+#### Finding 4 — `Args::parse()` before logger init
+
+If clap exits because of a malformed argv (or because the `MAXIMA_LAUNCH_ARGS` env var is mis-encoded), the error message goes to stderr — which is the unattached pipe. User sees nothing, no log line on disk. Init the logger first, then parse args.
+
+#### Finding 5 — Bootstrap swallows non-zero exit codes
+
+[maxima-bootstrap/src/main.rs:271](maxima-bootstrap/src/main.rs:271): `child.spawn()?.wait().await?` only propagates an error on `wait()` itself; a non-zero exit from maxima-cli returns `Ok(ExitStatus)` and bootstrap logs "Result: Success". If maxima-cli crashes or auth fails, bootstrap pretends everything worked. Not the root cause but blinds diagnostics — every other finding becomes invisible because we can't tell whether maxima-cli even ran.
+
+**Fix:** After `wait().await?`, check `status.success()` and log the exit code to `maxima_execution.log` if non-zero.
+
+#### Ruled out
+
+- `is_valid_ea_offer_id("Origin.OFR.50.0002694")` returns `true` — leading zeros are fine.
+- `url::Url::parse("link2ea://launchgame/Origin.OFR.50.0002694?...").path_segments()` correctly yields `["Origin.OFR.50.0002694"]` (the action is the host, not a path segment). `segments[0]` is the offer id, as intended.
+- `LOG_FILE` mutex deadlock — not a realistic failure mode; lock scope is short and not reentrant.
+- `winapi` features `consoleapi` / `wincon` are correctly enabled in [maxima-cli/Cargo.toml:22](maxima-cli/Cargo.toml:22).
+
+#### Recommended order of work when picking this up
+
+1. Ship Finding 5 (bootstrap exit-code logging) first — it's a one-liner and makes every subsequent change debuggable.
+2. Then Finding 1 (NSIS `SetRegView` reset + Maxima-ownership guard in `BackupProtocol`). High likelihood of being the user-facing root cause.
+3. Then Findings 2+3+4 together (rewrite the prologue of `maxima-cli/main.rs`: plain main, panic hook, logger before args, manual tokio runtime, stdio reattach after AllocConsole).
+4. Have the user share the contents of `maxima_execution.log` and `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.log` after the fixes ship — those should now be populated and tell us whether the symptom is gone or whether a new layer is exposed.
+
+Do not delete this section until the user confirms TF2 launches with Maxima visible again.
+
+---
+
 ## Known remaining gaps
 
 - **`maxima-tui` / `maxima-ui`**: The UI crates exist and compile but are not wired into the Draconis flow at all. They are upstream components that may be useful in a future Draconis "standalone mode" but need significant work to be production-ready.

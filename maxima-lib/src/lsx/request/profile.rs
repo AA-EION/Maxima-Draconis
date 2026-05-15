@@ -90,7 +90,13 @@ pub async fn handle_set_presence_request(
     let arc = state.write().await.maxima_arc();
     let mut maxima = arc.lock().await;
 
-    let playing = maxima.playing().as_ref().unwrap();
+    // When LSX connects from an externally-launched game (e.g. Steam Northstar
+    // mode), maxima.playing() is None because the game wasn't started through
+    // maxima-cli. Return a harmless success response so the connection stays
+    // alive rather than panicking. (Upstream PR #42 / catornot patch-external-lsx)
+    let Some(playing) = maxima.playing().as_ref() else {
+        return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
+    };
     if playing.mode().is_online_offline() {
         return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
     }
