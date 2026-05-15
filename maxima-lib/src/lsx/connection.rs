@@ -257,10 +257,10 @@ impl Connection {
                     }
                 }
 
-                if let Err(ref err) = pid {
-                    warn!("Error while finding game PID: {}", err);
-                } else if pid.as_ref().unwrap() == &0 {
-                    warn!("Failed to find PID through launch ID, things may not work!");
+                match &pid {
+                    Err(err) => warn!("Error while finding game PID: {}", err),
+                    Ok(0) => warn!("Failed to find PID through launch ID, things may not work!"),
+                    _ => {}
                 }
             }
         };
