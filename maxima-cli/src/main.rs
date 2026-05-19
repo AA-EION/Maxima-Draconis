@@ -1430,26 +1430,53 @@ async fn install_game(
     // `ZipDownloader::download_single_file` — the same primitive
     // `Mode::DownloadSpecificFile` already uses.
     if only_listed_files {
-        let url = {
+        // Release the maxima_arc lock BEFORE the async `download_url` HTTP
+        // call so concurrent LSX / RTM / serve operations on the same
+        // Maxima instance aren't blocked while EA's CDN responds.
+        let auth_storage = {
             let maxima = maxima_arc.lock().await;
-            let content_service = ContentService::new(maxima.auth_storage().clone());
-            content_service
-                .download_url(&offer_id, Some(&build_id))
-                .await?
+            maxima.auth_storage().clone()
         };
+        let content_service = ContentService::new(auth_storage);
+        let url = content_service
+            .download_url(&offer_id, Some(&build_id))
+            .await?;
 
+        // Use the offer_id as the downloader's id so concurrent strict
+        // installs of different games don't collide in any temp/state
+        // that ZipDownloader keys by id.
         let downloader =
-            ZipDownloader::new("maxima-cli-install", url.url(), install_path.clone()).await?;
+            ZipDownloader::new(&offer_id, url.url(), install_path.clone()).await?;
         let entries = downloader.manifest().entries();
 
-        let total = replace_files.len();
+        // Empty entries in `replace_files` are skipped by the delete loop;
+        // mirror that here so an empty string doesn't bail the whole flow
+        // on a manifest lookup miss, and so per-file progress counts stay
+        // accurate.
+        let total = replace_files.iter().filter(|s| !s.is_empty()).count();
         let start_time = Instant::now();
 
-        for (idx, relative) in replace_files.iter().enumerate() {
+        for (idx, relative) in replace_files
+            .iter()
+            .filter(|s| !s.is_empty())
+            .enumerate()
+        {
             let normalized = relative.replace('\\', "/");
+            // Common case: zip entries use forward slashes, so the
+            // case-insensitive compare against the unmodified name
+            // succeeds without allocating. Fall back to a normalized
+            // compare only when the entry path actually contains
+            // backslashes — saves an allocation per entry per file on
+            // manifests with tens of thousands of entries.
             let entry = entries.iter().find(|e| {
-                let n = e.name().replace('\\', "/");
-                n.eq_ignore_ascii_case(&normalized)
+                let n = e.name();
+                if n.eq_ignore_ascii_case(&normalized) {
+                    return true;
+                }
+                if n.contains('\\') {
+                    return n.replace('\\', "/").eq_ignore_ascii_case(&normalized);
+                }
+                false
             });
             let entry = match entry {
                 Some(e) => e,
