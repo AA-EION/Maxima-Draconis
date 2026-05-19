@@ -261,27 +261,31 @@ impl Maxima {
         // the game executable) — the game's `EALsxPort=<port>` env var
         // will resolve to the existing server.
         //
-        // Using `std::net::TcpStream::connect` (not tokio) keeps this
-        // probe entirely synchronous so we don't yield the runtime
-        // mid-decision; the call is cheap when nothing's listening
-        // (immediate ECONNREFUSED on localhost).
-        use std::time::Duration as StdDuration;
+        // Non-blocking probe via tokio so we don't park an executor
+        // thread for up to 200ms (an earlier version used
+        // `std::net::TcpStream::connect_timeout` which did exactly that).
+        // The connect is cheap when nothing's listening — immediate
+        // ECONNREFUSED on localhost — so the timeout is mostly a guard
+        // against accidental long DNS resolves or routing weirdness.
         let probe_addr = format!("127.0.0.1:{}", lsx_port);
-        if let Ok(probe_target) = probe_addr.parse() {
-            match std::net::TcpStream::connect_timeout(&probe_target, StdDuration::from_millis(200)) {
-                Ok(stream) => {
-                    drop(stream);
-                    info!(
-                        "LSX server already listening on {} (likely `maxima-cli serve` \
-                         in another window); skipping our own bind so the game's traffic \
-                         lands on the existing server.",
-                        probe_addr
-                    );
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Nothing listening — proceed to bind below.
-                }
+        let probe_result = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(&probe_addr),
+        )
+        .await;
+        match probe_result {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                info!(
+                    "LSX server already listening on {} (likely `maxima-cli serve` \
+                     in another window); skipping our own bind so the game's traffic \
+                     lands on the existing server.",
+                    probe_addr
+                );
+                return Ok(());
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Nothing listening or probe timed out — proceed to bind below.
             }
         }
 

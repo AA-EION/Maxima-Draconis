@@ -54,9 +54,25 @@ use std::sync::Arc;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::Duration;
+
+/// Per-request total deadline. A legitimate `/authorize` finishes in
+/// well under 2s (license preflight + spawn); anything longer is either
+/// EA's licensing service is having a bad day, or a slow / malicious
+/// local client trying to pin our task indefinitely. 30s is generous
+/// enough not to cut off the slow-but-real case while still keeping
+/// the worker free for the next request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap total bytes we'll read from one connection at 8 KiB. This is the
+/// request line plus all headers (we never read a body). 8 KiB is the
+/// same number Nginx's `large_client_header_buffers` defaults to.
+/// Without this cap, an attacker could send an arbitrarily long
+/// request line on the loopback socket to exhaust memory.
+const MAX_REQUEST_HEAD_BYTES: u64 = 8 * 1024;
 
 use crate::core::{
     auth::storage::TokenError,
@@ -128,12 +144,36 @@ struct ErrorResponse {
     message: String,
 }
 
+/// Public entry point: wraps the real handler in a per-request
+/// `tokio::time::timeout` so a stalled / hostile peer can't keep a
+/// task pinned indefinitely. Slow-client mitigation for an
+/// unauthenticated loopback HTTP listener.
 async fn handle_connection(
+    socket: TcpStream,
+    maxima_arc: Arc<Mutex<Maxima>>,
+) -> Result<(), std::io::Error> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, handle_connection_inner(socket, maxima_arc)).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "Authorize: request exceeded {:?} timeout, dropping connection",
+                REQUEST_TIMEOUT
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn handle_connection_inner(
     mut socket: TcpStream,
     maxima_arc: Arc<Mutex<Maxima>>,
 ) -> Result<(), std::io::Error> {
     let (read_half, _) = socket.split();
-    let mut reader = BufReader::new(read_half);
+    // `.take(N)` bounds the total bytes our BufReader will surface — once
+    // the limit is reached, subsequent reads return 0 (EOF). A truncated
+    // request line / header block then trips the HTTP parser below and
+    // we respond 400 instead of hanging on the read.
+    let mut reader = BufReader::new(read_half.take(MAX_REQUEST_HEAD_BYTES));
 
     // We only need the request line — the body is empty for our endpoints
     // and headers carry nothing we care about. Drain enough to keep the

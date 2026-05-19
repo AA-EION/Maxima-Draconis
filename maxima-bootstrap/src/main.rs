@@ -91,18 +91,21 @@ fn log_event(line: &str) {
 
 /// Quick TCP probe — does the `/authorize` HTTP server look reachable?
 /// Used before paying for a full reqwest round-trip.
-fn auth_server_alive(port: u16) -> bool {
+///
+/// Uses tokio's async `TcpStream::connect` wrapped in `timeout` so it
+/// doesn't block the executor thread. (`std::net::TcpStream::connect_timeout`
+/// inside an async fn parks a worker for up to the timeout duration,
+/// which we don't want.)
+async fn auth_server_alive(port: u16) -> bool {
     let addr = format!("127.0.0.1:{}", port);
-    addr.parse()
-        .ok()
-        .and_then(|target| {
-            std::net::TcpStream::connect_timeout(
-                &target,
-                std::time::Duration::from_millis(200),
-            )
-            .ok()
-        })
-        .is_some()
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Hand a `link2ea://` or `origin2://` URL off to whichever Maxima
@@ -137,7 +140,7 @@ async fn handle_protocol_authorize(
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(AUTHORIZE_PORT);
 
-    if auth_server_alive(port) {
+    if auth_server_alive(port).await {
         // Forward to the running Maxima. The server will refresh the
         // `.dlf`, set the EA-* env vars, and spawn the game executable
         // via `launch::start_game` — that's the chain TF2's Origin
