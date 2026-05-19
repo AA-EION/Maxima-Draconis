@@ -103,6 +103,30 @@ enum Mode {
         #[arg(long)]
         build_id: Option<String>,
 
+        /// Comma-separated list of file paths (relative to `--path`) to
+        /// delete BEFORE the install runs, so the downloader sees them as
+        /// missing and re-fetches them from EA's content servers. Designed
+        /// for the Steam-CEG fix flow: a Steam-installed `Titanfall2.exe`
+        /// is the same size as the EA original (CEG patches bytes in
+        /// place) so the size-only entry-state check in the downloader
+        /// would skip it. Listing it here forces a clean replace.
+        /// Path-traversal segments (`..`) are rejected.
+        #[arg(long, value_delimiter = ',')]
+        replace_files: Vec<String>,
+
+        /// Restrict the install to **only** the files listed in
+        /// `--replace-files` — the downloader fetches just those entries
+        /// from the build manifest and leaves every other file on disk
+        /// alone. Without this flag, the full `install_now` flow runs
+        /// after the delete step, which can re-download large chunks of
+        /// the game when Steam-vs-EA file sizes legitimately differ
+        /// (~50% of the manifest in the TF2 case). With this flag, an
+        /// "Apply Maxima fix" against a Steam install touches only the
+        /// exes you actually need to replace. Requires `--replace-files`
+        /// to be non-empty.
+        #[arg(long, requires = "replace_files")]
+        only_listed_files: bool,
+
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
         /// `{"event":"progress","percent":<0-100>}`; the terminator is
@@ -649,8 +673,21 @@ async fn startup(args: Args) -> Result<()> {
             slug,
             path,
             build_id,
+            replace_files,
+            only_listed_files,
             json,
-        } => install_game(maxima_arc.clone(), &slug, &path, build_id.as_deref(), json).await,
+        } => {
+            install_game(
+                maxima_arc.clone(),
+                &slug,
+                &path,
+                build_id.as_deref(),
+                &replace_files,
+                only_listed_files,
+                json,
+            )
+            .await
+        }
         Mode::CloudSync { game_slug, write } => {
             do_cloud_sync(maxima_arc.clone(), &game_slug, write).await
         }
@@ -1232,6 +1269,8 @@ async fn install_game(
     slug: &str,
     path: &str,
     build_id_override: Option<&str>,
+    replace_files: &[String],
+    only_listed_files: bool,
     json: bool,
 ) -> Result<()> {
     use std::io::Write;
@@ -1251,6 +1290,60 @@ async fn install_game(
         let msg = format!("--path must be absolute, got '{}'", path);
         emit_error(&msg);
         bail!(msg);
+    }
+
+    // Pre-install replace step. The downloader's `initial_state` check
+    // marks entries `Fresh` when missing (re-downloads) and `Complete`
+    // when their on-disk size matches the manifest (skips). For files
+    // that are content-different-but-same-size (the Steam CEG case),
+    // we need to delete them up front so the downloader's size check
+    // sees them as missing. Path-traversal segments are rejected so a
+    // bad `--replace-files` argument can't escape the install dir.
+    for relative in replace_files {
+        if relative.is_empty() {
+            continue;
+        }
+        if relative
+            .split(['/', '\\'])
+            .any(|segment| segment == ".." || segment.is_empty())
+            || PathBuf::from(relative).is_absolute()
+        {
+            let msg = format!(
+                "--replace-files entries must be relative paths without '..' segments, got '{}'",
+                relative
+            );
+            emit_error(&msg);
+            bail!(msg);
+        }
+
+        let target = install_path.join(relative);
+        match std::fs::metadata(&target) {
+            Ok(meta) if meta.is_file() => {
+                if !json {
+                    info!("Deleting {} (replace-files)", target.display());
+                }
+                if let Err(e) = std::fs::remove_file(&target) {
+                    let msg = format!("failed to delete {}: {}", target.display(), e);
+                    emit_error(&msg);
+                    bail!(msg);
+                }
+            }
+            Ok(_) => {
+                // Directory or symlink — skip, not what this flag is for.
+                if !json {
+                    warn!(
+                        "Skipping {} from --replace-files (not a regular file)",
+                        target.display()
+                    );
+                }
+            }
+            Err(_) => {
+                // Already missing — that's fine, the downloader will fetch it.
+                if !json {
+                    debug!("--replace-files: {} already absent", target.display());
+                }
+            }
+        }
     }
 
     // Resolve slug → offer_id. Same chain as `Mode::Launch` minus the
@@ -1325,6 +1418,99 @@ async fn install_game(
         }
         id
     };
+
+    // Strict replace path: download only the entries listed in
+    // `--replace-files`, never run `install_now`. Empirically the full
+    // install path re-downloads ~50% of the TF2 manifest against a Steam
+    // install because legitimate size differences across distribution
+    // channels make many files fail the size-only entry-state check.
+    // For the CEG-fix use case we only need to refresh a handful of
+    // CEG-touched binaries, so we bypass install_now entirely and pull
+    // each listed file directly from the build's zip manifest via
+    // `ZipDownloader::download_single_file` — the same primitive
+    // `Mode::DownloadSpecificFile` already uses.
+    if only_listed_files {
+        let url = {
+            let maxima = maxima_arc.lock().await;
+            let content_service = ContentService::new(maxima.auth_storage().clone());
+            content_service
+                .download_url(&offer_id, Some(&build_id))
+                .await?
+        };
+
+        let downloader =
+            ZipDownloader::new("maxima-cli-install", url.url(), install_path.clone()).await?;
+        let entries = downloader.manifest().entries();
+
+        let total = replace_files.len();
+        let start_time = Instant::now();
+
+        for (idx, relative) in replace_files.iter().enumerate() {
+            let normalized = relative.replace('\\', "/");
+            let entry = entries.iter().find(|e| {
+                let n = e.name().replace('\\', "/");
+                n.eq_ignore_ascii_case(&normalized)
+            });
+            let entry = match entry {
+                Some(e) => e,
+                None => {
+                    let msg = format!(
+                        "file '{}' not found in build {} manifest",
+                        relative, build_id
+                    );
+                    emit_error(&msg);
+                    bail!(msg);
+                }
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "progress",
+                        "current_file": relative,
+                        "files_done": idx,
+                        "total_files": total,
+                    })
+                );
+                let _ = std::io::stdout().flush();
+            } else {
+                info!("Downloading {} ({}/{})", relative, idx + 1, total);
+            }
+
+            if let Err(e) = downloader.download_single_file(entry, None).await {
+                let msg = format!("download of '{}' failed: {}", relative, e);
+                emit_error(&msg);
+                return Err(e.into());
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "done",
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                    "offer_id": offer_id,
+                    "build_id": build_id,
+                    "path": install_path.display().to_string(),
+                    "files_replaced": replace_files,
+                })
+            );
+            let _ = std::io::stdout().flush();
+        } else {
+            info!(
+                "Replaced {} file(s) in {}.{}s — {}",
+                total,
+                elapsed.as_secs(),
+                elapsed.subsec_millis(),
+                install_path.display()
+            );
+        }
+
+        return Ok(());
+    }
 
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id.clone())
