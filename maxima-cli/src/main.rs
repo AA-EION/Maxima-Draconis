@@ -68,9 +68,33 @@ enum Mode {
         #[arg(long)]
         login: Option<String>,
     },
-    ListGames,
+    ListGames {
+        /// Emit a JSON array on stdout (with log output suppressed) instead
+        /// of the human-readable `info!` lines. Intended for Draconis and
+        /// other automation that needs to inspect what Maxima has in the
+        /// user's EA library — per-game `slug`, `name`, `offer_id`,
+        /// `content_id`, `installed`, `install_path`, `version`, plus the
+        /// list of extra-offer DLC.
+        #[arg(long)]
+        json: bool,
+    },
     LocateGame {
         path: String,
+    },
+    /// Filesystem-only detection of a Titanfall 2 / Northstar install at a
+    /// given path. Doesn't talk to EA, doesn't require login, doesn't spin
+    /// up the tokio runtime — just inspects what's on disk. Designed for
+    /// Draconis's pre-flight: "you say TF2 is at X, can you confirm and
+    /// tell me whether Northstar is present too?"
+    Inspect {
+        /// Path to inspect. Can be the install directory (e.g.
+        /// `C:\Titanfall 2`) or the executable itself (e.g.
+        /// `…\Titanfall2.exe`); if it's a file, we look at its parent dir.
+        path: String,
+
+        /// Emit a JSON document on stdout instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
     },
     CloudSync {
         game_slug: String,
@@ -276,6 +300,101 @@ fn install_panic_hook() {
     }));
 }
 
+/// Returns true if the parsed mode requests JSON output. Used to enable
+/// stdout suppression on the global logger before anything has a chance to
+/// log — keeps `--json` subcommand output cleanly parseable.
+fn json_mode(args: &Args) -> bool {
+    matches!(
+        args.mode,
+        Some(Mode::ListGames { json: true }) | Some(Mode::Inspect { json: true, .. })
+    )
+}
+
+/// Pure filesystem detection: does this path look like a Titanfall 2
+/// install, and is Northstar present alongside it? No EA library lookup,
+/// no auth, no tokio runtime — just `std::fs::exists` checks. Returns the
+/// process exit code (0 success, 1 serialization/IO failure).
+///
+/// Detection rules:
+///   - exe candidates: `Titanfall2.exe` (primary), `NorthstarLauncher.exe`
+///     (Northstar 1.x entry point). The first one that exists wins.
+///   - `is_titanfall2`: `Titanfall2.exe` is in the resolved dir.
+///   - Northstar markers (any one is enough to set `has_northstar`):
+///     `NorthstarLauncher.exe`, `wsock32.dll` (the proxy DLL), `r2/mods`
+///     (the mods dir).
+fn run_inspect(path: &str, json: bool) -> i32 {
+    use std::path::PathBuf;
+
+    #[derive(serde::Serialize)]
+    struct InspectJson {
+        path: String,
+        exists: bool,
+        is_titanfall2: bool,
+        exe_path: Option<String>,
+        has_northstar: bool,
+        northstar_markers: Vec<String>,
+    }
+
+    let raw = PathBuf::from(path);
+    let dir = if raw.is_file() {
+        raw.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| raw.clone())
+    } else {
+        raw.clone()
+    };
+    let exists = dir.exists();
+
+    let exe_path = ["Titanfall2.exe", "NorthstarLauncher.exe"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.exists())
+        .map(|p| p.display().to_string());
+
+    let is_titanfall2 = dir.join("Titanfall2.exe").exists();
+
+    let northstar_markers: Vec<String> = ["NorthstarLauncher.exe", "wsock32.dll", "r2/mods"]
+        .iter()
+        .filter(|m| dir.join(m).exists())
+        .map(|s| (*s).to_string())
+        .collect();
+    let has_northstar = !northstar_markers.is_empty();
+
+    let report = InspectJson {
+        path: raw.display().to_string(),
+        exists,
+        is_titanfall2,
+        exe_path,
+        has_northstar,
+        northstar_markers,
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => {
+                println!("{}", s);
+                0
+            }
+            Err(e) => {
+                eprintln!("inspect: failed to serialize: {}", e);
+                1
+            }
+        }
+    } else {
+        println!("Path:           {}", report.path);
+        println!("Exists:         {}", report.exists);
+        println!("Is Titanfall 2: {}", report.is_titanfall2);
+        if let Some(ref exe) = report.exe_path {
+            println!("Executable:     {}", exe);
+        }
+        println!("Has Northstar:  {}", report.has_northstar);
+        if !report.northstar_markers.is_empty() {
+            println!("Markers:        {}", report.northstar_markers.join(", "));
+        }
+        0
+    }
+}
+
 /// Plain (non-tokio) `main`. The order is load-bearing:
 ///
 /// 1. Panic hook BEFORE anything fallible so a panic in any subsequent step
@@ -294,6 +413,19 @@ fn main() {
     init_logger_named("maxima-cli");
 
     let args = Args::parse();
+
+    // For `--json` subcommands, mute stdout logging so callers (Draconis,
+    // scripts) can parse stdout as a single JSON document. The file sink
+    // keeps receiving everything for debugging.
+    if json_mode(&args) {
+        maxima::util::log::set_stdout_suppressed(true);
+    }
+
+    // Inspect is a pure filesystem probe — no Maxima context, no auth, no
+    // tokio runtime. Handle it before paying for any of that.
+    if let Some(Mode::Inspect { ref path, json }) = args.mode {
+        std::process::exit(run_inspect(path, json));
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -585,8 +717,13 @@ async fn startup(args: Args) -> Result<()> {
             )
             .await
         }
-        Mode::ListGames => list_games(maxima_arc.clone()).await,
+        Mode::ListGames { json } => list_games(maxima_arc.clone(), json).await,
         Mode::LocateGame { path } => locate_game(maxima_arc.clone(), &path).await,
+        Mode::Inspect { .. } => {
+            // Handled in main() before the runtime starts — this branch is
+            // unreachable in practice but kept for exhaustiveness.
+            Ok(())
+        }
         Mode::CloudSync { game_slug, write } => {
             do_cloud_sync(maxima_arc.clone(), &game_slug, write).await
         }
@@ -632,7 +769,7 @@ async fn run_interactive(maxima_arc: LockedMaxima) -> Result<()> {
         "Launch Game" => interactive_start_game(maxima_arc.clone()).await?,
         "Install Game" => interactive_install_game(maxima_arc.clone()).await?,
         "List Builds" => generate_download_links(maxima_arc.clone()).await?,
-        "List Games" => list_games(maxima_arc.clone()).await?,
+        "List Games" => list_games(maxima_arc.clone(), false).await?,
         "Account Info" => print_account_info(maxima_arc.clone()).await?,
         _ => bail!("Something went wrong."),
     }
@@ -1030,12 +1167,86 @@ async fn get_legacy_catalog_def(maxima_arc: LockedMaxima, offer_id: &str) -> Res
     Ok(())
 }
 
-async fn list_games(maxima_arc: LockedMaxima) -> Result<()> {
-    let mut maxima = maxima_arc.lock().await;
+#[derive(serde::Serialize)]
+struct GameJson {
+    slug: String,
+    name: String,
+    offer_id: String,
+    content_id: String,
+    display_name: String,
+    installed: bool,
+    install_path: Option<String>,
+    version: Option<String>,
+    has_cloud_save: bool,
+    extra_offers: Vec<ExtraOfferJson>,
+}
 
-    info!("Owned games:");
+#[derive(serde::Serialize)]
+struct ExtraOfferJson {
+    offer_id: String,
+    display_name: String,
+}
+
+async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
+    let mut maxima = maxima_arc.lock().await;
     let titles = maxima.mut_library().games().await?;
 
+    if json {
+        // Machine-readable mode: one JSON array, no log noise. main() already
+        // muted stdout logging via `set_stdout_suppressed(true)` for this
+        // subcommand; everything that follows goes directly to stdout via
+        // `println!`.
+        let mut out: Vec<GameJson> = Vec::with_capacity(titles.len());
+        for title in titles {
+            let base = title.base_offer();
+            let installed = base.is_installed().await;
+            // `execute_path` and `installed_version` both read the local
+            // manifest, which can be absent for externally-installed copies
+            // (Steam, manually-placed). Swallow those errors — Draconis
+            // can still see `installed: true` even when version is unknown,
+            // and `installed: false` is enough to drive the install flow.
+            let install_path = if installed {
+                base.execute_path(false)
+                    .await
+                    .ok()
+                    .map(|p| p.display().to_string())
+            } else {
+                None
+            };
+            let version = if installed {
+                base.installed_version().await.ok()
+            } else {
+                None
+            };
+
+            let extras = title
+                .extra_offers()
+                .iter()
+                .map(|g| ExtraOfferJson {
+                    offer_id: g.offer_id().clone(),
+                    display_name: g.offer().display_name().to_string(),
+                })
+                .collect();
+
+            out.push(GameJson {
+                slug: base.slug().clone(),
+                name: title.name().to_string(),
+                offer_id: base.offer_id().clone(),
+                content_id: base.offer().content_id().to_string(),
+                display_name: base.offer().display_name().to_string(),
+                installed,
+                install_path,
+                version,
+                has_cloud_save: base.offer().has_cloud_save(),
+                extra_offers: extras,
+            });
+        }
+
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    info!("Owned games:");
     for title in titles {
         info!(
             "{:<width$} - {:<width2$} - {:<width3$} - Installed: {}",
