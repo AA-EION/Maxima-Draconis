@@ -81,21 +81,6 @@ enum Mode {
     LocateGame {
         path: String,
     },
-    /// Filesystem-only detection of a Titanfall 2 / Northstar install at a
-    /// given path. Doesn't talk to EA, doesn't require login, doesn't spin
-    /// up the tokio runtime — just inspects what's on disk. Designed for
-    /// Draconis's pre-flight: "you say TF2 is at X, can you confirm and
-    /// tell me whether Northstar is present too?"
-    Inspect {
-        /// Path to inspect. Can be the install directory (e.g.
-        /// `C:\Titanfall 2`) or the executable itself (e.g.
-        /// `…\Titanfall2.exe`); if it's a file, we look at its parent dir.
-        path: String,
-
-        /// Emit a JSON document on stdout instead of human-readable lines.
-        #[arg(long)]
-        json: bool,
-    },
     CloudSync {
         game_slug: String,
 
@@ -304,95 +289,7 @@ fn install_panic_hook() {
 /// stdout suppression on the global logger before anything has a chance to
 /// log — keeps `--json` subcommand output cleanly parseable.
 fn json_mode(args: &Args) -> bool {
-    matches!(
-        args.mode,
-        Some(Mode::ListGames { json: true }) | Some(Mode::Inspect { json: true, .. })
-    )
-}
-
-/// Pure filesystem detection: does this path look like a Titanfall 2
-/// install, and is Northstar present alongside it? No EA library lookup,
-/// no auth, no tokio runtime — just `std::fs::exists` checks. Returns the
-/// process exit code (0 success, 1 serialization/IO failure).
-///
-/// Detection rules:
-///   - exe candidates: `Titanfall2.exe` (primary), `NorthstarLauncher.exe`
-///     (Northstar 1.x entry point). The first one that exists wins.
-///   - `is_titanfall2`: `Titanfall2.exe` is in the resolved dir.
-///   - Northstar markers (any one is enough to set `has_northstar`):
-///     `NorthstarLauncher.exe`, `wsock32.dll` (the proxy DLL), `r2/mods`
-///     (the mods dir).
-fn run_inspect(path: &str, json: bool) -> i32 {
-    use std::path::PathBuf;
-
-    #[derive(serde::Serialize)]
-    struct InspectJson {
-        path: String,
-        exists: bool,
-        is_titanfall2: bool,
-        exe_path: Option<String>,
-        has_northstar: bool,
-        northstar_markers: Vec<String>,
-    }
-
-    let raw = PathBuf::from(path);
-    let dir = if raw.is_file() {
-        raw.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| raw.clone())
-    } else {
-        raw.clone()
-    };
-    let exists = dir.exists();
-
-    let exe_path = ["Titanfall2.exe", "NorthstarLauncher.exe"]
-        .iter()
-        .map(|name| dir.join(name))
-        .find(|p| p.exists())
-        .map(|p| p.display().to_string());
-
-    let is_titanfall2 = dir.join("Titanfall2.exe").exists();
-
-    let northstar_markers: Vec<String> = ["NorthstarLauncher.exe", "wsock32.dll", "r2/mods"]
-        .iter()
-        .filter(|m| dir.join(m).exists())
-        .map(|s| (*s).to_string())
-        .collect();
-    let has_northstar = !northstar_markers.is_empty();
-
-    let report = InspectJson {
-        path: raw.display().to_string(),
-        exists,
-        is_titanfall2,
-        exe_path,
-        has_northstar,
-        northstar_markers,
-    };
-
-    if json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(s) => {
-                println!("{}", s);
-                0
-            }
-            Err(e) => {
-                eprintln!("inspect: failed to serialize: {}", e);
-                1
-            }
-        }
-    } else {
-        println!("Path:           {}", report.path);
-        println!("Exists:         {}", report.exists);
-        println!("Is Titanfall 2: {}", report.is_titanfall2);
-        if let Some(ref exe) = report.exe_path {
-            println!("Executable:     {}", exe);
-        }
-        println!("Has Northstar:  {}", report.has_northstar);
-        if !report.northstar_markers.is_empty() {
-            println!("Markers:        {}", report.northstar_markers.join(", "));
-        }
-        0
-    }
+    matches!(args.mode, Some(Mode::ListGames { json: true }))
 }
 
 /// Plain (non-tokio) `main`. The order is load-bearing:
@@ -419,12 +316,6 @@ fn main() {
     // keeps receiving everything for debugging.
     if json_mode(&args) {
         maxima::util::log::set_stdout_suppressed(true);
-    }
-
-    // Inspect is a pure filesystem probe — no Maxima context, no auth, no
-    // tokio runtime. Handle it before paying for any of that.
-    if let Some(Mode::Inspect { ref path, json }) = args.mode {
-        std::process::exit(run_inspect(path, json));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -719,11 +610,6 @@ async fn startup(args: Args) -> Result<()> {
         }
         Mode::ListGames { json } => list_games(maxima_arc.clone(), json).await,
         Mode::LocateGame { path } => locate_game(maxima_arc.clone(), &path).await,
-        Mode::Inspect { .. } => {
-            // Handled in main() before the runtime starts — this branch is
-            // unreachable in practice but kept for exhaustiveness.
-            Ok(())
-        }
         Mode::CloudSync { game_slug, write } => {
             do_cloud_sync(maxima_arc.clone(), &game_slug, write).await
         }
