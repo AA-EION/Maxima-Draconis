@@ -63,6 +63,7 @@ use self::{
     },
 };
 use crate::{
+    auth_server,
     content::manager::{ContentManager, ContentManagerError},
     lsx::{self, service::LSXServerError, types::LSXRequestType},
     rtm::client::{BasicPresence, RtmClient},
@@ -232,6 +233,58 @@ impl Maxima {
     pub async fn start_lsx(&self, maxima: LockedMaxima) -> Result<(), LSXServerError> {
         let lsx_port = self.lsx_port;
 
+        // Cooperate with any LSX server already listening on the same port
+        // — this is what makes `maxima-cli serve` actually useful.
+        //
+        // The protocol-handler chain (Steam Play → `link2ea://launchgame/X`
+        // → bootstrap → `maxima-cli.exe launch X`) **always** spawns a fresh
+        // maxima-cli process. That child has its own `Maxima` instance with
+        // `playing = Some(context)` and, without this guard, also tries to
+        // bind 127.0.0.1:3216. On a stock Linux/Windows stack the second
+        // `TcpListener::bind` would fail and the child's LSX task would
+        // exit harmlessly — the game's traffic would then hit the original
+        // server (serve / UI / earlier instance) which has `playing()=None`,
+        // exercising the catornot/patch-external-lsx code path that the
+        // user reports works on Windows.
+        //
+        // Under Wine on macOS/CrossOver we observed the opposite: the
+        // child's bind appears to succeed (or take precedence), so the
+        // game's connection lands on the *child's* LSX server, where
+        // `playing()=Some(...)`. That puts every handler down the
+        // active-launch branch and reproduces the "File corruption
+        // detected" symptom the user has been hitting.
+        //
+        // The fix is a synchronous probe: if a TCP connection to
+        // 127.0.0.1:<port> succeeds, an LSX server is already there, so
+        // we deliberately do NOT start another. The child still proceeds
+        // with `launch::start_game` (license preflight, env vars, spawn
+        // the game executable) — the game's `EALsxPort=<port>` env var
+        // will resolve to the existing server.
+        //
+        // Using `std::net::TcpStream::connect` (not tokio) keeps this
+        // probe entirely synchronous so we don't yield the runtime
+        // mid-decision; the call is cheap when nothing's listening
+        // (immediate ECONNREFUSED on localhost).
+        use std::time::Duration as StdDuration;
+        let probe_addr = format!("127.0.0.1:{}", lsx_port);
+        if let Ok(probe_target) = probe_addr.parse() {
+            match std::net::TcpStream::connect_timeout(&probe_target, StdDuration::from_millis(200)) {
+                Ok(stream) => {
+                    drop(stream);
+                    info!(
+                        "LSX server already listening on {} (likely `maxima-cli serve` \
+                         in another window); skipping our own bind so the game's traffic \
+                         lands on the existing server.",
+                        probe_addr
+                    );
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Nothing listening — proceed to bind below.
+                }
+            }
+        }
+
         tokio::spawn(async move {
             if let Err(e) = lsx::service::start_server(lsx_port, maxima).await {
                 error!("Error starting LSX server: {}", e);
@@ -240,6 +293,29 @@ impl Maxima {
 
         tokio::task::yield_now().await;
         Ok(())
+    }
+
+    /// Start the `/authorize` HTTP server. Companion to [`Self::start_lsx`]
+    /// for the bootstrap → `link2ea://` forward path — see
+    /// [`crate::auth_server`] for protocol details. Defaults to port
+    /// [`crate::auth_server::AUTHORIZE_PORT`] (13219); override with the
+    /// `MAXIMA_AUTHORIZE_PORT` env var.
+    ///
+    /// This method is intended to be called once per process at startup
+    /// (e.g. `maxima-cli serve` or the UI bridge thread). It returns
+    /// immediately after the listener is bound; the accept loop runs in
+    /// a tokio task. Errors are surfaced if the bind itself fails, so
+    /// callers can degrade gracefully (the LSX server keeps working
+    /// even if authorize-HTTP is unavailable).
+    pub async fn start_auth_server(
+        &self,
+        maxima: LockedMaxima,
+    ) -> Result<(), auth_server::AuthServerError> {
+        let port = env::var("MAXIMA_AUTHORIZE_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(auth_server::AUTHORIZE_PORT);
+        auth_server::start_server(port, maxima).await
     }
 
     pub async fn access_token(&mut self) -> Result<String, TokenError> {
