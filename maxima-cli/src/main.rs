@@ -1091,16 +1091,36 @@ async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
             // (Steam, manually-placed). Swallow those errors — Draconis
             // can still see `installed: true` even when version is unknown,
             // and `installed: false` is enough to drive the install flow.
+            // Errors are logged at `debug!` so the file sink still has them
+            // for diagnosing why a path/version came back null, without
+            // breaking the JSON document on stdout.
             let install_path = if installed {
-                base.execute_path(false)
-                    .await
-                    .ok()
-                    .map(|p| p.display().to_string())
+                match base.execute_path(false).await {
+                    Ok(p) => Some(p.display().to_string()),
+                    Err(e) => {
+                        debug!(
+                            "execute_path for {} failed: {}",
+                            base.offer_id(),
+                            e
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
             let version = if installed {
-                base.installed_version().await.ok()
+                match base.installed_version().await {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        debug!(
+                            "installed_version for {} failed: {}",
+                            base.offer_id(),
+                            e
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
