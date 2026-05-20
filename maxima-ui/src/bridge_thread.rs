@@ -85,6 +85,12 @@ pub enum MaximaLibRequest {
     InstallGameRequest(String, PathBuf),
     LocateGameRequest(String),
     ShutdownRequest,
+    /// External-command auto-install (driven by `maxima --install <slug>
+    /// --install-path <path>`). Resolves the slug to an offer_id via
+    /// the EA library and immediately queues an install against it.
+    /// Failure (slug not in library, no live build) surfaces as a
+    /// `NonFatalError` so the UI stays interactive.
+    AutoInstallSlug(String, PathBuf),
 }
 
 pub enum MaximaLibResponse {
@@ -506,6 +512,53 @@ impl BridgeThread {
                         .offer_id(offer)
                         .build_id(build.build_id().to_owned())
                         .path(path.to_owned())
+                        .build()?;
+                    Ok(maxima.content_manager().add_install(game).await?)
+                }
+                MaximaLibRequest::AutoInstallSlug(slug, path) => {
+                    // External `--install <slug>` flow. Resolve the
+                    // slug against the user's EA library, then queue
+                    // an install against the live build at the given
+                    // path. Mirrors the `InstallGameRequest` handler
+                    // above minus the offer_id resolution step.
+                    let mut maxima = maxima_arc.lock().await;
+                    let offer = maxima.mut_library().game_by_base_slug(&slug).await?;
+                    let offer = match offer {
+                        Some(o) => o,
+                        None => {
+                            // Slug isn't in the user's library — log
+                            // and surface a non-fatal error so the UI
+                            // stays interactive (user can link
+                            // accounts / pick a different game).
+                            warn!(
+                                "AutoInstallSlug: '{}' not in library — leaving UI interactive",
+                                slug
+                            );
+                            continue;
+                        }
+                    };
+                    let offer_id = offer.offer_id().clone();
+                    info!(
+                        "AutoInstallSlug: resolved '{}' -> {}, queueing install at {:?}",
+                        slug, offer_id, path
+                    );
+
+                    let builds = maxima
+                        .content_manager()
+                        .service()
+                        .available_builds(&offer_id)
+                        .await?;
+                    let build = if let Some(build) = builds.live_build() {
+                        build
+                    } else {
+                        warn!("AutoInstallSlug: no live build for '{}'", offer_id);
+                        continue;
+                    };
+
+                    let game = QueuedGameBuilder::default()
+                        .offer_id(offer_id)
+                        .build_id(build.build_id().to_owned())
+                        .path(path)
                         .build()?;
                     Ok(maxima.content_manager().add_install(game).await?)
                 }

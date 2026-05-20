@@ -1,7 +1,7 @@
 use crate::{
     bridge_thread::{self, BackendError},
     views::downloads_view::QueuedDownload,
-    BackendStallState, GameDetails, GameDetailsWrapper, MaximaEguiApp,
+    BackendStallState, GameDetails, GameDetailsWrapper, MaximaEguiApp, PageType,
 };
 use log::{error, info, warn};
 use std::sync::mpsc::TryRecvError;
@@ -37,6 +37,30 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             .backend_commander
                             .send(bridge_thread::MaximaLibRequest::GetFriendsRequest)
                             .unwrap();
+
+                        // External-command auto-install: if the user
+                        // (or an external launcher like Draconis)
+                        // passed `--install <slug>` on the command
+                        // line, fire it now that the login has
+                        // landed. `take()` so we never re-fire on a
+                        // re-login event.
+                        if let Some((slug, path)) = app.pending_install.take() {
+                            info!(
+                                "Dispatching auto-install for '{}' -> {:?}",
+                                slug, path
+                            );
+                            app.backend
+                                .backend_commander
+                                .send(bridge_thread::MaximaLibRequest::AutoInstallSlug(
+                                    slug, path,
+                                ))
+                                .unwrap();
+                            // Jump to the Downloads view so the user
+                            // sees progress as soon as the queue
+                            // update arrives — saves them clicking
+                            // a tab they didn't ask to land on.
+                            app.page_view = PageType::Downloads;
+                        }
                     }
                     LoginCacheEmpty => app.backend_state = BackendStallState::UserNeedsToLogIn,
                     ServiceNeedsStarting => {
