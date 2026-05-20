@@ -51,24 +51,29 @@ pub const INSTALL_MARKER_FILENAME: &str = "FInstall.txt";
 /// Contents of the install-completion marker file (`FInstall.txt`).
 /// Written into the game's install directory by `ContentManager::update`
 /// after a download transitions to `is_done()`.
+///
+/// Public so other crates in the workspace (and external consumers via
+/// `maxima-lib` as a dependency) can deserialize the marker without
+/// redefining the schema. Forward-compat: callers should accept any
+/// `schema >= 1` and ignore unknown fields.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct InstallMarker {
+pub struct InstallMarker {
     /// Forward-compat schema version. Consumers should accept >=1 and
     /// ignore unknown fields.
-    schema: u32,
+    pub schema: u32,
     /// The offer the install was queued against (e.g.
     /// `Origin.OFR.50.0001456` for Titanfall 2).
-    offer_id: String,
+    pub offer_id: String,
     /// The build that landed on disk (lets consumers tell whether the
     /// installed copy matches the current live build later).
-    build_id: String,
+    pub build_id: String,
     /// Absolute path the install was written to. Self-describing —
     /// callers can verify the file is the one they expected.
-    install_path: String,
+    pub install_path: String,
     /// RFC 3339 UTC timestamp.
-    completed_at: String,
+    pub completed_at: String,
     /// `maxima-lib` package version that wrote this marker. Cosmetic.
-    maxima_lib_version: String,
+    pub maxima_lib_version: String,
 }
 
 #[derive(Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
