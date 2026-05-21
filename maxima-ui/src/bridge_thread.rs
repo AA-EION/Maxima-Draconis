@@ -591,9 +591,21 @@ impl BridgeThread {
                             .build()?;
                         {
                             let mut maxima = maxima_arc.lock().await;
-                            maxima.content_manager().add_install(game).await?;
-                            // Mirror the InstallGameRequest fix:
-                            // surface the new queue state to the UI
+                            // Capture the result BEFORE calling
+                            // `update_queue`. `add_install` can
+                            // partially mutate the in-memory queue
+                            // (`install_direct` writes `current` to
+                            // disk via `queue.save` before failing on
+                            // downloader init), so the UI needs the
+                            // refreshed view of `current + queued`
+                            // even on the error path — otherwise it
+                            // can show stale state. Matches the
+                            // InstallGameRequest pattern above.
+                            // Gemini caught the previous version's
+                            // `?` short-circuit on PR #16 review.
+                            let add_result =
+                                maxima.content_manager().add_install(game).await;
+                            // Surface the new queue state to the UI
                             // immediately so `installing_now` lands
                             // populated and `DownloadProgressChanged`
                             // events have somewhere to write their
@@ -606,6 +618,7 @@ impl BridgeThread {
                                 maxima.content_manager(),
                                 backend_responder.clone(),
                             );
+                            add_result?;
                         }
                         info!(
                             "AutoInstallSlug: queued install of '{}' -> {:?}",
