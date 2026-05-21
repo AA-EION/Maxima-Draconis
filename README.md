@@ -162,7 +162,7 @@ cargo check --target x86_64-pc-windows-gnu -p maxima-lib -p maxima-cli -p maxima
 
 ## Northstar online play
 
-Northstar works with Maxima. The trick is using `NorthstarLauncher.exe -noOriginStartup` — that flag tells the Northstar binary to skip the hardcoded `Origin.exe` wait (Origin doesn't exist in Wine), which would otherwise hang forever. Draconis applies the flag automatically; the launch is wrapped in `maxima-cli launch --game-path "...\NorthstarLauncher.exe" --game-args -noOriginStartup` so Maxima provides EA auth and Northstar's `wsock32.dll` proxy provides the engine hooks.
+Northstar works with Maxima. The trick is using `NorthstarLauncher.exe -noOriginStartup` — that flag tells the Northstar binary to skip the hardcoded `Origin.exe` wait (Origin doesn't exist in Wine), which would otherwise hang forever. Draconis applies the flag automatically; the launch is wrapped in `maxima-cli launch titanfall-2 --game-path "...\NorthstarLauncher.exe" --game-args -noOriginStartup` so Maxima provides EA auth and Northstar's `wsock32.dll` proxy provides the engine hooks.
 
 Vanilla TF2 with Northstar installed in the same bottle also goes through `NorthstarLauncher.exe`, just with the extra `--game-args -vanilla` flag to skip mod loading. Northstar's `wsock32.dll` proxy applies engine fixes even in vanilla mode, so there's no reason to bypass it.
 
@@ -174,7 +174,7 @@ Thanks to [catornot](https://github.com/catornot) for identifying the `-noOrigin
 
 ### What works
 
-- **End-to-end TF2 launch on macOS/CrossOver via the CEG fix** (v0.11.0+). User reproducible: a Steam install of TF2 reaches Main Menu through the full LSX flow (`GetProfile` → `RequestLicense` → `GetAuthCode` → `QueryEntitlements` → `SetPresence`) after `maxima-cli install --replace-files "Titanfall2.exe,Titanfall2_trial.exe" --only-listed-files` replaces just the two CEG-signed launcher binaries. ~3 MB download.
+- **End-to-end TF2 launch on macOS/CrossOver via the CEG fix** (v0.11.0+). User reproducible: a Steam install of TF2 reaches Main Menu through the full LSX flow (`GetProfile` → `RequestLicense` → `GetAuthCode` → `QueryEntitlements` → `SetPresence`) after `maxima-cli install titanfall-2 --path "<steam_install>" --replace-files "Titanfall2.exe,Titanfall2_trial.exe" --only-listed-files` replaces just the two CEG-signed launcher binaries. ~3 MB download.
 - **Headless install flow via `maxima.exe --install <slug> --install-path <abs>`** (v0.12.0+). Draconis spawns Maxima with these args; user logs into EA in their host browser; the UI auto-navigates to the Downloads view and downloads the game. `FInstall.txt` marker written to the install dir when `ContentManager` confirms `is_done()`.
 - `maxima-cli serve` brings up LSX + the authorize HTTP server reliably inside the bottle.
 - `maxima-bootstrap` correctly forwards `link2ea://` / `origin2://` to a running `serve` and falls back to spawning `maxima-cli launch` when nothing's listening.

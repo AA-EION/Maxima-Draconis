@@ -928,7 +928,7 @@ Three follow-ups to v0.12.0, all observed while testing the new `maxima.exe --in
 
 ### 2026-05-21 — v0.12.0: headless install driver + `FInstall.txt` marker + UI panic hook
 
-Two related fixes to make `maxima.exe` usable as a non-interactive install driver an external launcher (specifically Draconis) can invoke, plus a defensive panic hook for the kind of crash-without-trace the user hit while testing.
+Two related fixes to make `maxima.exe` usable as a non-interactive install driver that an external launcher (specifically Draconis) can invoke, plus a defensive panic hook for the kind of crash-without-trace the user hit while testing.
 
 **`maxima.exe --install <SLUG> --install-path <PATH>` ([#14](https://github.com/AA-EION/Maxima-Draconis/pull/14))** — new CLI args on the graphical UI. On startup, Maxima logs in (showing the login screen if needed), then auto-navigates to the Downloads view and queues an install of the named slug at the given path as soon as login lands. Wired through a new `MaximaLibRequest::AutoInstallSlug` variant whose `bridge_thread` handler resolves the slug against `game_by_base_slug`, looks up the live build, and calls `content_manager().add_install(...)`. Errors (slug not in library, no live build) surface as `NonFatalError` so the UI stays interactive instead of bailing. Lock dropped between each network-bound step so other backend requests aren't serialized behind install setup.
 
