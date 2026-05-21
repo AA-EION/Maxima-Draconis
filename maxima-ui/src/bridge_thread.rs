@@ -513,7 +513,19 @@ impl BridgeThread {
                         .build_id(build.build_id().to_owned())
                         .path(path.to_owned())
                         .build()?;
-                    Ok(maxima.content_manager().add_install(game).await?)
+                    let add_result = maxima.content_manager().add_install(game).await;
+                    // Surface the new queue state to the UI immediately
+                    // — without this, `installing_now` stays None until
+                    // some OTHER install finishes (because the only
+                    // existing `update_queue` call is on
+                    // `InstallFinished`). Today the install modal
+                    // worked around it by pre-populating `installing_now`
+                    // synchronously in the click handler; with this
+                    // emission the workaround becomes unnecessary, and
+                    // headless callers (e.g. `AutoInstallSlug` from
+                    // `--install`) also get a populated download list.
+                    Self::update_queue(maxima.content_manager(), backend_responder.clone());
+                    Ok(add_result?)
                 }
                 MaximaLibRequest::AutoInstallSlug(slug, path) => {
                     // External `--install <slug>` flow. Resolve the
@@ -580,6 +592,20 @@ impl BridgeThread {
                         {
                             let mut maxima = maxima_arc.lock().await;
                             maxima.content_manager().add_install(game).await?;
+                            // Mirror the InstallGameRequest fix:
+                            // surface the new queue state to the UI
+                            // immediately so `installing_now` lands
+                            // populated and `DownloadProgressChanged`
+                            // events have somewhere to write their
+                            // bytes counter. Without this, the UI's
+                            // Downloads view stays empty even though
+                            // bytes ARE coming down — exactly the
+                            // symptom an earlier `--install` test
+                            // reproduced.
+                            Self::update_queue(
+                                maxima.content_manager(),
+                                backend_responder.clone(),
+                            );
                         }
                         info!(
                             "AutoInstallSlug: queued install of '{}' -> {:?}",
