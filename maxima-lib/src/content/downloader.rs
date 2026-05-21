@@ -381,6 +381,22 @@ impl<'a> EntryDownloadRequest<'a> {
             }));
         }
 
+        // Explicit `shutdown()` to flush the buffered writer chain
+        // (BufWriter inside AsyncWriterWrapper → ZLibDeflateDecoder's
+        // BufWriter<File>). `tokio::io::copy` doesn't flush on completion;
+        // letting the wrapper drop is also not a flush (tokio's
+        // AsyncWrite has no Drop-time flush guarantee). Without this,
+        // the final buffered bytes — possibly the entire deflate
+        // tail — never reach disk, and a "successful" file ends up
+        // truncated. Gemini caught this on PR #19 review.
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = wrapper.shutdown().await {
+            return Err(DownloaderError::Download(DownloadError::ChunkCopy {
+                entry: self.entry.name().clone(),
+                error: err,
+            }));
+        }
+
         Ok(())
     }
 }
@@ -481,12 +497,19 @@ impl ZipDownloader {
         let file_path = self.path.join(entry.name());
 
         // Directory entry / parent-not-yet-created handling.
-        if !file_path.exists() {
-            if !file_path.safe_parent()?.exists() {
-                create_dir_all(&file_path.safe_parent()?).await?;
+        // `tokio::fs::try_exists` instead of sync `Path::exists` —
+        // we're hot in the `buffer_unordered(16)` install loop and
+        // a sync `stat()` blocks the runtime worker thread. Gemini
+        // caught this on PR #19 review.
+        if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
+            let parent = file_path.safe_parent()?;
+            if !tokio::fs::try_exists(&parent).await.unwrap_or(false) {
+                create_dir_all(&parent).await?;
             }
 
-            if entry.name().ends_with("/") && !file_path.exists() {
+            if entry.name().ends_with("/")
+                && !tokio::fs::try_exists(&file_path).await.unwrap_or(false)
+            {
                 debug!("{} is a directory", entry.name());
                 create_dir(file_path).await?;
                 return Ok(0);
@@ -507,7 +530,7 @@ impl ZipDownloader {
         // (Re-running the same install over a previously-completed
         // dir should short-circuit.) `state()` opens the file read-only,
         // so this works even before the retry loop opens the writer.
-        if file_path.exists() {
+        if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
             if let Ok(EntryDownloadState::Complete) =
                 EntryDownloadRequest::state(&context, entry).await
             {
