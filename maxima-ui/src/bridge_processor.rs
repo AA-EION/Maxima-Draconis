@@ -49,12 +49,25 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                                 "Dispatching auto-install for '{}' -> {:?}",
                                 slug, path
                             );
-                            app.backend
-                                .backend_commander
-                                .send(bridge_thread::MaximaLibRequest::AutoInstallSlug(
-                                    slug, path,
-                                ))
-                                .unwrap();
+                            // Tolerate a dead bridge thread: an
+                            // `.unwrap()` here would panic the UI
+                            // thread on a `SendError`, which is the
+                            // exact failure mode the new panic hook
+                            // is meant to help diagnose — don't
+                            // compound it. The next try_recv on the
+                            // listener will surface a Disconnected
+                            // error and route to `critical_error`,
+                            // which is the right user-visible
+                            // outcome.
+                            if let Err(err) = app.backend.backend_commander.send(
+                                bridge_thread::MaximaLibRequest::AutoInstallSlug(slug, path),
+                            ) {
+                                warn!(
+                                    "Failed to dispatch AutoInstallSlug — bridge thread \
+                                     disconnected? {}",
+                                    err
+                                );
+                            }
                             // Jump to the Downloads view so the user
                             // sees progress as soon as the queue
                             // update arrives — saves them clicking
