@@ -1,6 +1,6 @@
 [package]
 name = "maxima-ui"
-version = "0.1.0"
+version = "0.12.1"
 authors = ["Nick Whelan <cooldood909@gmail.com>"]
 edition = "2021"
 
