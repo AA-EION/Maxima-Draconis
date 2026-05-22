@@ -536,20 +536,12 @@ async fn startup(args: Args) -> Result<()> {
 
     native_setup().await?;
 
-    let skip_login = {
-        if let Some(Mode::Launch {
-            game_path: _,
-            game_args: _,
-            slug: _,
-            ref login,
-            trailing_args: _,
-        }) = args.mode
-        {
-            login.is_some()
-        } else {
-            false
-        }
-    };
+    // `--login <content_id>` short-circuits the OAuth flow: only the
+    // license server needs auth, so we skip loading persistent auth
+    // storage and run with a dummy local user. `matches!` lets us
+    // ignore the rest of the Launch fields cleanly — they don't
+    // affect this decision.
+    let skip_login = matches!(args.mode, Some(Mode::Launch { login: Some(_), .. }));
 
     let options = MaximaOptionsBuilder::default()
         .load_auth_storage(!skip_login)
