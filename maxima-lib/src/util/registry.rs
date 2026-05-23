@@ -25,7 +25,7 @@ use winapi::{
 
 #[cfg(windows)]
 use winreg::{
-    enums::{HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_WRITE},
+    enums::{HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE},
     RegKey,
 };
 
@@ -283,6 +283,103 @@ pub fn launch_bootstrap() -> Result<(), NativeError> {
     }
 
     Ok(())
+}
+
+/// Scan `HKLM\...\RunOnce` for WiX Burn-engine installers that were killed
+/// mid-run (leaving `Resume=1` and a `/burn.runonce` RunOnce entry). For each
+/// found: clear `Resume`, delete the corrupt `state.rsm` checkpoint, and remove
+/// the RunOnce entry so the next Touchup.exe invocation starts the redistributable
+/// installer from scratch instead of failing with exit code 1 on resume.
+#[cfg(windows)]
+pub fn cleanup_interrupted_burn_installs() {
+    use log::{info, warn};
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+    for runonce_path in &[
+        "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    ] {
+        let Ok(key) = hklm.open_subkey_with_flags(runonce_path, KEY_READ | KEY_WRITE) else {
+            continue;
+        };
+
+        let names: Vec<String> = key
+            .enum_values()
+            .filter_map(|r| r.ok())
+            .map(|(name, _)| name)
+            .collect();
+
+        for name in names {
+            let Ok(command) = key.get_value::<String, _>(&name) else {
+                continue;
+            };
+            if !command.contains("/burn.runonce") {
+                continue;
+            }
+
+            let Some(guid) = extract_burn_guid(&command) else {
+                warn!(
+                    "Found /burn.runonce RunOnce entry '{}' but could not extract GUID",
+                    name
+                );
+                continue;
+            };
+
+            info!(
+                "Cleaning up interrupted Burn install: RunOnce='{}' GUID={}",
+                name, guid
+            );
+
+            // Clear the Resume flag so the installer re-runs from scratch
+            let uninstall_path = format!(
+                "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{}",
+                guid
+            );
+            if let Ok(uninstall_key) =
+                hklm.open_subkey_with_flags(&uninstall_path, KEY_READ | KEY_WRITE)
+            {
+                if let Err(err) = uninstall_key.set_value("Resume", &0u32) {
+                    warn!("Could not clear Resume flag for {}: {}", guid, err);
+                } else {
+                    info!("Cleared Resume flag for {}", guid);
+                }
+            }
+
+            // Delete the corrupt Burn checkpoint file
+            let state_rsm = PathBuf::from(format!(
+                "C:\\ProgramData\\Package Cache\\{}\\state.rsm",
+                guid
+            ));
+            if state_rsm.exists() {
+                if let Err(err) = std::fs::remove_file(&state_rsm) {
+                    warn!("Could not delete {}: {}", state_rsm.display(), err);
+                } else {
+                    info!("Deleted Burn checkpoint {}", state_rsm.display());
+                }
+            }
+
+            // Remove the RunOnce entry so it doesn't fire at the next boot
+            if let Err(err) = key.delete_value(&name) {
+                warn!("Could not delete RunOnce entry '{}': {}", name, err);
+            } else {
+                info!("Removed RunOnce entry '{}' for interrupted Burn install", name);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn extract_burn_guid(command: &str) -> Option<String> {
+    let start = command.find('{')?;
+    let end = command[start..].find('}')? + start + 1;
+    let candidate = &command[start..end];
+    // GUIDs with braces: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} = 38 chars
+    if candidate.len() == 38 {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(windows)]
