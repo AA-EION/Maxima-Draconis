@@ -331,26 +331,32 @@ pub fn cleanup_interrupted_burn_installs() {
                 name, guid
             );
 
-            // Clear the Resume flag so the installer re-runs from scratch
-            let uninstall_path = format!(
-                "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{}",
-                guid
-            );
-            if let Ok(uninstall_key) =
-                hklm.open_subkey_with_flags(&uninstall_path, KEY_READ | KEY_WRITE)
-            {
-                if let Err(err) = uninstall_key.set_value("Resume", &0u32) {
-                    warn!("Could not clear Resume flag for {}: {}", guid, err);
-                } else {
-                    info!("Cleared Resume flag for {}", guid);
+            // Clear the Resume flag so the installer re-runs from scratch.
+            // Check both the 32-bit (Wow6432Node) and 64-bit Uninstall hives
+            // since Burn bundles can register in either depending on bitness.
+            for uninstall_prefix in &[
+                "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            ] {
+                let uninstall_path = format!("{}\\{}", uninstall_prefix, guid);
+                if let Ok(uninstall_key) =
+                    hklm.open_subkey_with_flags(&uninstall_path, KEY_READ | KEY_WRITE)
+                {
+                    if let Err(err) = uninstall_key.set_value("Resume", &0u32) {
+                        warn!("Could not clear Resume flag for {}: {}", guid, err);
+                    } else {
+                        info!("Cleared Resume flag for {}", guid);
+                    }
                 }
             }
 
             // Delete the corrupt Burn checkpoint file
-            let state_rsm = PathBuf::from(format!(
-                "C:\\ProgramData\\Package Cache\\{}\\state.rsm",
-                guid
-            ));
+            let program_data =
+                std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+            let state_rsm = PathBuf::from(program_data)
+                .join("Package Cache")
+                .join(guid)
+                .join("state.rsm");
             if state_rsm.exists() {
                 if let Err(err) = std::fs::remove_file(&state_rsm) {
                     warn!("Could not delete {}: {}", state_rsm.display(), err);

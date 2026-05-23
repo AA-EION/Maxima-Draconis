@@ -461,10 +461,7 @@ pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
 
     let reg_path = maxima_dir()?.join("temp").join("burn_cleanup.reg");
     tokio::fs::create_dir_all(reg_path.safe_parent()?).await?;
-    {
-        let mut file = tokio::fs::File::create(&reg_path).await?;
-        file.write_all(reg.as_bytes()).await?;
-    }
+    tokio::fs::write(&reg_path, reg.as_bytes()).await?;
 
     run_wine_command(
         "regedit",
