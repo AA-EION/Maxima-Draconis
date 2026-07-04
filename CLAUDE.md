@@ -92,6 +92,11 @@ maxima-resources/    Logo assets (`logo.ico`, `logo.png`) + `winres`-based
 MaximaHelper/        Native macOS Swift app (build.sh + Info.plist +
                      Sources/main.swift). Bridges qrc:// from the host
                      browser into the bottle via http://127.0.0.1:31033.
+maxima-native/       Native macOS SwiftUI launcher (Liquid Glass, macOS
+                     26+). A pure consumer of maxima-cli's JSON surface —
+                     the same contract Draconis uses. build.sh assembles a
+                     self-contained Maxima.app (bundles maxima-cli,
+                     maxima-bootstrap, MaximaBootstrap.app when built).
 installer/           NSIS script (maxima-setup.nsi) + cross-build script
                      (build.sh, uses mingw-w64 + makensis).
 images/              Repo images — banners, screenshots.
@@ -311,7 +316,11 @@ game in bottle emits link2ea://…
 
 **`maxima-ui` also runs natively** (smoke-validated 2026-07-04): one missing macOS stub (`check_desktop_icon`) was all the compile needed, and at runtime eframe/wgpu picks **Metal directly** on Apple Silicon — no Wine, no MoltenVK, none of the swapchain workarounds the in-bottle build needs. Login (shared token storage with the CLI), library, RTM, and the LSX server all come up. The UI's launch (`bridge/start_game.rs`) and both install handlers (`bridge_thread.rs`) ensure the per-game bottle the same way the CLI does. Bottle-selection nuance for long-lived processes: `ensure_game_bottle` snapshots a user-set `MAXIMA_WINE_PREFIX` at first use (`USER_PREFIX` OnceLock) so its own env exports for game A aren't mistaken for a user override when game B launches later. `canonical_slug` moved to `maxima-lib` (`GameLibrary::canonical_slug`) so CLI and UI share bottle-naming resolution.
 
-Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); Draconis not yet wired to the native binaries.
+**Native SwiftUI launcher (`maxima-native/`, added 2026-07-04).** A Liquid Glass (macOS 26+) SwiftUI app — `bash maxima-native/build.sh` → `maxima-native/build/Maxima.app`, self-contained (bundles the native `maxima-cli`, `maxima-bootstrap`, and `MaximaBootstrap.app` into Resources). Architecturally it is deliberately **just another consumer of `maxima-cli`'s JSON surface** — the same contract Draconis uses — so it doubles as a living validation of that contract: `list-games --json` for the library, `install/launch --json` JSONL streams for progress and lifecycle, `register-protocols` from Settings. Glass styling follows the Draconis reference (`.glassEffect(.regular, in: .rect(cornerRadius: 16))`, `GlassEffectContainer`, `.glass`/`.glassProminent` buttons); brand accent is the egui UI's `F9B233` orange. CrossOver's bottles dir is read from its preferences plist directly (Draconis `PathResolver` approach). Installed-state display uses the EA flag OR the conventional bottle game-dir (a display-speed mirror of `bottle-info`'s policy; actions stay CLI-authoritative). Settings: wine engine (custom command → `MAXIMA_WINE_COMMAND` on every CLI spawn), bottles folder (open in Finder), protocol registration, and a `maxima-cli` path override.
+
+**Feature parity between the two Maxima UIs**: the wine-engine picker also exists in the egui UI's settings view (persisted in `FrontendSettings.wine_command`, applied live via the same `MAXIMA_WINE_COMMAND`), along with an auto-detection status line and the CrossOver bottles-dir display. The egui (`maxima-ui`) path is maintained, not replaced — it remains the cross-platform launcher upstream ships; `maxima-native` is the macOS-first face.
+
+Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); Draconis not yet wired to the native binaries; `maxima-native` has no box art (list-games --json carries no image URLs yet) and no per-game settings sheet (launch args / exe override) — both natural next steps.
 
 ---
 
@@ -985,6 +994,8 @@ Follow-up the same day — **consumer surface for Draconis** (universal, no per-
 Second follow-up — **native protocol loop closed** (validated with an in-bottle `wine start link2ea://…` probe reaching the host bootstrap): `maxima-bootstrap/build-app.sh` assembles a bundle-signed `MaximaBootstrap.app`; `register-protocols` subcommand (login-free) registers it via `lsregister -f` (upstream's spawn-the-binary approach registered nothing); `setup_wine_registry` (macOS) routes `link2ea`/`origin2`/`qrc` out of the bottle via `winebrowser.exe` HKCR entries; bootstrap's `maxima-cli` fallback spawn fixed for native name + bundle layout (was hardcoded `maxima-cli.exe` sibling). See the "Protocol loop" diagram in the native-mode section.
 
 Third follow-up — **`maxima-ui` runs natively on macOS**: `check_desktop_icon` macOS stub (the only compile blocker), per-game bottle wiring in the UI's launch + install handlers, `canonical_slug` promoted to `maxima-lib::GameLibrary` (shared by CLI + UI), and a `USER_PREFIX` snapshot in `ensure_game_bottle` so long-lived processes switch bottles per game instead of sticking to the first one. Smoke-validated: native window on Metal (no Wine/MoltenVK), login + library + RTM + LSX all up.
+
+Fourth follow-up — **`maxima-native/`: SwiftUI Liquid Glass launcher (macOS 26+)** + **wine-engine selection in both UIs**. New self-contained `Maxima.app` (swiftc build like MaximaHelper; bundles the native CLI/bootstrap/protocol-app) consuming only `maxima-cli`'s JSON contract — Library grid with Play/Install/progress driven by `list-games`/`launch --json`/`install --json`, Settings with wine-engine picker, CrossOver bottles-dir (plist read, Draconis-style), protocol registration, CLI path override. Smoke-validated: app boots, spawns bundled CLI, logs in, loads library. The egui UI gained the matching wine-engine setting (`FrontendSettings.wine_command` → `MAXIMA_WINE_COMMAND`, live-applied) plus engine auto-detection status and bottles-dir display in its settings view — the traditional UI stays feature-equal and maintained.
 
 Not yet in native mode: Northstar (consumer-side recipe expected to work), Draconis wiring. Shipped releases still use the in-bottle mode.
 
