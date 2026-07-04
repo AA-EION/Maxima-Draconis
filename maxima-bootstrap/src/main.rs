@@ -213,7 +213,26 @@ async fn handle_protocol_authorize(
         port, protocol_name, offer_id
     ));
 
-    let mut child = Command::new(current_exe()?.with_file_name("maxima-cli.exe"));
+    #[cfg(windows)]
+    const MAXIMA_CLI: &str = "maxima-cli.exe";
+    #[cfg(not(windows))]
+    const MAXIMA_CLI: &str = "maxima-cli";
+
+    // Sibling binary in the flat (cargo / installer) layout; when running
+    // from inside MaximaBootstrap.app (bundle/osx/MaximaBootstrap.app/
+    // Contents/MacOS/), the CLI lives a few directories up — walk the
+    // ancestors and take the first hit. Falls back to the sibling path so
+    // a miss still produces a meaningful spawn error.
+    let exe = current_exe()?;
+    let cli_path = exe
+        .parent()
+        .into_iter()
+        .flat_map(|dir| dir.ancestors().take(6))
+        .map(|dir| dir.join(MAXIMA_CLI))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| exe.with_file_name(MAXIMA_CLI));
+
+    let mut child = Command::new(cli_path);
 
     if let Ok(port) = std::env::var("KYBER_INTERFACE_PORT") {
         child.env("KYBER_INTERFACE_PORT", port);

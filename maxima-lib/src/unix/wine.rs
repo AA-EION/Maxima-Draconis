@@ -573,6 +573,31 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         }
     }
 
+    // macOS: route Maxima's URL protocols OUT of the bottle to the host.
+    // Fresh (native-mode) bottles have no in-bottle maxima-bootstrap.exe;
+    // registering winebrowser.exe for the schemes makes wine hand the URL
+    // to the host's `open`, where LaunchServices resolves it to the
+    // registered MaximaBootstrap.app (see registry::set_up_registry). This
+    // is how an externally-launched game's link2ea:// reaches the host
+    // auth server / maxima-cli. Linux keeps upstream's flow untouched.
+    #[cfg(target_os = "macos")]
+    for (protocol, name) in [
+        ("link2ea", "Maxima Launcher"),
+        ("origin2", "Maxima Launcher"),
+        ("qrc", "Maxima Protocol"),
+    ] {
+        reg_content.push_str(&format!("[HKEY_CLASSES_ROOT\\{}]\n", protocol));
+        reg_content.push_str(&format!("@=\"URL:{}\"\n", name));
+        reg_content.push_str("\"URL Protocol\"=\"\"\n\n");
+        reg_content.push_str(&format!(
+            "[HKEY_CLASSES_ROOT\\{}\\shell\\open\\command]\n",
+            protocol
+        ));
+        reg_content.push_str(
+            "@=\"C:\\\\windows\\\\system32\\\\winebrowser.exe \\\"%1\\\"\"\n\n",
+        );
+    }
+
     let path = maxima_dir()?.join("temp").join("wine.reg");
     tokio::fs::create_dir_all(path.safe_parent()?).await?;
 

@@ -56,6 +56,8 @@ pub enum RegistryError {
 
     #[error("registry key `{0}` not found")]
     Key(String),
+    #[error("protocol registration failed: {0}")]
+    ProtocolRegistration(String),
     #[error("failed to get `{value}` of registry key `{key}`")]
     Value { value: String, key: String },
     #[error("install key is invalid")]
@@ -442,18 +444,40 @@ pub fn set_up_registry() -> Result<(), RegistryError> {
 pub fn set_up_registry() -> Result<(), RegistryError> {
     use std::process::Command;
 
-    use log::warn;
+    use log::info;
 
-    let bin = bootstrap_path()?;
+    // LaunchServices only honors URL scheme claims from a signed .app
+    // bundle — the bare sibling binary bootstrap_path() prefers for spawns
+    // can't be registered. Running the binary (upstream's approach) also
+    // registers nothing; `lsregister -f` is the reliable way.
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
-    if !bin.try_exists()? {
-        warn!(
-            "{} does not exist. Did you run `cargo bundle` for `maxima-bootstrap`?",
-            bin.display()
-        );
+    let app = module_path()?
+        .safe_parent()?
+        .join("bundle")
+        .join("osx")
+        .join("MaximaBootstrap.app");
+
+    if !app.try_exists()? {
+        return Err(RegistryError::ProtocolRegistration(format!(
+            "{} does not exist — build it with `bash maxima-bootstrap/build-app.sh` first",
+            app.display()
+        )));
     }
 
-    Command::new(bin).arg("--noop").spawn()?;
+    let status = Command::new(LSREGISTER).arg("-f").arg(&app).status()?;
+    if !status.success() {
+        return Err(RegistryError::ProtocolRegistration(format!(
+            "lsregister -f {} exited with {:?}",
+            app.display(),
+            status.code()
+        )));
+    }
+
+    info!(
+        "Registered {} with LaunchServices (qrc://, link2ea://, origin2://)",
+        app.display()
+    );
 
     Ok(())
 }

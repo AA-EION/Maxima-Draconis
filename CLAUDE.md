@@ -294,8 +294,22 @@ How it works:
 - `launch <slug> --json` — JSONL lifecycle: `{"event":"launched","offer_id":…,"wine_prefix":…}` once the game spawns, `{"event":"exited","elapsed_secs":…}` when it stops, `{"event":"error","message":…}` + non-zero exit on failure.
 - `bottle-info <slug> [--json]` — read-only readout of the bottle name, wine prefix, default game dir and existence flags Maxima would use for a title, WITHOUT creating anything. This is how a consumer finds the game dir to drop Northstar/mod files into without re-deriving Maxima's bottle-naming policy.
 - `serve --wine-prefix <path>` — discoverable front for `MAXIMA_WINE_PREFIX` in the one mode with no game context to auto-pick a bottle from.
+- `register-protocols` — one-time host setup (no login needed): registers `MaximaBootstrap.app` with LaunchServices for `qrc://` / `link2ea://` / `origin2://`.
 
-Known gaps in native mode: `link2ea://` from externally-launched games needs the in-bottle `maxima-bootstrap.exe` registered (fresh native bottles don't have it — direct `maxima-cli launch` doesn't need it since the game gets its auth env up front); Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); `maxima-ui`/Draconis not yet wired to the native binaries.
+**Protocol loop (validated 2026-07-04 with an in-bottle probe).** Native mode needs no in-bottle Maxima binaries for protocol handling:
+
+```
+game in bottle emits link2ea://…
+  → wine HKCR\link2ea → winebrowser.exe   (written by setup_wine_registry, macOS)
+  → winebrowser hands the URL to the host's `open`
+  → LaunchServices → MaximaBootstrap.app  (registered by `register-protocols`)
+  → bootstrap validates the offer id, probes 127.0.0.1:13219
+  → forwards to a running `serve` — or spawns the sibling native `maxima-cli launch`
+```
+
+`MaximaBootstrap.app` is assembled by `maxima-bootstrap/build-app.sh` from the native binary + an Info.plist claiming the three schemes, and **must be bundle-signed** (the script does `codesign --force --deep --sign -`; LaunchServices silently ignores claims from unsealed bundles — same gotcha as MaximaHelper). `registry.rs::set_up_registry` (macOS) registers it via `lsregister -f` — upstream's spawn-the-binary approach registered nothing. `qrc://` may resolve to Draconis's MaximaHelper.app when installed; that's fine — both forward to the same host loopback `:31033`. The bootstrap's `maxima-cli` fallback spawn walks ancestor dirs so it works from both the flat cargo layout and inside the `.app` bundle.
+
+Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); `maxima-ui`/Draconis not yet wired to the native binaries.
 
 ---
 
@@ -966,7 +980,9 @@ TF2 validated end-to-end running `maxima-cli` **natively on Apple Silicon** — 
 
 Follow-up the same day — **consumer surface for Draconis** (universal, no per-title logic in Maxima per the fork's scope rule): `launch --json` (JSONL lifecycle events: launched/exited/error), `bottle-info <slug> [--json]` (read-only bottle/prefix/game-dir readout so consumers can place per-title files without re-deriving bottle naming), `serve --wine-prefix <path>` (flag front for MAXIMA_WINE_PREFIX in the no-game-context mode).
 
-Not yet in native mode: in-bottle `link2ea://` handler registration, Northstar (consumer-side recipe expected to work), UI. Shipped releases still use the in-bottle mode.
+Second follow-up — **native protocol loop closed** (validated with an in-bottle `wine start link2ea://…` probe reaching the host bootstrap): `maxima-bootstrap/build-app.sh` assembles a bundle-signed `MaximaBootstrap.app`; `register-protocols` subcommand (login-free) registers it via `lsregister -f` (upstream's spawn-the-binary approach registered nothing); `setup_wine_registry` (macOS) routes `link2ea`/`origin2`/`qrc` out of the bottle via `winebrowser.exe` HKCR entries; bootstrap's `maxima-cli` fallback spawn fixed for native name + bundle layout (was hardcoded `maxima-cli.exe` sibling). See the "Protocol loop" diagram in the native-mode section.
+
+Not yet in native mode: Northstar (consumer-side recipe expected to work), UI. Shipped releases still use the in-bottle mode.
 
 ### 2026-05-22 — v0.13.0: verify + repair, trailing-args separator, dependency hardening
 

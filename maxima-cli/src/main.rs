@@ -266,6 +266,15 @@ enum Mode {
         #[arg(long)]
         wine_prefix: Option<String>,
     },
+    /// Register Maxima's URL protocol handlers with the host OS. On macOS
+    /// this registers MaximaBootstrap.app (built by
+    /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
+    /// link2ea:// and origin2:// — required for OAuth login redirects
+    /// without Draconis's MaximaHelper, and for catching link2ea:// from
+    /// externally-launched games (routed out of the bottle via
+    /// winebrowser). On Linux this writes the maxima-*.desktop handlers.
+    /// No login required.
+    RegisterProtocols,
     /// Report the wine prefix / CrossOver bottle and default install
     /// location Maxima would use for a game — WITHOUT creating anything.
     /// Lets consumers (Draconis) place per-title files (e.g. Northstar)
@@ -577,7 +586,10 @@ async fn startup(args: Args) -> Result<()> {
     // storage and run with a dummy local user. `matches!` lets us
     // ignore the rest of the Launch fields cleanly — they don't
     // affect this decision.
-    let skip_login = matches!(args.mode, Some(Mode::Launch { login: Some(_), .. }));
+    let skip_login = matches!(
+        args.mode,
+        Some(Mode::Launch { login: Some(_), .. }) | Some(Mode::RegisterProtocols)
+    );
 
     let options = MaximaOptionsBuilder::default()
         .load_auth_storage(!skip_login)
@@ -876,6 +888,19 @@ async fn startup(args: Args) -> Result<()> {
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::BottleInfo { slug, json } => bottle_info(maxima_arc.clone(), &slug, json).await,
+        Mode::RegisterProtocols => {
+            #[cfg(unix)]
+            {
+                maxima::util::registry::set_up_registry()?;
+                info!("Protocol handlers registered");
+            }
+            #[cfg(windows)]
+            info!(
+                "On Windows, protocol registration is handled by the installer / \
+                 maxima-service (see request_registry_setup)."
+            );
+            Ok(())
+        }
     }?;
 
     Ok(())
