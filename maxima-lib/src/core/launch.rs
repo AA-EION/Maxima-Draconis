@@ -590,7 +590,7 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
     nucleus_auth_exchange(&context, JUNO_PC_CLIENT_ID, "token").await
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub async fn mx_linux_setup() -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
@@ -611,6 +611,30 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
         if !check_runtime_validity("umu", &runtimes).await? {
             install_runtime("umu", &runtimes).await?;
         }
+    }
+
+    setup_wine_registry().await?;
+
+    Ok(())
+}
+
+/// macOS variant: games run through a CrossOver bottle — no wine/umu
+/// auto-install here. The bottle is normally selected (and created on
+/// demand) by `crossover::ensure_game_bottle`, which exports
+/// MAXIMA_WINE_PREFIX for this process and its children; we require it here
+/// so an unwired call path fails with a clear message instead of wine
+/// silently creating a fresh prefix at ~/.local/share/maxima/wine/prefix.
+#[cfg(target_os = "macos")]
+pub async fn mx_linux_setup() -> Result<(), NativeError> {
+    use crate::unix::wine::setup_wine_registry;
+
+    if std::env::var("MAXIMA_WINE_PREFIX").is_err() {
+        return Err(NativeError::MissingEnvironmentVariable(
+            "MAXIMA_WINE_PREFIX (no bottle selected — `maxima-cli install`/`launch` \
+             auto-create a per-game CrossOver bottle; set this manually for `serve` \
+             or a custom prefix)"
+                .to_string(),
+        ));
     }
 
     setup_wine_registry().await?;

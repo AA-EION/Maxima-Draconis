@@ -340,19 +340,38 @@ impl<'a> EntryDownloadRequest<'a> {
         let offset = self.entry.data_offset();
         let range = format!("bytes={}-{}", offset + start as i64, offset + end - 1);
 
-        let data = match self
-            .client
-            .get(self.url)
-            .header("range", range)
-            .send()
-            .await
-        {
-            Ok(res) => res,
-            Err(err) => {
+        // `send()` resolves when response HEADERS arrive — a GET issued on a
+        // wedged keepalive connection can hang here forever, before any body
+        // exists for ByteCountingStream's stall watchdog to guard (observed:
+        // install frozen at 89% with two header-less GETs ESTABLISHED for
+        // minutes). Bound it so the retry layer gets a fresh attempt.
+        let send_result = tokio::time::timeout(
+            RESPONSE_HEADER_TIMEOUT,
+            self.client.get(self.url).header("range", range).send(),
+        )
+        .await;
+
+        let data = match send_result {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
                 error!("Failed to download ({}): {}", self.entry.name(), err);
                 return Err(DownloaderError::Download(DownloadError::ChunkDownload {
                     entry: self.entry.name().clone(),
                     error: err,
+                }));
+            }
+            Err(_elapsed) => {
+                error!(
+                    "No response headers for {} within {:?}; treating connection as dead",
+                    self.entry.name(),
+                    RESPONSE_HEADER_TIMEOUT
+                );
+                return Err(DownloaderError::Download(DownloadError::ChunkCopy {
+                    entry: self.entry.name().clone(),
+                    error: tokio::io::Error::new(
+                        tokio::io::ErrorKind::TimedOut,
+                        format!("no response headers within {:?}", RESPONSE_HEADER_TIMEOUT),
+                    ),
                 }));
             }
         };
@@ -430,7 +449,12 @@ impl ZipDownloader {
             id: id.to_owned(),
             url: zip_url.to_owned(),
             path,
-            client: Client::builder().build()?,
+            // connect_timeout only — no total timeout, since this client
+            // streams multi-GB entries; mid-stream stalls are caught by
+            // ByteCountingStream's DOWNLOAD_STALL_TIMEOUT watchdog.
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()?,
             manifest,
         })
     }
@@ -445,12 +469,23 @@ impl ZipDownloader {
 
         let range_header = format!("bytes={}-{}", offset, offset + compressed_size - 1);
 
-        let response = self
-            .client
-            .get(&self.url)
-            .header("Range", range_header)
-            .send()
-            .await?;
+        // Same dead-connection guards as `download_range`: bound the wait
+        // for response headers, and bound the buffered body read by a
+        // generous size-scaled deadline (this path isn't streamed, so the
+        // stall watchdog can't cover it).
+        let timeout_err = |what: &str| {
+            DownloaderError::Download(DownloadError::ChunkCopy {
+                entry: entry.name().clone(),
+                error: tokio::io::Error::new(tokio::io::ErrorKind::TimedOut, what.to_string()),
+            })
+        };
+
+        let response = tokio::time::timeout(
+            RESPONSE_HEADER_TIMEOUT,
+            self.client.get(&self.url).header("Range", range_header).send(),
+        )
+        .await
+        .map_err(|_| timeout_err("no response headers"))??;
 
         if !response.status().is_success()
             && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
@@ -458,7 +493,12 @@ impl ZipDownloader {
             return Err(DownloaderError::Http(response.status()));
         }
 
-        let compressed_data = response.bytes().await?;
+        // 60s base + worst-case 50 KB/s floor for the entry body.
+        let body_deadline =
+            std::time::Duration::from_secs(60 + (compressed_size / 50_000).max(0) as u64);
+        let compressed_data = tokio::time::timeout(body_deadline, response.bytes())
+            .await
+            .map_err(|_| timeout_err("body read timed out"))??;
         let decompressed_data = match entry.compression_type() {
             CompressionType::None => {
                 let entry_size = *entry.uncompressed_size() as u64;
@@ -665,10 +705,24 @@ impl ZipDownloader {
     }
 }
 
+/// How long a download may go without receiving a single byte before we
+/// treat the connection as dead. reqwest 0.11 has no read/stall timeout of
+/// its own, and EA's CDN connections do stall silently mid-transfer
+/// (observed: ESTABLISHED socket, zero bytes moving, forever). The timeout
+/// error surfaces as `ChunkCopy` and is handled by the retry+backoff loop
+/// in `EntryDownloadRequest::download`.
+const DOWNLOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait for response HEADERS after sending a request. Covers the
+/// hang `DOWNLOAD_STALL_TIMEOUT` can't: `send()` never resolving because the
+/// server (or a dead keepalive connection) never answers.
+const RESPONSE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct ByteCountingStream<'a, S> {
     inner: S,
     byte_count: usize,
     callback: Option<&'a BytesDownloadedCallback>,
+    stall_deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
 
 impl<'a, S> ByteCountingStream<'a, S>
@@ -680,6 +734,7 @@ where
             inner,
             byte_count: 0,
             callback,
+            stall_deadline: Box::pin(tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT)),
         }
     }
 
@@ -706,6 +761,11 @@ where
                     callback(chunk.len());
                 }
 
+                // Data arrived — push the stall deadline out.
+                self.stall_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + DOWNLOAD_STALL_TIMEOUT);
+
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(Some(Err(err))) => {
@@ -715,7 +775,27 @@ where
                 ))))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                // No data — if the stall deadline fires, kill the transfer
+                // so the retry layer can re-attempt on a fresh connection.
+                use std::future::Future;
+                match self.stall_deadline.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        error!(
+                            "Download stalled: no data for {:?} after {} bytes",
+                            DOWNLOAD_STALL_TIMEOUT, self.byte_count
+                        );
+                        std::task::Poll::Ready(Some(Err(tokio::io::Error::new(
+                            tokio::io::ErrorKind::TimedOut,
+                            format!(
+                                "download stalled (no data for {:?})",
+                                DOWNLOAD_STALL_TIMEOUT
+                            ),
+                        ))))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }
         }
     }
 }

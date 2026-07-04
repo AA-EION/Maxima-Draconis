@@ -213,6 +213,14 @@ pub async fn get_wine_pid(launch_id: &str, name: &str) -> Result<u32, NativeErro
     wine_get_pid(launch_id, name).await
 }
 
+// macOS: no wine-helper.exe / background service; PID lookup is only used for
+// Kyber DLL injection, which Wine on macOS can't do anyway. 0 = "not found",
+// same contract as the windows stub above.
+#[cfg(target_os = "macos")]
+pub async fn get_wine_pid(_launch_id: &str, _name: &str) -> Result<u32, NativeError> {
+    Ok(0)
+}
+
 pub struct Connection {
     maxima: LockedMaxima,
     stream: TcpStream,

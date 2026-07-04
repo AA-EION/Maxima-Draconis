@@ -115,8 +115,10 @@ enum Mode {
         /// Absolute path to install into. Will be created if missing. If
         /// it already contains a different game's files, behavior is
         /// `install_now`'s problem — Maxima doesn't try to dry-run.
+        /// On macOS this is optional: it defaults to `drive_c/Games/<slug>`
+        /// inside the game's auto-created CrossOver bottle.
         #[arg(long)]
-        path: String,
+        path: Option<String>,
 
         /// Specific build ID to install. Defaults to the live (latest)
         /// build advertised by the EA content service.
@@ -672,6 +674,19 @@ async fn startup(args: Args) -> Result<()> {
                 slug.clone()
             };
 
+            // macOS: select/create the per-game CrossOver bottle before
+            // anything touches wine — the license dir, regedit, and the
+            // spawned game all resolve the prefix via wine_prefix_dir(),
+            // which ensure_game_bottle exports for this process and its
+            // children.
+            #[cfg(target_os = "macos")]
+            let mx_bottle = {
+                let bottle_slug = canonical_slug(maxima_arc.clone(), &slug).await;
+                let bottle =
+                    maxima::unix::crossover::ensure_game_bottle(&bottle_slug).await?;
+                (bottle_slug, bottle)
+            };
+
             // If the slug was a Steam App ID, the game is installed under
             // Steam's library, not EA Desktop's. `launch::start_game` would
             // bail with `NotInstalled` because EA's metadata doesn't know
@@ -699,6 +714,25 @@ async fn startup(args: Args) -> Result<()> {
             } else {
                 game_path
             };
+
+            // macOS: with no explicit or Steam-discovered path, fall back to
+            // the conventional per-bottle install location `maxima-cli
+            // install` uses (drive_c/Games/<slug> inside the game's bottle).
+            // launch::start_game resolves a directory to the actual exe via
+            // the STEAM_GAMES table.
+            #[cfg(target_os = "macos")]
+            let resolved_game_path = resolved_game_path.or_else(|| {
+                let conventional = mx_bottle.1.join("drive_c/Games").join(&mx_bottle.0);
+                if conventional.exists() {
+                    info!(
+                        "No --game-path given; using bottle install dir {}",
+                        conventional.display()
+                    );
+                    Some(conventional.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
 
             // Steam-Play detection: if the original slug was a numeric
             // Steam App ID, surface it via `LaunchOptions.steam_app_id`.
@@ -729,6 +763,33 @@ async fn startup(args: Args) -> Result<()> {
             only_listed_files,
             json,
         } => {
+            // macOS: select/create the per-game CrossOver bottle before the
+            // install — the touchup steps (vcredist etc.) run through wine
+            // and resolve the prefix via wine_prefix_dir() — and default
+            // --path into that bottle.
+            #[cfg(target_os = "macos")]
+            let path = {
+                let bottle_slug = canonical_slug(maxima_arc.clone(), &slug).await;
+                let bottle =
+                    maxima::unix::crossover::ensure_game_bottle(&bottle_slug).await?;
+                match path {
+                    Some(p) => p,
+                    None => {
+                        let p = bottle.join("drive_c/Games").join(&bottle_slug);
+                        info!(
+                            "No --path given; installing into the game's bottle: {}",
+                            p.display()
+                        );
+                        p.to_string_lossy().to_string()
+                    }
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let Some(path) = path
+            else {
+                bail!("--path is required");
+            };
+
             install_game(
                 maxima_arc.clone(),
                 &slug,
@@ -1322,6 +1383,42 @@ async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
 /// once per second, then `{"event":"done",…}` on success or
 /// `{"event":"error",…}` on failure. Logger stdout is already suppressed
 /// by `main()` when `--json` is set.
+/// Resolve whatever the user typed (slug, offer id, Steam App ID, content
+/// id…) to the EA library's canonical slug where possible. Used to name
+/// per-game CrossOver bottles consistently: `install titanfall-2`,
+/// `launch Origin.OFR.50.0001456` and `launch 1237970` must all land in the
+/// same `Maxima-titanfall-2` bottle. Falls back to the typed string when the
+/// library doesn't know it (offline/dummy login, unlinked accounts).
+#[cfg(target_os = "macos")]
+async fn canonical_slug(maxima_arc: LockedMaxima, typed: &str) -> String {
+    let typed_s = typed.to_string();
+    let mut maxima = maxima_arc.lock().await;
+
+    if let Ok(Some(offer)) = maxima.mut_library().game_by_base_slug(typed).await {
+        return offer.slug().clone();
+    }
+    if let Ok(Some(offer)) = maxima.mut_library().game_by_base_offer(typed).await {
+        return offer.slug().clone();
+    }
+    // Exhaustive scan — same property set Mode::Launch's resolution uses.
+    if let Ok(games) = maxima.mut_library().games().await {
+        for game in games {
+            let base = game.base_offer();
+            if base.slug() == &typed_s
+                || base.offer_id() == &typed_s
+                || base.product().id() == &typed_s
+                || base.product().origin_offer_id() == &typed_s
+                || base.offer().content_id() == &typed_s
+                || base.product().product().id() == &typed_s
+            {
+                return base.slug().clone();
+            }
+        }
+    }
+
+    typed_s
+}
+
 async fn install_game(
     maxima_arc: LockedMaxima,
     slug: &str,
@@ -1602,6 +1699,10 @@ async fn install_game(
         .build_id(build_id.clone())
         .path(install_path.clone())
         .build()?;
+
+    if !json {
+        info!("Resolving download URL and fetching the build manifest (can take a minute)...");
+    }
 
     let start_time = Instant::now();
     {

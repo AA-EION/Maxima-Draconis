@@ -292,7 +292,7 @@ async fn main() -> Result<(), RunError> {
 
 #[cfg(target_os = "macos")]
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), RunError> {
     use cacao::appkit::App;
 
     use crate::macos::MaximaBootstrapApp;

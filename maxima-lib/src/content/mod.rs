@@ -71,18 +71,35 @@ impl ContentService {
             return Ok(cached);
         }
 
-        let url: ServiceDownloadUrlMetadata = self
-            .service_layer
-            .request(
-                SERVICE_REQUEST_DOWNLOADURL,
-                ServiceDownloadUrlRequestBuilder::default()
-                    .offer_id(offer_id.to_owned())
-                    .build_id(build_id.unwrap_or_default().to_owned())
-                    .build()?,
-            )
-            .await?;
+        // Read-only query — retry a few times with backoff. EA's API can
+        // stall/timeout transiently (the client has a 60s cap), and one
+        // flaky response shouldn't fail an install queue.
+        let mut last_err = None;
+        for attempt in 0u32..4 {
+            let request = ServiceDownloadUrlRequestBuilder::default()
+                .offer_id(offer_id.to_owned())
+                .build_id(build_id.unwrap_or_default().to_owned())
+                .build()?;
 
-        self.request_cache.insert(cache_key, url.clone());
-        Ok(url)
+            match self
+                .service_layer
+                .request::<_, ServiceDownloadUrlMetadata>(SERVICE_REQUEST_DOWNLOADURL, request)
+                .await
+            {
+                Ok(url) => {
+                    self.request_cache.insert(cache_key, url.clone());
+                    return Ok(url);
+                }
+                Err(err) => {
+                    log::warn!("download_url attempt {}/4 failed: {}", attempt + 1, err);
+                    last_err = Some(err);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2u64 << attempt))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(last_err.expect("at least one attempt"))
     }
 }

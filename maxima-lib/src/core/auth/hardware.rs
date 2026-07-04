@@ -3,8 +3,21 @@ use gethostname::gethostname;
 use hex::ToHex;
 use regex::Regex;
 use ring::digest::SHA1_FOR_LEGACY_USE_ONLY;
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::CpuidResult;
 use thiserror::Error;
+
+/// aarch64 has no cpuid; same-shape stand-in so the hash composition code
+/// stays portable. Zeroed flags are fine — the hash only needs per-machine
+/// stability, not real x86 feature bits.
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy)]
+pub struct CpuidResult {
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}
 
 #[derive(Debug)]
 pub struct CpuDetails {
@@ -255,9 +268,16 @@ impl HardwareInfo {
 
         use crate::util::system_profiler_utils::SPDisplaysDataType;
 
-        let smbios_data = table_load_from_device().unwrap();
-        let bios_data = smbios_data.first::<SMBiosSystemInformation>();
-        let board_data = smbios_data.first::<SMBiosBaseboardInformation>();
+        // Apple Silicon Macs have no SMBIOS — fall back to the defaults
+        // below; MAC address, disk UUID and hostname still make the hash
+        // unique and stable per machine.
+        let smbios_data = table_load_from_device().ok();
+        let bios_data = smbios_data
+            .as_ref()
+            .and_then(|d| d.first::<SMBiosSystemInformation>());
+        let board_data = smbios_data
+            .as_ref()
+            .and_then(|d| d.first::<SMBiosBaseboardInformation>());
 
         let mut board_manufacturer = String::from("Apple Inc.");
         let mut board_sn = String::from("None");
@@ -286,9 +306,11 @@ impl HardwareInfo {
             .unwrap();
         if output.status.success() {
             let json = String::from_utf8_lossy(&output.stdout);
-            let result: SPDisplaysDataType = serde_json::from_str(&json).unwrap();
+            // Apple GPUs expose no PCI device/revision ids in this output —
+            // parse failure just means no gpu_pnp_id, which the hash allows.
+            let result: Option<SPDisplaysDataType> = serde_json::from_str(&json).ok();
 
-            if let Some(gpu) = result.items.first() {
+            if let Some(gpu) = result.as_ref().and_then(|r| r.items.first()) {
                 gpu_pnp_id = Some(generate_pci_pnp_id(
                     version,
                     None,
@@ -349,6 +371,31 @@ impl HardwareInfo {
         }
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn get_cpu_details() -> CpuDetails {
+        // No cpuid on Apple Silicon; sysctl gives a stable brand string and
+        // zeroed flags keep the hash deterministic.
+        let brand_name = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "Apple Silicon".to_string());
+
+        CpuDetails {
+            flags: CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+            manufacturer: "Apple".to_string(),
+            brand_name,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     pub fn get_cpu_details() -> CpuDetails {
         use core::arch::x86_64::__cpuid;
 
@@ -593,5 +640,21 @@ fn get_ea_mac_address() -> Option<String> {
             Some("$".to_owned() + &mac)
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the Apple Silicon path: no SMBIOS, no cpuid, no PCI GPU ids —
+    // HardwareInfo::new must still produce a non-empty hash without panicking.
+    #[test]
+    fn hardware_info_builds_without_panicking() {
+        for version in [1, 2] {
+            let info = HardwareInfo::new(version);
+            assert!(!info.generate_hardware_hash().is_empty());
+            assert!(!info.generate_mid().unwrap().is_empty());
+        }
     }
 }

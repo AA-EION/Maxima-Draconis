@@ -142,7 +142,15 @@ impl ServiceLayerClient {
     pub fn new(auth: LockedAuthStorage) -> Self {
         Self {
             auth,
-            client: Client::new(),
+            // Small JSON/GraphQL calls only — a stalled connection must
+            // error out instead of hanging the caller forever (observed
+            // with EA endpoints mid-install). Client build only fails on
+            // TLS backend init, which is fatal at startup anyway.
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 

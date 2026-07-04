@@ -72,8 +72,20 @@ struct Versions {
 
 /// Returns internal prtoton pfx path
 pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
+    // Override to target an existing prefix — on macOS this is how a
+    // CrossOver bottle is selected, e.g.
+    // MAXIMA_WINE_PREFIX="$HOME/Library/Application Support/CrossOver/Bottles/Titanfall 2"
+    if let Ok(prefix) = env::var("MAXIMA_WINE_PREFIX") {
+        return Ok(PathBuf::from(prefix));
+    }
     Ok(maxima_dir()?.join("wine/prefix"))
 }
+
+/// CrossOver's wine loader on macOS — used as the default wine command
+/// when present and MAXIMA_WINE_COMMAND isn't set.
+#[cfg(target_os = "macos")]
+pub const CROSSOVER_WINE: &str =
+    "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine";
 
 pub fn proton_dir() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/proton"))
@@ -246,13 +258,18 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let eac_path = eac_dir()?;
     let umu_bin = umu_bin()?;
 
-    let wine_path =
-        env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| umu_bin.to_string_lossy().to_string());
+    let wine_path = env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| {
+        #[cfg(target_os = "macos")]
+        if std::path::Path::new(CROSSOVER_WINE).exists() {
+            return CROSSOVER_WINE.to_string();
+        }
+        umu_bin.to_string_lossy().to_string()
+    });
 
     // Create command with all necessary wine env variables
     let mut binding = Command::new(wine_path.clone());
     let mut child = binding
-        .env("WINEPREFIX", proton_prefix_path)
+        .env("WINEPREFIX", &proton_prefix_path)
         .env("GAMEID", "umu-0")
         .env("PROTON_VERB", &command_type.to_string())
         .env("PROTONPATH", proton_path)
@@ -269,6 +286,14 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             "WINEDLLOVERRIDES",
             "CryptBase,wsock32,bcrypt,dxgi,d3d11,d3d12,d3d12core=n,b;winemenubuilder.exe=d",
         );
+    }
+
+    // CrossOver's wine wrapper selects bottles by name (CX_BOTTLE); derive it
+    // from the prefix dir so WINEPREFIX and CX_BOTTLE agree. Harmless for
+    // non-CrossOver wine, which ignores the variable.
+    #[cfg(target_os = "macos")]
+    if let Some(bottle) = proton_prefix_path.file_name().and_then(|n| n.to_str()) {
+        child = child.env("CX_BOTTLE", bottle);
     }
 
     if let Some(arguments) = args {
@@ -517,6 +542,19 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         (
             "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\EA Desktop",
             &[("InstallSuccessful", "true")],
+        ),
+        // The key Origin-era titles actually read: real Origin is a 32-bit
+        // app, so on 64-bit Windows its install info lives at the BARE
+        // Wow6432Node\Origin (no Electronic Arts\ prefix). TF2 shows
+        // "Failed to initialize Origin: The Origin installation couldn't be
+        // found [a0020008]" without it. Same key the NSIS installer writes
+        // (installer/maxima-setup.nsi, SetRegView 64) for the in-bottle flow.
+        (
+            "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Origin",
+            &[
+                ("InstallSuccessful", "true"),
+                ("ClientPath", "C:/Windows/System32/conhost.exe"),
+            ],
         ),
         (
             "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\Origin",

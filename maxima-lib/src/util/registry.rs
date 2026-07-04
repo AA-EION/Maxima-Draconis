@@ -581,6 +581,12 @@ pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
 
 #[cfg(target_os = "macos")]
 pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
+    // Prefer a sibling binary (cargo build layout, same as linux); fall back
+    // to the .app bundle layout upstream planned for LaunchServices.
+    let sibling = module_path()?.safe_parent()?.join("maxima-bootstrap");
+    if sibling.exists() {
+        return Ok(sibling);
+    }
     Ok(module_path()?
         .safe_parent()?
         .join("bundle")

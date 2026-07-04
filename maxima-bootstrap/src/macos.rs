@@ -16,8 +16,13 @@ impl MaximaBootstrapApp {
 impl AppDelegate for MaximaBootstrapApp {
     fn did_finish_launching(&self) {
         self.rt.spawn(async {
-            if let Ok(true) = handle_launch_args().await {
-                App::terminate();
+            // Terminate on any completed outcome — Ok(false) means "no args,
+            // stay alive for open_urls"; Err must also terminate, otherwise a
+            // failed game launch leaves this process (and the parent's
+            // playing-state tracking) hanging forever.
+            match handle_launch_args().await {
+                Ok(false) => {}
+                _ => App::terminate(),
             }
         });
     }

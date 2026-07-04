@@ -8,7 +8,7 @@ If you're updating this file, the rule is: **state of the world first, history a
 
 ## What Maxima is
 
-Open-source replacement for the EA Desktop / Origin launcher. **Not** a macOS-native app — `maxima-cli` / `maxima-bootstrap` / `maxima-service` are Windows binaries that run **inside the CrossOver bottle** alongside Titanfall 2. The only piece that runs on the macOS host is `MaximaHelper.app`, a tiny Swift background agent that bridges EA's `qrc://` OAuth redirect from the user's browser into the bottle.
+Open-source replacement for the EA Desktop / Origin launcher. Historically **not** a macOS-native app — `maxima-cli` / `maxima-bootstrap` / `maxima-service` are Windows binaries that run **inside the CrossOver bottle** alongside Titanfall 2, with `MaximaHelper.app` as the only host-side piece (a tiny Swift agent bridging EA's `qrc://` OAuth redirect into the bottle). **As of 2026-07-04 there is additionally a native macOS mode** — `maxima-cli` / `maxima-bootstrap` compiled for `aarch64-apple-darwin` run directly on the host, manage per-game CrossOver bottles via `cxbottle`, and launch the game through CrossOver's wine. See "Native macOS mode" below. Both modes coexist; the in-bottle mode remains what shipped releases use until the native mode is productized.
 
 The Draconis fork is tested *only* for Titanfall 2 on macOS via CrossOver. Other configurations may work but aren't supported here.
 
@@ -260,6 +260,34 @@ Before this rewrite, every `link2ea://` invocation **fully re-bootstrapped Maxim
 Path A centralizes the auth-provider role in a long-running `serve` process. When `link2ea://` fires, bootstrap doesn't restart Maxima — it forwards to the running `serve` over HTTP, which already has cached login state. `serve` then calls the same `launch::start_game` path the upstream UI does (so the EA env vars end up on the re-spawned TF2 identically), but without paying for a fresh `maxima-cli` process startup each time.
 
 **An earlier draft of Path A skipped the game-spawn entirely** — the theory was that TF2 stayed alive polling LSX after emitting link2ea, so we just needed the auth server to refresh `.dlf` and TF2's polling would reconnect. Empirically TF2 *exits* after emitting link2ea (it expects EA Desktop to relaunch it), so a preflight-only `/authorize` leaves the game closed and the user sees "TF2 opens for a moment and then closes". The current design (spawn the game from `/authorize`) is the corrected version, aligned with upstream issue [#27](https://github.com/ArmchairDevelopers/Maxima/issues/27) ("Protocol handler should then use the obtained parameters to launch the game process").
+
+---
+
+## Native macOS mode (experimental, validated 2026-07-04)
+
+`maxima-cli` + `maxima-bootstrap` compile and run natively on `aarch64-apple-darwin`. TF2 validated end-to-end on this path: EA login on the host → `install titanfall-2` (auto-created CrossOver bottle, 71 GB download, touchup) → `launch titanfall-2` → game reaches gameplay. This is upstream's Linux-native architecture (host binary, game in a wine prefix) retargeted at CrossOver.
+
+```bash
+# The entire user flow — no env vars, no pre-made bottle:
+maxima-cli list-games            # first run does OAuth login on the host
+maxima-cli install titanfall-2   # creates bottle 'Maxima-titanfall-2', installs into it
+maxima-cli launch titanfall-2    # licenses + launches through CrossOver wine
+```
+
+How it works:
+
+- **Per-game bottles** (`maxima-lib/src/unix/crossover.rs`) — `ensure_game_bottle(slug)` creates/reuses a `Maxima-<slug>` bottle via CodeWeavers' `cxbottle --create --template win11_64|win10_64` (semi-documented CLI shipped with CrossOver). The bottle appears in the CrossOver UI; a custom bottle directory set in CrossOver's prefs is honored (`defaults read com.codeweavers.CrossOver BottleDir`). Selection precedence: explicit `MAXIMA_WINE_PREFIX` env always wins; else the per-game bottle is created and exported via that same env var, so the whole pipeline (license dir, regedit, spawned game) plus child processes follow. `install`/`launch` resolve whatever the user typed to the EA library's canonical slug (`canonical_slug` in `maxima-cli/src/main.rs`) so `titanfall-2`, `Origin.OFR.50.0001456` and `1237970` all land in the same bottle.
+- **Wine invocation** — `run_wine_command` (unix/wine.rs) auto-detects CrossOver's wine loader (`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`) when `MAXIMA_WINE_COMMAND` is unset, sets `CX_BOTTLE` from the prefix basename, and `wine_prefix_dir()` honors `MAXIMA_WINE_PREFIX`. Host env vars propagate through CrossOver's wine into the Windows environment (verified empirically) — that's how the EA-* auth env reaches the game.
+- **`mx_linux_setup` is split by OS** — the linux variant keeps the umu/Proton auto-install; the macOS variant requires a selected bottle and runs `setup_wine_registry` only.
+- **Registry: bare `Wow6432Node\Origin` is load-bearing** — real Origin is 32-bit, so Origin-era titles (TF2) read `HKLM\Software\Wow6432Node\Origin\ClientPath`. Upstream's `setup_wine_registry` didn't write it → "Failed to initialize Origin: The Origin installation couldn't be found [a0020008]" dialog at game boot. Now written (same key the NSIS installer sets for the in-bottle flow). Upstreambar.
+- **Apple Silicon hardware hash** (`core/auth/hardware.rs`) — no SMBIOS and no cpuid on arm64 Macs; both `.unwrap()`-panicked. SMBIOS values fall back to defaults (MAC + disk UUID + hostname keep the hash unique), cpu details come from `sysctl machdep.cpu.brand_string` with a same-shape `CpuidResult` stand-in. Guarded by a unit test (`hardware_info_builds_without_panicking`).
+- **OAuth login needs no bridge** — the native CLI binds the same host loopback `127.0.0.1:31033` that MaximaHelper already forwards `qrc://` to, so login works with Draconis's helper installed, or via the paste-redirect-URL fallback without it.
+- **Loopback is shared** — the game inside the bottle reaches the host's LSX (3216) and authorize (13219) listeners directly; wine does not virtualize networking.
+- **`maxima-bootstrap` (native)** — upstream's half-finished cacao AppKit main now compiles; a failed launch terminates the app instead of hanging the parent's playing-state tracking. `bootstrap_path()` prefers a sibling binary (cargo layout) over the planned `.app` bundle layout.
+
+**Downloader hardening** (all-targets, motivated by a flaky route to EA's CDN — three distinct stall modes observed in one install): every network phase is now bounded and self-healing. Connect 15s; response headers 60s (`RESPONSE_HEADER_TIMEOUT` — a GET on a dead keepalive connection previously hung `send()` forever with no body for the stall guard to watch); body stall 30s without a byte (`DOWNLOAD_STALL_TIMEOUT` via `ByteCountingStream`'s deadline — tolerates any transfer speed, unlike a total cap which kept expiring on slow-but-alive manifest reads); 4-attempt retry with backoff on the manifest fetch (`ZipFile::fetch`, streamed body) and `download_url`; 60s total cap on ServiceLayer JSON calls. Manifests are **cached on disk** after first success (`maxima_dir/cache/manifests/<fnv1a-of-url-path>.json` — the URL path names the immutable build artifact; the `sauth` query token rotates and is excluded), so reruns and repairs skip the CDN's flakiest request entirely.
+
+Known gaps in native mode: `serve` still needs `MAXIMA_WINE_PREFIX` set manually (no game context to pick a bottle from); `link2ea://` from externally-launched games needs the in-bottle `maxima-bootstrap.exe` registered (fresh native bottles don't have it — direct `maxima-cli launch` doesn't need it since the game gets its auth env up front); Northstar untested on this path; `maxima-ui`/Draconis not yet wired to the native binaries.
 
 ---
 
@@ -916,6 +944,19 @@ When TF2 emits `link2ea://`, bootstrap forwards to the running `serve` and exits
 ## Changelog (most recent first)
 
 History of significant changes since this fork was forked. Not a substitute for `git log` but useful for "when did X land" questions.
+
+### 2026-07-04 — Native macOS mode: host-side maxima-cli + per-game CrossOver bottles
+
+TF2 validated end-to-end running `maxima-cli` **natively on Apple Silicon** — login, install (into an auto-created bottle), and launch through CrossOver's wine, no in-bottle Maxima needed. See the "Native macOS mode" section up top for the architecture; summary of what landed:
+
+- **aarch64-apple-darwin compiles** — `compile_error!` gate narrowed ([lib.rs](maxima-lib/src/lib.rs)); Apple Silicon hardware hash (no SMBIOS / no cpuid — graceful fallbacks + sysctl brand string, unit-tested); macOS `get_wine_pid` stub; upstream's cacao bootstrap main fixed (signature + terminate-on-error).
+- **`maxima-lib/src/unix/crossover.rs`** — bottle management via `cxbottle`: `ensure_bottle` (create with newest win*_64 template, idempotent reuse, ignored round-trip test) + `ensure_game_bottle` (per-game `Maxima-<slug>` bottles, exports `MAXIMA_WINE_PREFIX`, explicit env always wins). `NativeError::CrossOverMissing` for the no-CrossOver case.
+- **CLI wiring** — `install --path` optional on macOS (defaults to `<bottle>/drive_c/Games/<slug>`); `launch` falls back to that conventional dir; `canonical_slug` keeps bottle naming consistent across slug/offer-id/Steam-id input forms.
+- **Wine plumbing** — `MAXIMA_WINE_PREFIX` override on `wine_prefix_dir()`; CrossOver wine auto-detected as default `MAXIMA_WINE_COMMAND`; `CX_BOTTLE` derived from prefix; `mx_linux_setup` split linux (umu auto-install) vs macOS (registry only, requires bottle).
+- **Registry fix (upstreambar)** — `setup_wine_registry` now writes bare `HKLM\Software\Wow6432Node\Origin` (`ClientPath`=conhost trick). Missing key = TF2's "[a0020008] Origin installation couldn't be found" dialog; it's the 32-bit-view location real Origin uses and the one the Origin SDK reads.
+- **Downloader hardening (all targets, upstreambar)** — every HTTP phase bounded + self-healing: connect timeout, response-header timeout (dead-keepalive `send()` hangs), body stall watchdog (30s no-data, any speed OK), retries with backoff on manifest fetch + `download_url`, ServiceLayer 60s cap, and an on-disk manifest cache keyed by URL path (immutable per build; `sauth` token excluded). Root-caused from three distinct real-world freezes: manifest fetch stall, headerless GETs at 89%, and total-cap expiry on slow-but-alive manifest reads.
+
+Not yet in native mode: `serve` bottle selection, in-bottle `link2ea://` handler registration, Northstar, UI. Shipped releases still use the in-bottle mode.
 
 ### 2026-05-22 — v0.13.0: verify + repair, trailing-args separator, dependency hardening
 
