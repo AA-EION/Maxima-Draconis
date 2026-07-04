@@ -87,6 +87,106 @@ pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
 pub const CROSSOVER_WINE: &str =
     "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine";
 
+/// CrossOver's launch helper. Games/installers are handed off through this
+/// instead of running `wine` as our descendant: cxstart makes the launch
+/// behave exactly like double-clicking the exe inside CrossOver's UI, with
+/// CrossOver owning the process tree. Running wine directly works from a
+/// shell but freezes the game's renderer (blank window right after LSX
+/// GetAllGameInfo) when Maxima itself is a `.app`-launched GUI — the same
+/// failure Draconis solved by delegating to cxstart. Env vars still
+/// propagate into the Windows environment through cxstart (verified).
+#[cfg(target_os = "macos")]
+pub const CROSSOVER_CXSTART: &str =
+    "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxstart";
+
+/// Run a Windows exe via cxstart. cxstart exits right after the handoff, so
+/// wait-for-exit semantics are emulated by polling for the exe's process:
+/// grace period for it to appear (CrossOver cold start), then wait until
+/// it's gone.
+#[cfg(target_os = "macos")]
+async fn run_via_cxstart(
+    prefix: &std::path::Path,
+    exe: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+) -> Result<String, NativeError> {
+    use sysinfo::{ProcessExt, System, SystemExt};
+
+    let bottle = prefix
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    info!(
+        "Launching {:?} via cxstart (bottle '{}')",
+        exe, bottle
+    );
+
+    let mut cmd = Command::new(CROSSOVER_CXSTART);
+    cmd.arg("--bottle")
+        .arg(&bottle)
+        .arg(&exe)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let status = cmd.spawn()?.wait().await?;
+    if !status.success() {
+        return Err(NativeError::Wine(WineError::Command {
+            output: format!("cxstart handoff failed for {:?}", exe),
+            exit: status,
+        }));
+    }
+
+    let needle = std::path::Path::new(&exe)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if needle.is_empty() {
+        return Ok(String::new());
+    }
+
+    let running = |needle: &str| -> bool {
+        let sys = System::new_all();
+        sys.processes().values().any(|p| {
+            p.name().to_lowercase().contains(needle)
+                || p
+                    .cmd()
+                    .first()
+                    .map(|c| c.to_lowercase().contains(needle))
+                    .unwrap_or(false)
+        })
+    };
+
+    let mut appeared = false;
+    let mut gone_checks = 0u32;
+    for tick in 0u32.. {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if running(&needle) {
+            if !appeared {
+                info!("{} is running (cxstart handoff complete)", needle);
+            }
+            appeared = true;
+            gone_checks = 0;
+        } else if appeared {
+            gone_checks += 1;
+            if gone_checks >= 2 {
+                info!("{} exited", needle);
+                break;
+            }
+        } else if tick > 30 {
+            warn!(
+                "{} never appeared after cxstart handoff (waited ~60s); treating launch as done",
+                needle
+            );
+            break;
+        }
+    }
+
+    Ok(String::new())
+}
+
 pub fn proton_dir() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/proton"))
 }
@@ -257,6 +357,28 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let proton_prefix_path = wine_prefix_dir()?;
     let eac_path = eac_dir()?;
     let umu_bin = umu_bin()?;
+
+    // macOS + auto-detected CrossOver + fire-and-monitor commands (games,
+    // installers): hand off through cxstart — see run_via_cxstart. A
+    // user-set MAXIMA_WINE_COMMAND opts out (their engine, their rules);
+    // output-capturing calls (regedit parses, version checks) keep the
+    // direct wine invocation, which is fine for non-rendering processes.
+    #[cfg(target_os = "macos")]
+    if !want_output
+        && env::var("MAXIMA_WINE_COMMAND").is_err()
+        && std::path::Path::new(CROSSOVER_CXSTART).exists()
+    {
+        let exe: std::ffi::OsString = arg.as_ref().to_owned();
+        let arg_vec: Vec<std::ffi::OsString> = args
+            .map(|list| {
+                list.into_iter()
+                    .map(|a| a.as_ref().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = command_type; // cxstart has no verb concept
+        return run_via_cxstart(&proton_prefix_path, exe, arg_vec).await;
+    }
 
     let wine_path = env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| {
         #[cfg(target_os = "macos")]

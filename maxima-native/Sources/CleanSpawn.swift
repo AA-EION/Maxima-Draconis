@@ -28,11 +28,17 @@ enum CleanSpawn {
 
     private typealias DisclaimFn = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
     private static let disclaim: DisclaimFn? = {
-        guard let sym = dlsym(
-            UnsafeMutableRawPointer(bitPattern: -2), // RTLD_DEFAULT
-            "responsibility_spawnattrs_setdisclaim"
-        ) else { return nil }
-        return unsafeBitCast(sym, to: DisclaimFn.self)
+        // Resolve via dlopen(nil, RTLD_LAZY) — the exact pattern Draconis's
+        // CleanSpawn uses and has validated in production. An earlier
+        // RTLD_DEFAULT shortcut here failed silently, leaving the wine tree
+        // responsibility-attributed to the app — background-throttled the
+        // moment the game window took focus (frozen blank screen).
+        guard let handle = dlopen(nil, RTLD_LAZY) else { return nil }
+        defer { dlclose(handle) }
+        guard let symbol = dlsym(handle, "responsibility_spawnattrs_setdisclaim") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: DisclaimFn.self)
     }()
 
     /// Spawn `executable` with the given stdio descriptors dup2'd to 0/1/2.

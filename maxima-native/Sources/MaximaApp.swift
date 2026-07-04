@@ -3,9 +3,23 @@ import SwiftUI
 /// Maxima's brand orange — same value as the egui UI's `F9B233` accent.
 let maximaOrange = Color(red: 249 / 255, green: 178 / 255, blue: 51 / 255)
 
+/// Held for the app's lifetime: Maxima.app must never App Nap. macOS
+/// responsibility-attributes the backend — and transitively the wine/game
+/// tree — to this app, and a napped responsible app background-throttles
+/// the whole tree (the game renders a frozen blank window). Public-API
+/// safety net alongside CleanSpawn's responsibility disclaim.
+private let napPreventionToken: NSObjectProtocol = ProcessInfo.processInfo.beginActivity(
+    options: [.userInitiated, .idleSystemSleepDisabled],
+    reason: "Maxima keeps its game session backend responsive"
+)
+
 @main
 struct MaximaApp: App {
     @StateObject private var store = GameStore()
+
+    init() {
+        _ = napPreventionToken
+    }
 
     var body: some Scene {
         WindowGroup {
