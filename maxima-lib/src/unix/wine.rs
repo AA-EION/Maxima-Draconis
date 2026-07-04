@@ -327,7 +327,20 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         }
         status = output.status;
     } else {
-        status = child.spawn()?.wait().await?;
+        // No output wanted → give wine null stdio instead of inheriting.
+        // Inherited descriptors from a GUI frontend (JSONL pipes, app fds)
+        // reach the game and confuse wine's macOS driver (TF2 freezes after
+        // LSX GetAllGameInfo — see launch.rs bootstrap spawn note), and
+        // wine's fixme spam would otherwise pollute a parent's stdout
+        // protocol. Wine's own logs (CX_LOG / maxima log files) keep the
+        // diagnostics.
+        status = child
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?
+            .wait()
+            .await?;
     };
 
     if !status.success() {

@@ -430,6 +430,22 @@ pub async fn start_game(
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
 
+    // Detach the game tree's stdio from whatever spawned us. When Maxima
+    // runs as a GUI frontend's child (ui-backend under maxima-native, or a
+    // one-shot launch spawned by an app), inherited pipes/descriptors
+    // connected to that app reach wine and the game — and wine's macOS
+    // driver chokes on GUI-app descriptors: TF2 reproducibly freezes right
+    // after LSX GetAllGameInfo. Same root cause Draconis documents in its
+    // CleanSpawn service; files-or-null stdio is the shell-equivalent
+    // context wine expects. Diagnostics are unaffected: bootstrap and wine
+    // log to files. Windows keeps console inheritance (useful there, no
+    // wine involved).
+    #[cfg(unix)]
+    child
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
     let bootstrap_args = BootstrapLaunchArgs {
         path: path.to_string(),
         args: game_args,
