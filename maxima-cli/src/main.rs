@@ -87,6 +87,15 @@ enum Mode {
         /// Merged with `game_args` before being forwarded to the game.
         #[arg(last = true)]
         trailing_args: Vec<String>,
+
+        /// Emit structured launch lifecycle events as JSONL on stdout
+        /// (log output suppressed): `{"event":"launched",...}` once the
+        /// game process is spawned, `{"event":"exited","elapsed_secs":…}`
+        /// when it stops, `{"event":"error","message":…}` on failure (plus
+        /// non-zero exit). For consumers like Draconis that drive launches
+        /// programmatically instead of scraping log lines.
+        #[arg(long)]
+        json: bool,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -248,6 +257,29 @@ enum Mode {
         /// the game update your status normally.
         #[arg(long)]
         no_rtm: bool,
+
+        /// Wine prefix (CrossOver bottle path) to operate against. `serve`
+        /// has no game context to auto-pick a per-game bottle from, so
+        /// consumers that need `/authorize` to spawn games (Steam-installed
+        /// titles, link2ea flows) pass the bottle here. Equivalent to
+        /// setting MAXIMA_WINE_PREFIX. Unix-only; ignored on Windows.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+    },
+    /// Report the wine prefix / CrossOver bottle and default install
+    /// location Maxima would use for a game — WITHOUT creating anything.
+    /// Lets consumers (Draconis) place per-title files (e.g. Northstar)
+    /// into the right game dir without re-deriving Maxima's bottle-naming
+    /// policy. `exists` flags tell whether the bottle / game dir are
+    /// actually present yet.
+    BottleInfo {
+        /// Slug, offer_id, or content_id — resolved to the canonical slug
+        /// the same way `launch` / `install` name their bottle.
+        slug: String,
+
+        /// Emit a single JSON object on stdout instead of log lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -403,6 +435,8 @@ fn json_mode(args: &Args) -> bool {
         Some(Mode::ListGames { json: true })
             | Some(Mode::Install { json: true, .. })
             | Some(Mode::Verify { json: true, .. })
+            | Some(Mode::Launch { json: true, .. })
+            | Some(Mode::BottleInfo { json: true, .. })
     )
 }
 
@@ -589,6 +623,7 @@ async fn startup(args: Args) -> Result<()> {
             game_args,
             login,
             trailing_args,
+            json,
         } => {
             // Merge the explicit `--game-args` repetitions with the
             // post-`--` trailing args. `--game-args` first so order is
@@ -750,6 +785,7 @@ async fn startup(args: Args) -> Result<()> {
                 login,
                 steam_app_id,
                 maxima_arc.clone(),
+                json,
             )
             .await
         }
@@ -828,7 +864,18 @@ async fn startup(args: Args) -> Result<()> {
             build_id,
             file,
         } => download_specific_file(maxima_arc.clone(), &offer_id, &build_id, &file).await,
-        Mode::Serve { no_rtm } => serve_lsx(maxima_arc.clone(), no_rtm).await,
+        Mode::Serve {
+            no_rtm,
+            wine_prefix,
+        } => {
+            if let Some(prefix) = wine_prefix {
+                // Same override wine_prefix_dir() reads; the flag is just a
+                // discoverable front for it.
+                std::env::set_var("MAXIMA_WINE_PREFIX", prefix);
+            }
+            serve_lsx(maxima_arc.clone(), no_rtm).await
+        }
+        Mode::BottleInfo { slug, json } => bottle_info(maxima_arc.clone(), &slug, json).await,
     }?;
 
     Ok(())
@@ -883,7 +930,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone()).await?;
+    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone(), false).await?;
 
     Ok(())
 }
@@ -2061,6 +2108,99 @@ async fn verify_game(
     Ok(())
 }
 
+/// Read-only readout of the wine prefix / CrossOver bottle and default game
+/// dir Maxima would use for `slug` — creates nothing. Consumers (Draconis)
+/// use this to place per-title files (Northstar, mods) into the right
+/// install dir without re-deriving Maxima's bottle-naming policy.
+async fn bottle_info(maxima_arc: LockedMaxima, slug: &str, json: bool) -> Result<()> {
+    use std::io::Write;
+
+    // Canonical slug drives bottle naming; falls back to the typed slug
+    // when the library doesn't know it.
+    #[cfg(target_os = "macos")]
+    let slug = canonical_slug(maxima_arc.clone(), slug).await;
+    #[cfg(not(target_os = "macos"))]
+    let slug = {
+        let _ = &maxima_arc;
+        slug.to_string()
+    };
+
+    let env_prefix = std::env::var("MAXIMA_WINE_PREFIX").ok().map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    let (bottle_name, prefix): (Option<String>, Option<PathBuf>) = match env_prefix {
+        Some(p) => (
+            p.file_name().map(|n| n.to_string_lossy().to_string()),
+            Some(p),
+        ),
+        None => {
+            let name = format!("Maxima-{}", slug);
+            let p = maxima::unix::crossover::bottles_dir()
+                .ok()
+                .map(|d| d.join(&name));
+            (Some(name), p)
+        }
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (bottle_name, prefix): (Option<String>, Option<PathBuf>) = match env_prefix {
+        Some(p) => (
+            p.file_name().map(|n| n.to_string_lossy().to_string()),
+            Some(p),
+        ),
+        None => (None, maxima::unix::wine::wine_prefix_dir().ok()),
+    };
+    #[cfg(windows)]
+    let (bottle_name, prefix): (Option<String>, Option<PathBuf>) = (None, None);
+
+    let game_dir = prefix
+        .as_ref()
+        .map(|p| p.join("drive_c").join("Games").join(&slug));
+    let prefix_exists = prefix
+        .as_ref()
+        .map(|p| p.join("system.reg").exists())
+        .unwrap_or(false);
+    let game_dir_exists = game_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "slug": slug,
+                "bottle_name": bottle_name,
+                "wine_prefix": prefix.as_ref().map(|p| p.display().to_string()),
+                "wine_prefix_exists": prefix_exists,
+                "default_game_dir": game_dir.as_ref().map(|p| p.display().to_string()),
+                "game_dir_exists": game_dir_exists,
+            })
+        );
+        let _ = std::io::stdout().flush();
+    } else {
+        info!("slug:             {}", slug);
+        info!(
+            "bottle:           {} (exists: {})",
+            bottle_name.as_deref().unwrap_or("-"),
+            prefix_exists
+        );
+        info!(
+            "wine prefix:      {}",
+            prefix
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        info!(
+            "default game dir: {} (exists: {})",
+            game_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            game_dir_exists
+        );
+    }
+
+    Ok(())
+}
+
 async fn locate_game(maxima_arc: LockedMaxima, path: &str) -> Result<()> {
     let path = PathBuf::from(path);
     let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
@@ -2107,6 +2247,53 @@ async fn start_game(
     login: Option<String>,
     steam_app_id: Option<String>,
     maxima_arc: LockedMaxima,
+    json: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    let start_ts = Instant::now();
+    let result = start_game_inner(
+        offer_id,
+        game_path_override,
+        game_args,
+        login,
+        steam_app_id,
+        maxima_arc,
+        json,
+    )
+    .await;
+
+    if json {
+        match &result {
+            Ok(()) => println!(
+                "{}",
+                serde_json::json!({
+                    "event": "exited",
+                    "elapsed_secs": start_ts.elapsed().as_secs_f64(),
+                })
+            ),
+            Err(err) => println!(
+                "{}",
+                serde_json::json!({
+                    "event": "error",
+                    "message": err.to_string(),
+                })
+            ),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    result
+}
+
+async fn start_game_inner(
+    offer_id: &str,
+    game_path_override: Option<String>,
+    game_args: Vec<String>,
+    login: Option<String>,
+    steam_app_id: Option<String>,
+    maxima_arc: LockedMaxima,
+    json: bool,
 ) -> Result<()> {
     {
         let mut maxima = maxima_arc.lock().await;
@@ -2147,6 +2334,19 @@ async fn start_game(
             launch_options,
         )
         .await?;
+    }
+
+    if json {
+        use std::io::Write;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "launched",
+                "offer_id": offer_id,
+                "wine_prefix": std::env::var("MAXIMA_WINE_PREFIX").ok(),
+            })
+        );
+        let _ = std::io::stdout().flush();
     }
 
     loop {

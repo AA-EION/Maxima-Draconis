@@ -287,7 +287,15 @@ How it works:
 
 **Downloader hardening** (all-targets, motivated by a flaky route to EA's CDN — three distinct stall modes observed in one install): every network phase is now bounded and self-healing. Connect 15s; response headers 60s (`RESPONSE_HEADER_TIMEOUT` — a GET on a dead keepalive connection previously hung `send()` forever with no body for the stall guard to watch); body stall 30s without a byte (`DOWNLOAD_STALL_TIMEOUT` via `ByteCountingStream`'s deadline — tolerates any transfer speed, unlike a total cap which kept expiring on slow-but-alive manifest reads); 4-attempt retry with backoff on the manifest fetch (`ZipFile::fetch`, streamed body) and `download_url`; 60s total cap on ServiceLayer JSON calls. Manifests are **cached on disk** after first success (`maxima_dir/cache/manifests/<fnv1a-of-url-path>.json` — the URL path names the immutable build artifact; the `sauth` query token rotates and is excluded), so reruns and repairs skip the CDN's flakiest request entirely.
 
-Known gaps in native mode: `serve` still needs `MAXIMA_WINE_PREFIX` set manually (no game context to pick a bottle from); `link2ea://` from externally-launched games needs the in-bottle `maxima-bootstrap.exe` registered (fresh native bottles don't have it — direct `maxima-cli launch` doesn't need it since the game gets its auth env up front); Northstar untested on this path; `maxima-ui`/Draconis not yet wired to the native binaries.
+**Consumer surface (for Draconis).** Maxima stays a universal EA launcher; per-title glue (Northstar files, mod management, TF2-specific detection) lives in the consumer, built on these machine-readable primitives:
+
+- `list-games --json` — library inventory (pre-existing).
+- `install <slug> [--path …] --json` — JSONL progress + done/error terminators (pre-existing; `--path` optional on macOS).
+- `launch <slug> --json` — JSONL lifecycle: `{"event":"launched","offer_id":…,"wine_prefix":…}` once the game spawns, `{"event":"exited","elapsed_secs":…}` when it stops, `{"event":"error","message":…}` + non-zero exit on failure.
+- `bottle-info <slug> [--json]` — read-only readout of the bottle name, wine prefix, default game dir and existence flags Maxima would use for a title, WITHOUT creating anything. This is how a consumer finds the game dir to drop Northstar/mod files into without re-deriving Maxima's bottle-naming policy.
+- `serve --wine-prefix <path>` — discoverable front for `MAXIMA_WINE_PREFIX` in the one mode with no game context to auto-pick a bottle from.
+
+Known gaps in native mode: `link2ea://` from externally-launched games needs the in-bottle `maxima-bootstrap.exe` registered (fresh native bottles don't have it — direct `maxima-cli launch` doesn't need it since the game gets its auth env up front); Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); `maxima-ui`/Draconis not yet wired to the native binaries.
 
 ---
 
@@ -956,7 +964,9 @@ TF2 validated end-to-end running `maxima-cli` **natively on Apple Silicon** — 
 - **Registry fix (upstreambar)** — `setup_wine_registry` now writes bare `HKLM\Software\Wow6432Node\Origin` (`ClientPath`=conhost trick). Missing key = TF2's "[a0020008] Origin installation couldn't be found" dialog; it's the 32-bit-view location real Origin uses and the one the Origin SDK reads.
 - **Downloader hardening (all targets, upstreambar)** — every HTTP phase bounded + self-healing: connect timeout, response-header timeout (dead-keepalive `send()` hangs), body stall watchdog (30s no-data, any speed OK), retries with backoff on manifest fetch + `download_url`, ServiceLayer 60s cap, and an on-disk manifest cache keyed by URL path (immutable per build; `sauth` token excluded). Root-caused from three distinct real-world freezes: manifest fetch stall, headerless GETs at 89%, and total-cap expiry on slow-but-alive manifest reads.
 
-Not yet in native mode: `serve` bottle selection, in-bottle `link2ea://` handler registration, Northstar, UI. Shipped releases still use the in-bottle mode.
+Follow-up the same day — **consumer surface for Draconis** (universal, no per-title logic in Maxima per the fork's scope rule): `launch --json` (JSONL lifecycle events: launched/exited/error), `bottle-info <slug> [--json]` (read-only bottle/prefix/game-dir readout so consumers can place per-title files without re-deriving bottle naming), `serve --wine-prefix <path>` (flag front for MAXIMA_WINE_PREFIX in the no-game-context mode).
+
+Not yet in native mode: in-bottle `link2ea://` handler registration, Northstar (consumer-side recipe expected to work), UI. Shipped releases still use the in-bottle mode.
 
 ### 2026-05-22 — v0.13.0: verify + repair, trailing-args separator, dependency hardening
 
