@@ -11,13 +11,16 @@ struct MaximaApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(store)
-                .frame(minWidth: 900, minHeight: 560)
+                .frame(minWidth: 960, minHeight: 600)
+                .task { store.start() }
         }
     }
 }
 
 enum SidebarItem: String, CaseIterable, Identifiable {
     case library = "Library"
+    case downloads = "Downloads"
+    case friends = "Friends"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -25,6 +28,8 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .library: return "square.grid.2x2"
+        case .downloads: return "arrow.down.circle"
+        case .friends: return "person.2"
         case .settings: return "gearshape"
         }
     }
@@ -32,21 +37,99 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @State private var selection: SidebarItem? = .library
+    @EnvironmentObject var store: GameStore
 
     var body: some View {
         NavigationSplitView {
-            List(SidebarItem.allCases, selection: $selection) { item in
-                Label(item.rawValue, systemImage: item.icon)
+            List(selection: $selection) {
+                ForEach(SidebarItem.allCases) { item in
+                    Label {
+                        HStack {
+                            Text(item.rawValue)
+                            Spacer()
+                            badge(for: item)
+                        }
+                    } icon: {
+                        Image(systemName: item.icon)
+                    }
                     .tag(item)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 210)
+            .safeAreaInset(edge: .bottom) {
+                connectionFooter
+            }
         } detail: {
             switch selection ?? .library {
             case .library: LibraryView()
+            case .downloads: DownloadsView()
+            case .friends: FriendsView()
             case .settings: SettingsView()
             }
         }
         .navigationTitle("Maxima")
+        .alert(
+            "Maxima",
+            isPresented: Binding(
+                get: { store.errorMessage != nil },
+                set: { if !$0 { store.errorMessage = nil } }
+            )
+        ) {
+            Button("OK") { store.errorMessage = nil }
+        } message: {
+            Text(store.errorMessage ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private func badge(for item: SidebarItem) -> some View {
+        switch item {
+        case .downloads where !store.activeInstalls.isEmpty:
+            Text("\(store.activeInstalls.count)")
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(maximaOrange.opacity(0.25), in: .capsule)
+        case .friends where store.onlineFriendCount > 0:
+            Text("\(store.onlineFriendCount)")
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.green.opacity(0.22), in: .capsule)
+        default:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var connectionFooter: some View {
+        HStack(spacing: 6) {
+            switch store.backendState {
+            case .connecting:
+                ProgressView().controlSize(.mini)
+                Text("Connecting…").font(.caption)
+            case .ready(let persona):
+                Circle().fill(.green).frame(width: 7, height: 7)
+                Text(persona.isEmpty ? "Connected" : persona)
+                    .font(.caption)
+                    .lineLimit(1)
+            case .stopped(let reason):
+                Circle().fill(.red).frame(width: 7, height: 7)
+                Text(reason ?? "Backend stopped")
+                    .font(.caption)
+                    .lineLimit(1)
+                Button {
+                    store.start()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.mini)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 }
 

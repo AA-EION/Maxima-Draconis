@@ -7,7 +7,8 @@ struct LibraryView: View {
 
     var body: some View {
         ScrollView {
-            if store.firstLoad {
+            switch store.backendState {
+            case .connecting:
                 VStack(spacing: 14) {
                     ProgressView()
                         .controlSize(.large)
@@ -19,24 +20,33 @@ struct LibraryView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 140)
-            } else if store.games.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "square.grid.2x2")
-                        .font(.system(size: 40))
-                        .foregroundStyle(.secondary)
-                    Text("No games in your EA library")
+            case .stopped(let reason):
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 36))
+                        .foregroundStyle(maximaOrange)
+                    Text(reason ?? "Maxima backend stopped")
                         .font(.title3)
+                    Button("Reconnect") { store.start() }
+                        .buttonStyle(.glassProminent)
+                        .tint(maximaOrange)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 140)
-            } else {
-                GlassEffectContainer {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(store.games) { game in
-                            GameCard(game: game)
+            case .ready:
+                if store.games.isEmpty && store.loading {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 140)
+                } else {
+                    GlassEffectContainer {
+                        LazyVGrid(columns: columns, spacing: 16) {
+                            ForEach(store.games) { game in
+                                GameCard(game: game)
+                            }
                         }
+                        .padding(20)
                     }
-                    .padding(20)
                 }
             }
         }
@@ -44,7 +54,7 @@ struct LibraryView: View {
         .toolbar {
             ToolbarItem {
                 Button {
-                    Task { await store.refresh() }
+                    Task { await store.refreshAll() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -52,28 +62,13 @@ struct LibraryView: View {
                 .help("Refresh library")
             }
         }
-        .task {
-            if store.firstLoad {
-                await store.refresh()
-            }
-        }
-        .alert(
-            "Maxima",
-            isPresented: Binding(
-                get: { store.errorMessage != nil },
-                set: { if !$0 { store.errorMessage = nil } }
-            )
-        ) {
-            Button("OK") { store.errorMessage = nil }
-        } message: {
-            Text(store.errorMessage ?? "")
-        }
     }
 }
 
 struct GameCard: View {
     @EnvironmentObject var store: GameStore
     let game: Game
+    @State private var showSettings = false
 
     private var status: GameStatus { store.statuses[game.slug] ?? .unknown }
 
@@ -85,6 +80,14 @@ struct GameCard: View {
                     .foregroundStyle(maximaOrange)
                 Spacer()
                 statusPill
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13))
+                }
+                .buttonStyle(.borderless)
+                .help("Game settings")
             }
             Text(game.displayName.isEmpty ? game.name : game.displayName)
                 .font(.title3.weight(.semibold))
@@ -99,6 +102,10 @@ struct GameCard: View {
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: 160, alignment: .leading)
         .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .sheet(isPresented: $showSettings) {
+            GameSettingsSheet(game: game)
+                .environmentObject(store)
+        }
     }
 
     @ViewBuilder private var statusPill: some View {
@@ -145,6 +152,7 @@ struct GameCard: View {
         case .installing(let pct):
             VStack(alignment: .leading, spacing: 6) {
                 ProgressView(value: min(max(pct, 0), 100), total: 100)
+                    .tint(maximaOrange)
                 Text(String(format: "Downloading… %.1f%%", pct))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -154,6 +162,60 @@ struct GameCard: View {
                 .font(.callout)
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// Per-game launch preferences — feature parity with the egui UI's
+/// game-settings modal (launch args, exe override, cloud saves).
+struct GameSettingsSheet: View {
+    @EnvironmentObject var store: GameStore
+    @Environment(\.dismiss) private var dismiss
+    let game: Game
+
+    @State private var settings = GameLocalSettings()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(game.displayName.isEmpty ? game.name : game.displayName)
+                .font(.title2.weight(.semibold))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Launch arguments")
+                    .font(.callout)
+                TextField("-novid -northstar …", text: $settings.launchArgs)
+                    .textFieldStyle(.roundedBorder)
+                Text("Passed to the game verbatim, space-separated.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Executable override")
+                    .font(.callout)
+                TextField("Empty = auto (bottle install dir)", text: $settings.exeOverride)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Toggle("Sync cloud saves", isOn: $settings.cloudSaves)
+                .disabled(!game.hasCloudSave)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.glass)
+                Button("Save") {
+                    store.setLocalSettings(settings, for: game.slug)
+                    dismiss()
+                }
+                .buttonStyle(.glassProminent)
+                .tint(maximaOrange)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+        .onAppear {
+            settings = store.localSettings(for: game.slug)
         }
     }
 }

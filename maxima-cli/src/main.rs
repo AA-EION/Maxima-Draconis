@@ -1,3 +1,5 @@
+mod ui_backend;
+
 use clap::{Parser, Subcommand};
 
 use anyhow::{bail, Result};
@@ -266,6 +268,15 @@ enum Mode {
         #[arg(long)]
         wine_prefix: Option<String>,
     },
+    /// Long-running JSONL backend for native UI frontends: holds the
+    /// logged-in session, LSX server, /authorize endpoint and RTM presence
+    /// open, reads JSON requests from stdin (list-games, friends, launch,
+    /// install) and pushes responses + events (presence diffs, install
+    /// progress, game lifecycle) on stdout. One backend process = the same
+    /// role the egui UI's bridge_thread plays in-process; architecture
+    /// mirrors upstream PR #23's "Maxima Server" direction. Exits on stdin
+    /// EOF.
+    UiBackend,
     /// Register Maxima's URL protocol handlers with the host OS. On macOS
     /// this registers MaximaBootstrap.app (built by
     /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
@@ -446,6 +457,7 @@ fn json_mode(args: &Args) -> bool {
             | Some(Mode::Verify { json: true, .. })
             | Some(Mode::Launch { json: true, .. })
             | Some(Mode::BottleInfo { json: true, .. })
+            | Some(Mode::UiBackend)
     )
 }
 
@@ -888,6 +900,7 @@ async fn startup(args: Args) -> Result<()> {
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::BottleInfo { slug, json } => bottle_info(maxima_arc.clone(), &slug, json).await,
+        Mode::UiBackend => ui_backend::run_ui_backend(maxima_arc.clone()).await,
         Mode::RegisterProtocols => {
             #[cfg(unix)]
             {
@@ -1342,15 +1355,12 @@ struct ExtraOfferJson {
     display_name: String,
 }
 
-async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
-    let mut maxima = maxima_arc.lock().await;
+/// Build the machine-readable library snapshot — shared by
+/// `list-games --json` and the `ui-backend` server mode.
+pub(crate) async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameJson>> {
     let titles = maxima.mut_library().games().await?;
 
-    if json {
-        // Machine-readable mode: one JSON array, no log noise. main() already
-        // muted stdout logging via `set_stdout_suppressed(true)` for this
-        // subcommand; everything that follows goes directly to stdout via
-        // `println!`.
+    {
         let mut out: Vec<GameJson> = Vec::with_capacity(titles.len());
         for title in titles {
             let base = title.base_offer();
@@ -1417,10 +1427,24 @@ async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
             });
         }
 
+        return Ok(out);
+    }
+}
+
+async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
+    let mut maxima = maxima_arc.lock().await;
+
+    if json {
+        // Machine-readable mode: one JSON array, no log noise. main() already
+        // muted stdout logging via `set_stdout_suppressed(true)` for this
+        // subcommand; everything that follows goes directly to stdout via
+        // `println!`.
+        let out = games_json(&mut maxima).await?;
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
+    let titles = maxima.mut_library().games().await?;
     info!("Owned games:");
     for title in titles {
         info!(

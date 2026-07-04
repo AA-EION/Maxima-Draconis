@@ -66,3 +66,32 @@ enum GameStatus: Equatable {
     case installing(Double) // percent, 0–100
     case running
 }
+
+/// A friend from the backend's `friends` response.
+struct Friend: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+}
+
+/// Live presence for one friend, updated by pushed `presence` events.
+struct Presence: Equatable {
+    let basic: String
+    let status: String
+    let game: String?
+
+    var isOnline: Bool { basic != "Offline" && basic != "Unknown" }
+}
+
+/// Per-game launch preferences, persisted locally (feature parity with the
+/// egui UI's per-game settings modal).
+struct GameLocalSettings: Codable, Equatable {
+    var launchArgs: String = ""
+    var exeOverride: String = ""
+    var cloudSaves: Bool = true
+}
+
+enum BackendState: Equatable {
+    case connecting
+    case ready(persona: String)
+    case stopped(reason: String?)
+}
