@@ -309,7 +309,9 @@ game in bottle emits link2ea://…
 
 `MaximaBootstrap.app` is assembled by `maxima-bootstrap/build-app.sh` from the native binary + an Info.plist claiming the three schemes, and **must be bundle-signed** (the script does `codesign --force --deep --sign -`; LaunchServices silently ignores claims from unsealed bundles — same gotcha as MaximaHelper). `registry.rs::set_up_registry` (macOS) registers it via `lsregister -f` — upstream's spawn-the-binary approach registered nothing. `qrc://` may resolve to Draconis's MaximaHelper.app when installed; that's fine — both forward to the same host loopback `:31033`. The bootstrap's `maxima-cli` fallback spawn walks ancestor dirs so it works from both the flat cargo layout and inside the `.app` bundle.
 
-Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); `maxima-ui`/Draconis not yet wired to the native binaries.
+**`maxima-ui` also runs natively** (smoke-validated 2026-07-04): one missing macOS stub (`check_desktop_icon`) was all the compile needed, and at runtime eframe/wgpu picks **Metal directly** on Apple Silicon — no Wine, no MoltenVK, none of the swapchain workarounds the in-bottle build needs. Login (shared token storage with the CLI), library, RTM, and the LSX server all come up. The UI's launch (`bridge/start_game.rs`) and both install handlers (`bridge_thread.rs`) ensure the per-game bottle the same way the CLI does. Bottle-selection nuance for long-lived processes: `ensure_game_bottle` snapshots a user-set `MAXIMA_WINE_PREFIX` at first use (`USER_PREFIX` OnceLock) so its own env exports for game A aren't mistaken for a user override when game B launches later. `canonical_slug` moved to `maxima-lib` (`GameLibrary::canonical_slug`) so CLI and UI share bottle-naming resolution.
+
+Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); Draconis not yet wired to the native binaries.
 
 ---
 
@@ -982,7 +984,9 @@ Follow-up the same day — **consumer surface for Draconis** (universal, no per-
 
 Second follow-up — **native protocol loop closed** (validated with an in-bottle `wine start link2ea://…` probe reaching the host bootstrap): `maxima-bootstrap/build-app.sh` assembles a bundle-signed `MaximaBootstrap.app`; `register-protocols` subcommand (login-free) registers it via `lsregister -f` (upstream's spawn-the-binary approach registered nothing); `setup_wine_registry` (macOS) routes `link2ea`/`origin2`/`qrc` out of the bottle via `winebrowser.exe` HKCR entries; bootstrap's `maxima-cli` fallback spawn fixed for native name + bundle layout (was hardcoded `maxima-cli.exe` sibling). See the "Protocol loop" diagram in the native-mode section.
 
-Not yet in native mode: Northstar (consumer-side recipe expected to work), UI. Shipped releases still use the in-bottle mode.
+Third follow-up — **`maxima-ui` runs natively on macOS**: `check_desktop_icon` macOS stub (the only compile blocker), per-game bottle wiring in the UI's launch + install handlers, `canonical_slug` promoted to `maxima-lib::GameLibrary` (shared by CLI + UI), and a `USER_PREFIX` snapshot in `ensure_game_bottle` so long-lived processes switch bottles per game instead of sticking to the first one. Smoke-validated: native window on Metal (no Wine/MoltenVK), login + library + RTM + LSX all up.
+
+Not yet in native mode: Northstar (consumer-side recipe expected to work), Draconis wiring. Shipped releases still use the in-bottle mode.
 
 ### 2026-05-22 — v0.13.0: verify + repair, trailing-args separator, dependency hardening
 

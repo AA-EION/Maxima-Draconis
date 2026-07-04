@@ -500,6 +500,16 @@ impl BridgeThread {
                 }
                 MaximaLibRequest::InstallGameRequest(offer, path) => {
                     let mut maxima = maxima_arc.lock().await;
+
+                    // macOS: pick/create the per-game CrossOver bottle before
+                    // the install — the touchup steps run through wine and
+                    // resolve the prefix via wine_prefix_dir().
+                    #[cfg(target_os = "macos")]
+                    {
+                        let slug = maxima.mut_library().canonical_slug(&offer).await;
+                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
+                    }
+
                     let builds =
                         maxima.content_manager().service().available_builds(&offer).await?;
                     let build = if let Some(build) = builds.live_build() {
@@ -563,6 +573,12 @@ impl BridgeThread {
                             "AutoInstallSlug: resolved '{}' -> {}",
                             slug, offer_id
                         );
+
+                        // macOS: per-game bottle before install (touchup
+                        // runs through wine). The input slug is already the
+                        // base slug game_by_base_slug matched on.
+                        #[cfg(target_os = "macos")]
+                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
 
                         // 2. Pick the live build (network call —
                         //    `available_builds` hits EA's CDN).

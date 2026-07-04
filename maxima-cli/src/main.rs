@@ -1463,32 +1463,8 @@ async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
 /// library doesn't know it (offline/dummy login, unlinked accounts).
 #[cfg(target_os = "macos")]
 async fn canonical_slug(maxima_arc: LockedMaxima, typed: &str) -> String {
-    let typed_s = typed.to_string();
     let mut maxima = maxima_arc.lock().await;
-
-    if let Ok(Some(offer)) = maxima.mut_library().game_by_base_slug(typed).await {
-        return offer.slug().clone();
-    }
-    if let Ok(Some(offer)) = maxima.mut_library().game_by_base_offer(typed).await {
-        return offer.slug().clone();
-    }
-    // Exhaustive scan — same property set Mode::Launch's resolution uses.
-    if let Ok(games) = maxima.mut_library().games().await {
-        for game in games {
-            let base = game.base_offer();
-            if base.slug() == &typed_s
-                || base.offer_id() == &typed_s
-                || base.product().id() == &typed_s
-                || base.product().origin_offer_id() == &typed_s
-                || base.offer().content_id() == &typed_s
-                || base.product().product().id() == &typed_s
-            {
-                return base.slug().clone();
-            }
-        }
-    }
-
-    typed_s
+    maxima.mut_library().canonical_slug(typed).await
 }
 
 async fn install_game(

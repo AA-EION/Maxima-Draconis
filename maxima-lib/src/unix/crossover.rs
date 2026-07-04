@@ -107,13 +107,26 @@ pub async fn ensure_bottle(name: &str) -> Result<PathBuf, NativeError> {
     Ok(bottle)
 }
 
-/// Per-game bottle selection. Honors an explicit `MAXIMA_WINE_PREFIX`; else
-/// creates/reuses a `Maxima-<slug>` bottle and exports it via that same env
-/// var so the whole pipeline follows — license dir, regedit, and the spawned
-/// bootstrap/game child processes all resolve the prefix through
-/// `wine_prefix_dir()`, and children inherit the environment.
+/// A user-supplied `MAXIMA_WINE_PREFIX`, captured at first use. Snapshotting
+/// matters in long-lived processes (the UI): `ensure_game_bottle` exports
+/// its selection through the same env var, so re-reading the env on every
+/// call would mistake game A's bottle for a user override when game B
+/// launches later.
+static USER_PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Per-game bottle selection. Honors an explicit user-set
+/// `MAXIMA_WINE_PREFIX`; else creates/reuses a `Maxima-<slug>` bottle and
+/// exports it via that same env var so the whole pipeline follows — license
+/// dir, regedit, and the spawned bootstrap/game child processes all resolve
+/// the prefix through `wine_prefix_dir()`, and children inherit the
+/// environment.
+// ponytail: bottle selection is a process-global env var — concurrent
+// installs/launches of DIFFERENT games in one process would race it. Thread
+// a per-context prefix through LaunchOptions/ContentManager if that becomes
+// a real workload.
 pub async fn ensure_game_bottle(slug: &str) -> Result<PathBuf, NativeError> {
-    if let Ok(prefix) = std::env::var("MAXIMA_WINE_PREFIX") {
+    let user_prefix = USER_PREFIX.get_or_init(|| std::env::var("MAXIMA_WINE_PREFIX").ok());
+    if let Some(prefix) = user_prefix {
         return Ok(PathBuf::from(prefix));
     }
 
