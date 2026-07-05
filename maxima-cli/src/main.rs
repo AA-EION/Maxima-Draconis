@@ -686,13 +686,12 @@ async fn startup(args: Args) -> Result<()> {
             // self-contained mode.
             let port = server::server_port();
             if login.is_none() && server::is_running(port).await {
-                let mut req = serde_json::json!({"id": 1, "cmd": "launch", "slug": slug});
-                if !game_args.is_empty() {
-                    req["args"] = serde_json::json!(game_args);
-                }
-                if let Some(p) = &game_path {
-                    req["exe_override"] = serde_json::json!(p);
-                }
+                let req = maxima_proto::Request::Launch {
+                    slug: slug.clone(),
+                    args: game_args.clone(),
+                    exe_override: game_path.clone(),
+                    cloud_saves: true,
+                };
                 info!("Forwarding launch of '{}' to the running Maxima server", slug);
                 return server::forward_streaming(port, req, &["game-stopped"], json).await;
             }
@@ -877,10 +876,10 @@ async fn startup(args: Args) -> Result<()> {
                 && build_id.is_none()
                 && server::is_running(port).await
             {
-                let mut req = serde_json::json!({"id": 1, "cmd": "install", "slug": slug});
-                if let Some(p) = &path {
-                    req["path"] = serde_json::json!(p);
-                }
+                let req = maxima_proto::Request::Install {
+                    slug: slug.clone(),
+                    path: path.clone(),
+                };
                 info!("Forwarding install of '{}' to the running Maxima server", slug);
                 return server::forward_streaming(
                     port,

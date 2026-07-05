@@ -3,24 +3,14 @@
 //! One process holds the logged-in session, the LSX server, the `/authorize`
 //! HTTP endpoint and the RTM connection, and serves **many** concurrent
 //! clients over a loopback TCP socket (default `127.0.0.1:13220`, override
-//! with `MAXIMA_SERVER_PORT`). Every client sees the same state: launch a
-//! game from the CLI and the egui UI (also connected) shows it; a third-party
-//! `link2ea://` that hits `/authorize` broadcasts `game-started` to all
-//! clients. This is upstream PR #23's "Maxima Server" architecture (all logic
-//! in one server, frontends as thin clients, states synced) in its pragmatic
-//! fork-side form — the server→client notification layer that draft leaves
-//! unfinished is implemented here as broadcast events.
+//! with `MAXIMA_SERVER_PORT`). Every client sees the same state.
 //!
-//! Wire protocol (newline-delimited JSON, one object per line):
-//!   Client → server request:  {"id":N,"cmd":"list-games"|"friends"|"launch"|
-//!                              "install"|"status"|"shutdown", …}
-//!   Server → client response: {"id":N,"ok":true, …} | {"id":N,"ok":false,"error":"…"}
-//!   Server → ALL clients event (no id): ready / presence / install-progress /
-//!                              install-done / install-error / game-started /
-//!                              game-stopped
-//!
-//! On connect the server sends a `ready` event (persona) to that client.
-//! `shutdown` stops the whole server; `status` reports session state.
+//! This is upstream PR #23's "Maxima Server": one server, frontends as thin
+//! clients. The wire protocol and the client live in the `maxima-proto`
+//! crate (typed [`maxima_proto::Request`] / [`ResponseEnvelope`] /
+//! [`Notification`]); this module is the server side — it dispatches those
+//! requests against the real `maxima-lib` `Maxima` and broadcasts
+//! notifications to every client.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,47 +19,30 @@ use std::sync::Arc;
 use anyhow::Result;
 use log::{info, warn};
 use maxima::core::{
+    cloudsync::CloudSyncLockMode,
     launch::{self, LaunchMode, LaunchOptions},
-    LockedMaxima, MaximaEvent,
+    manifest, LockedMaxima, MaximaEvent,
 };
 use maxima::rtm::client::RichPresence;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use maxima_proto::message::{Notification, Request, RequestEnvelope, ResponseEnvelope};
+use maxima_proto::types::{FriendDto, GameDetailsDto, StatusDto};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 /// Default control port. LSX is 3216, authorize is 13219; the server control
 /// channel is 13220.
-pub const DEFAULT_PORT: u16 = 13220;
+pub const DEFAULT_PORT: u16 = maxima_proto::DEFAULT_PORT;
 
 pub fn server_port() -> u16 {
-    std::env::var("MAXIMA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT)
-}
-
-#[derive(Deserialize)]
-struct Request {
-    #[serde(default)]
-    id: u64,
-    cmd: String,
-    #[serde(default)]
-    slug: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    args: Option<Vec<String>>,
-    #[serde(default)]
-    exe_override: Option<String>,
-    #[serde(default)]
-    cloud_saves: Option<bool>,
+    maxima_proto::server_port()
 }
 
 struct ServerState {
     maxima: LockedMaxima,
     installing: Mutex<Option<String>>,
+    /// Serialized [`Notification`] lines, broadcast to every client.
     events: broadcast::Sender<String>,
     shutdown: Notify,
     persona: Mutex<String>,
@@ -77,17 +50,17 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn broadcast(&self, value: Value) {
+    fn notify(&self, note: Notification) {
         // Err just means no clients are currently subscribed — fine.
-        let _ = self.events.send(value.to_string());
+        if let Ok(line) = serde_json::to_string(&note) {
+            let _ = self.events.send(line);
+        }
     }
 }
 
 pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
     let port = server_port();
 
-    // Refuse to double-bind: if a server is already up, this process should
-    // not have been started. Surface it clearly instead of a raw EADDRINUSE.
     let listener = match TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -100,7 +73,7 @@ pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
         Err(err) => return Err(err.into()),
     };
 
-    // --- Session setup: LSX + authorize + RTM, like `serve`/`ui-backend`. ---
+    // --- Session setup: LSX + authorize + RTM, like `serve`. ---
     let persona = {
         let mut maxima = maxima_arc.lock().await;
         maxima.start_lsx(maxima_arc.clone()).await?;
@@ -140,22 +113,14 @@ pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
         clients: AtomicUsize::new(0),
     });
 
-    info!(
-        "Maxima server listening on 127.0.0.1:{} (persona: {})",
-        port, persona
-    );
+    info!("Maxima server listening on 127.0.0.1:{} (persona: {})", port, persona);
 
-    // Native tray on Windows — decoupled: it opens the UI / stops the server
-    // by acting as an ordinary client on this port.
     #[cfg(windows)]
     crate::tray::spawn_tray(port);
 
-    // Background tick task: drives maxima.update(), broadcasts presence /
-    // install / game-lifecycle events to all clients. One per server.
     let tick_state = state.clone();
     tokio::spawn(async move { tick_loop(tick_state).await });
 
-    // Accept loop, interruptible by shutdown.
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -190,11 +155,10 @@ async fn tick_loop(state: Arc<ServerState>) {
         let mut maxima = state.maxima.lock().await;
 
         for event in maxima.consume_pending_events() {
-            if let MaximaEvent::InstallFinished(offer_id) = event {
+            if let MaximaEvent::InstallFinished(_offer_id) = event {
                 let slug = state.installing.lock().await.take();
-                state.broadcast(json!({
-                    "event": "install-done", "offer_id": offer_id, "slug": slug
-                }));
+                state.notify(Notification::InstallDone { slug });
+                state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
                 last_percent = -1.0;
             }
         }
@@ -203,7 +167,7 @@ async fn tick_loop(state: Arc<ServerState>) {
 
         let playing_now = maxima.playing().is_some();
         if was_playing && !playing_now {
-            state.broadcast(json!({"event": "game-stopped"}));
+            state.notify(Notification::GameStopped);
         }
         was_playing = playing_now;
 
@@ -213,15 +177,17 @@ async fn tick_loop(state: Arc<ServerState>) {
                 Some(download) => {
                     let pct = download.percentage_done();
                     if (pct - last_percent).abs() > 0.05 {
-                        state.broadcast(json!({
-                            "event": "install-progress", "slug": slug, "percent": pct
-                        }));
+                        state.notify(Notification::InstallProgress {
+                            slug: slug.clone(),
+                            percent: pct,
+                        });
                         last_percent = pct;
                     }
                 }
                 None => {
                     *state.installing.lock().await = None;
-                    state.broadcast(json!({"event": "install-done", "slug": slug}));
+                    state.notify(Notification::InstallDone { slug: Some(slug) });
+                    state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
                     last_percent = -1.0;
                 }
             }
@@ -236,13 +202,12 @@ async fn tick_loop(state: Arc<ServerState>) {
                 if prev_presence.get(&id) == Some(&presence) {
                     continue;
                 }
-                state.broadcast(json!({
-                    "event": "presence",
-                    "id": id,
-                    "basic": format!("{:?}", presence.basic()),
-                    "status": presence.status(),
-                    "game": presence.game(),
-                }));
+                state.notify(Notification::Presence {
+                    id: id.clone(),
+                    basic: format!("{:?}", presence.basic()),
+                    status: presence.status().clone(),
+                    game: presence.game().clone(),
+                });
                 prev_presence.insert(id, presence);
             }
         }
@@ -255,8 +220,6 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     let n = state.clients.fetch_add(1, Ordering::SeqCst) + 1;
     info!("client connected ({} total)", n);
 
-    // Single writer task drains a per-client mpsc; both request responses and
-    // forwarded broadcast events funnel through it so writes never interleave.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
         while let Some(line) = out_rx.recv().await {
@@ -269,7 +232,6 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     });
 
-    // Forward broadcast events to this client.
     let mut events_rx = state.events.subscribe();
     let ev_tx = out_tx.clone();
     let forwarder = tokio::spawn(async move {
@@ -288,9 +250,10 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
 
     // Greet with a ready snapshot.
     let persona = state.persona.lock().await.clone();
-    let _ = out_tx.send(json!({"event": "ready", "persona": persona}).to_string());
+    if let Ok(line) = serde_json::to_string(&Notification::Ready { persona }) {
+        let _ = out_tx.send(line);
+    }
 
-    // Request loop.
     let reader = BufReader::new(read_half);
     let mut lines = reader.lines();
     loop {
@@ -299,27 +262,31 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
                 if line.trim().is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<Request>(&line) {
-                    Ok(req) => {
-                        let id = req.id;
-                        let is_shutdown = req.cmd == "shutdown";
-                        let response = dispatch(&state, req).await;
-                        let _ = out_tx.send(response.to_string());
+                match serde_json::from_str::<RequestEnvelope>(&line) {
+                    Ok(env) => {
+                        let id = env.id;
+                        let is_shutdown = matches!(env.request, Request::Shutdown);
+                        let response = dispatch(&state, id, env.request).await;
+                        if let Ok(line) = serde_json::to_string(&response) {
+                            let _ = out_tx.send(line);
+                        }
                         if is_shutdown {
                             state.shutdown.notify_waiters();
                             break;
                         }
                     }
                     Err(err) => {
-                        let _ = out_tx.send(
-                            json!({"id": id_hint(&line), "ok": false,
-                                   "error": format!("bad request: {}", err)})
-                            .to_string(),
+                        let resp = ResponseEnvelope::err(
+                            id_hint(&line),
+                            format!("bad request: {}", err),
                         );
+                        if let Ok(line) = serde_json::to_string(&resp) {
+                            let _ = out_tx.send(line);
+                        }
                     }
                 }
             }
-            _ => break, // client disconnected
+            _ => break,
         }
     }
 
@@ -331,66 +298,109 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
 }
 
 fn id_hint(line: &str) -> u64 {
-    serde_json::from_str::<Value>(line)
+    serde_json::from_str::<serde_json::Value>(line)
         .ok()
         .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
         .unwrap_or(0)
 }
 
-/// Handle one request, returning the response object for the requesting
-/// client. Events (broadcast to all) are emitted as a side effect.
-async fn dispatch(state: &Arc<ServerState>, req: Request) -> Value {
-    let id = req.id;
-    let result: Result<Value> = match req.cmd.as_str() {
-        "status" => Ok(status(state).await),
-        "shutdown" => Ok(json!({"stopping": true})),
-        "list-games" => {
+/// Handle one request, returning the response for the requesting client.
+/// Notifications (broadcast to all) are emitted as a side effect.
+async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> ResponseEnvelope {
+    let result: Result<serde_json::Value> = match request {
+        Request::Status => Ok(json!({ "status": status(state).await })),
+        Request::Shutdown => Ok(json!({ "stopping": true })),
+        Request::ListGames => {
             let mut maxima = state.maxima.lock().await;
-            crate::games_json(&mut maxima)
-                .await
-                .map(|games| json!({"games": games}))
+            crate::games_json(&mut maxima).await.map(|games| json!({ "games": games }))
         }
-        "friends" => {
+        Request::Friends => {
             let maxima = state.maxima.lock().await;
-            maxima.friends(0).await.map(|friends| {
-                let list: Vec<Value> = friends
-                    .iter()
-                    .map(|f| json!({"id": f.id(), "name": f.display_name()}))
-                    .collect();
-                json!({"friends": list})
-            }).map_err(Into::into)
+            maxima
+                .friends(0)
+                .await
+                .map(|friends| {
+                    let list: Vec<FriendDto> = friends
+                        .iter()
+                        .map(|f| FriendDto { id: f.id().clone(), name: f.display_name().to_string() })
+                        .collect();
+                    json!({ "friends": list })
+                })
+                .map_err(Into::into)
         }
-        "launch" => cmd_launch(state, req).await.map(|_| json!({})),
-        "install" => cmd_install(state, req).await.map(|_| json!({})),
-        other => Err(anyhow::anyhow!("unknown cmd `{}`", other)),
+        Request::GameDetails { slug } => {
+            game_details(state, &slug).await.map(|d| json!({ "details": d }))
+        }
+        Request::Launch { slug, args, exe_override, cloud_saves } => cmd_launch(
+            state, slug, args, exe_override, cloud_saves,
+        )
+        .await
+        .map(|_| json!({})),
+        Request::Install { slug, path } => {
+            cmd_install(state, slug, path).await.map(|_| json!({}))
+        }
+        Request::LocateGame { path } => cmd_locate(state, &path).await.map(|_| json!({})),
+        Request::CloudSync { slug, write } => {
+            cmd_cloud_sync(state, &slug, write).await.map(|_| json!({}))
+        }
     };
 
     match result {
-        Ok(mut extra) => {
-            let obj = extra.as_object_mut().unwrap();
-            obj.insert("id".into(), json!(id));
-            obj.insert("ok".into(), json!(true));
-            extra
-        }
-        Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
+        Ok(data) => ResponseEnvelope::ok(id, data),
+        Err(err) => ResponseEnvelope::err(id, err.to_string()),
     }
 }
 
-async fn status(state: &Arc<ServerState>) -> Value {
+async fn status(state: &Arc<ServerState>) -> StatusDto {
     let maxima = state.maxima.lock().await;
-    json!({
-        "status": {
-            "persona": *state.persona.lock().await,
-            "playing": maxima.playing().is_some(),
-            "installing": *state.installing.lock().await,
-            "lsx_port": maxima.lsx_port(),
-            "clients": state.clients.load(Ordering::SeqCst),
-        }
+    StatusDto {
+        persona: state.persona.lock().await.clone(),
+        playing: maxima.playing().is_some(),
+        installing: state.installing.lock().await.clone(),
+        lsx_port: *maxima.lsx_port(),
+        clients: state.clients.load(Ordering::SeqCst) as u64,
+    }
+}
+
+async fn game_details(state: &Arc<ServerState>, slug: &str) -> Result<GameDetailsDto> {
+    use maxima::core::service_layer::{
+        ServiceGameSystemRequirements, ServiceGameSystemRequirementsRequestBuilder,
+        SERVICE_REQUEST_GAMESYSTEMREQUIREMENTS,
+    };
+
+    let maxima = state.maxima.lock().await;
+    let rq: ServiceGameSystemRequirements = maxima
+        .service_layer()
+        .request(
+            SERVICE_REQUEST_GAMESYSTEMREQUIREMENTS,
+            ServiceGameSystemRequirementsRequestBuilder::default()
+                .slug(slug.to_owned())
+                .locale(maxima.locale().short_str().to_owned())
+                .build()?,
+        )
+        .await?;
+
+    // Return raw HTML system-requirement blocks; the egui UI applies its
+    // easymark transform when mapping the DTO onto its own type.
+    let (min, rec) = if !rq.system_requirements().is_empty() {
+        (
+            Some(rq.system_requirements()[0].minimum().to_owned()),
+            Some(rq.system_requirements()[0].recommended().to_owned()),
+        )
+    } else {
+        (None, None)
+    };
+
+    Ok(GameDetailsDto {
+        time: 0,
+        achievements_unlocked: 0,
+        achievements_total: 0,
+        path: String::new(),
+        system_requirements_min: min,
+        system_requirements_rec: rec,
     })
 }
 
-/// Resolve a typed slug to (canonical_slug, offer_id); ensures the per-game
-/// bottle on macOS so everything downstream targets the right prefix.
 async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String, String)> {
     let mut maxima = maxima_arc.lock().await;
     let slug = maxima.mut_library().canonical_slug(typed).await;
@@ -410,61 +420,50 @@ async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String,
 
 fn conventional_game_dir(slug: &str) -> Option<String> {
     let prefix = std::env::var("MAXIMA_WINE_PREFIX").ok()?;
-    let dir = std::path::Path::new(&prefix)
-        .join("drive_c")
-        .join("Games")
-        .join(slug);
+    let dir = std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug);
     dir.exists().then(|| dir.to_string_lossy().to_string())
 }
 
-async fn cmd_launch(state: &Arc<ServerState>, req: Request) -> Result<()> {
-    let typed = req.slug.ok_or_else(|| anyhow::anyhow!("launch requires `slug`"))?;
+async fn cmd_launch(
+    state: &Arc<ServerState>,
+    typed: String,
+    args: Vec<String>,
+    exe_override: Option<String>,
+    cloud_saves: bool,
+) -> Result<()> {
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let path_override = req.exe_override.or_else(|| conventional_game_dir(&slug));
+    let path_override = exe_override.or_else(|| conventional_game_dir(&slug));
 
     launch::start_game(
         state.maxima.clone(),
         LaunchMode::Online(offer_id),
-        LaunchOptions {
-            path_override,
-            arguments: req.args.unwrap_or_default(),
-            cloud_saves: req.cloud_saves.unwrap_or(true),
-            steam_app_id: None,
-        },
+        LaunchOptions { path_override, arguments: args, cloud_saves, steam_app_id: None },
     )
     .await?;
 
-    state.broadcast(json!({"event": "game-started", "slug": slug}));
+    state.notify(Notification::GameStarted { slug });
     Ok(())
 }
 
-async fn cmd_install(state: &Arc<ServerState>, req: Request) -> Result<()> {
+async fn cmd_install(state: &Arc<ServerState>, typed: String, path: Option<String>) -> Result<()> {
     use maxima::content::manager::QueuedGameBuilder;
 
     if state.installing.lock().await.is_some() {
         anyhow::bail!("another install is already running");
     }
-    let typed = req.slug.ok_or_else(|| anyhow::anyhow!("install requires `slug`"))?;
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
 
-    let install_path = match req.path {
+    let install_path = match path {
         Some(p) => std::path::PathBuf::from(p),
         None => {
             let prefix = std::env::var("MAXIMA_WINE_PREFIX")
                 .map_err(|_| anyhow::anyhow!("no path and no bottle selected for {}", slug))?;
-            std::path::Path::new(&prefix)
-                .join("drive_c")
-                .join("Games")
-                .join(&slug)
+            std::path::Path::new(&prefix).join("drive_c").join("Games").join(&slug)
         }
     };
 
     let mut maxima = state.maxima.lock().await;
-    let builds = maxima
-        .content_manager()
-        .service()
-        .available_builds(&offer_id)
-        .await?;
+    let builds = maxima.content_manager().service().available_builds(&offer_id).await?;
     let build = builds
         .live_build()
         .ok_or_else(|| anyhow::anyhow!("no live build for {}", slug))?;
@@ -477,13 +476,39 @@ async fn cmd_install(state: &Arc<ServerState>, req: Request) -> Result<()> {
     drop(maxima);
 
     *state.installing.lock().await = Some(slug.clone());
-    state.broadcast(json!({"event": "install-progress", "slug": slug, "percent": 0.0}));
+    state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 0.0 });
+    state.notify(Notification::DownloadQueue { current: Some(slug), queued: vec![] });
+    Ok(())
+}
+
+async fn cmd_locate(state: &Arc<ServerState>, path: &str) -> Result<()> {
+    let path = std::path::PathBuf::from(path);
+    let man = manifest::read(path.join(maxima::core::manifest::MANIFEST_RELATIVE_PATH)).await?;
+    man.run_touchup(&path).await?;
+    // Refresh library so the located game shows as installed to every client.
+    let _ = state.maxima.lock().await.mut_library().games().await;
+    Ok(())
+}
+
+async fn cmd_cloud_sync(state: &Arc<ServerState>, slug: &str, write: bool) -> Result<()> {
+    let mut maxima = state.maxima.lock().await;
+    let offer = maxima
+        .mut_library()
+        .game_by_base_slug(slug)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("`{}` not in library", slug))?
+        .clone();
+    let mode = if write { CloudSyncLockMode::Write } else { CloudSyncLockMode::Read };
+    let lock = maxima.cloud_sync().obtain_lock(&offer, mode).await?;
+    let res = lock.sync_files().await;
+    lock.release().await?;
+    res?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Client side — used by the CLI (server-stop/status, launch/install forward)
-// and by ensure_server_running() to auto-start the server for any frontend.
+// Client side — the CLI's own use of the server (server-stop / server-status,
+// launch/install forwarding). Built on maxima_proto::MaximaClient.
 // ---------------------------------------------------------------------------
 
 /// True if a server answers on the control port.
@@ -497,38 +522,14 @@ pub async fn is_running(port: u16) -> bool {
     .unwrap_or(false)
 }
 
-/// Connect and send one request, returning the matched response object.
-async fn request_once(port: u16, req: Value) -> Result<Value> {
-    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half.write_all(req.to_string().as_bytes()).await?;
-    write_half.write_all(b"\n").await?;
-    write_half.flush().await?;
-
-    let want_id = req.get("id").and_then(|i| i.as_u64()).unwrap_or(1);
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await? {
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("id").and_then(|i| i.as_u64()) == Some(want_id) {
-            return Ok(v);
-        }
-    }
-    anyhow::bail!("server closed the connection before responding")
-}
-
 pub async fn send_shutdown(port: u16) -> Result<()> {
     if !is_running(port).await {
         println!("No Maxima server running on port {}.", port);
         return Ok(());
     }
-    let resp = request_once(port, json!({"id": 1, "cmd": "shutdown"})).await?;
-    if resp.get("ok").and_then(|b| b.as_bool()) == Some(true) {
-        println!("Maxima server on port {} is stopping.", port);
-    }
+    let client = maxima_proto::MaximaClient::connect(port).await?;
+    client.shutdown().await?;
+    println!("Maxima server on port {} is stopping.", port);
     Ok(())
 }
 
@@ -541,48 +542,37 @@ pub async fn print_status(port: u16, json_out: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let resp = request_once(port, json!({"id": 1, "cmd": "status"})).await?;
-    let status = resp.get("status").cloned().unwrap_or(json!({}));
+    let client = maxima_proto::MaximaClient::connect(port).await?;
+    let status = client.status().await?;
     if json_out {
-        println!("{}", json!({"running": true, "port": port, "status": status}));
+        println!(
+            "{}",
+            json!({"running": true, "port": port, "status": status})
+        );
     } else {
         println!("Maxima server: running on port {}", port);
-        if let Some(p) = status.get("persona").and_then(|v| v.as_str()) {
-            println!("  persona:    {}", p);
-        }
-        println!(
-            "  playing:    {}",
-            status.get("playing").and_then(|v| v.as_bool()).unwrap_or(false)
-        );
-        if let Some(slug) = status.get("installing").and_then(|v| v.as_str()) {
+        println!("  persona:    {}", status.persona);
+        println!("  playing:    {}", status.playing);
+        if let Some(slug) = &status.installing {
             println!("  installing: {}", slug);
         }
-        println!(
-            "  clients:    {}",
-            status.get("clients").and_then(|v| v.as_u64()).unwrap_or(0)
-        );
+        println!("  clients:    {}", status.clients);
     }
     Ok(())
 }
 
-/// Ensure a server is up, spawning `maxima-cli server` detached if not, and
-/// waiting until its control port answers. Used by frontends (and forwarding
-/// CLI commands) so the server auto-starts when it isn't already running at
-/// logon.
+/// Ensure a server is up, spawning `maxima-cli server` detached if not.
 pub async fn ensure_server_running(port: u16) -> Result<()> {
     if is_running(port).await {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
     info!("No server on port {}; starting one ({})", port, exe.display());
-
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("server")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // Detach from our process group so the server outlives the spawning
-    // frontend / CLI command.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -591,12 +581,9 @@ pub async fn ensure_server_running(port: u16) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     cmd.spawn()?;
-
-    // Wait for it to come up (login may run; give it room).
     for _ in 0..120 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if is_running(port).await {
@@ -607,63 +594,62 @@ pub async fn ensure_server_running(port: u16) -> Result<()> {
 }
 
 /// Forward a launch/install to the running server and stream its events to
-/// stdout until a terminal event for this action arrives. `terminal` names
-/// the event(s) that end the stream. In `json_out` mode raw event lines are
-/// passed through; otherwise they're logged human-readably.
+/// stdout until a terminal event arrives. `json_out` passes raw event lines
+/// through; otherwise they're logged human-readably.
 pub async fn forward_streaming(
     port: u16,
-    request: Value,
+    request: Request,
     terminal: &[&str],
     json_out: bool,
 ) -> Result<()> {
-    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let want_id = request.get("id").and_then(|i| i.as_u64()).unwrap_or(1);
-    write_half.write_all(request.to_string().as_bytes()).await?;
-    write_half.write_all(b"\n").await?;
-    write_half.flush().await?;
+    let client = maxima_proto::MaximaClient::connect(port).await?;
+    let mut events = client.subscribe();
 
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await? {
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+    // Fire the request; a server-side error surfaces here.
+    client.request(request).await?;
+
+    loop {
+        let note = match events.recv().await {
+            Ok(n) => n,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
         };
-        // Error on our request → surface and stop.
-        if v.get("id").and_then(|i| i.as_u64()) == Some(want_id)
-            && v.get("ok").and_then(|b| b.as_bool()) == Some(false)
-        {
-            anyhow::bail!(
-                "{}",
-                v.get("error").and_then(|e| e.as_str()).unwrap_or("request failed")
-            );
-        }
-        if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
-            if json_out {
+        let ev_name = notification_event_name(&note);
+        if json_out {
+            if let Ok(line) = serde_json::to_string(&note) {
                 println!("{}", line);
                 let _ = std::io::Write::flush(&mut std::io::stdout());
-            } else {
-                match ev {
-                    "install-progress" => {
-                        if let Some(p) = v.get("percent").and_then(|p| p.as_f64()) {
-                            info!("Downloading: {:.1}%/100%", p);
-                        }
-                    }
-                    "install-done" => info!("Install complete."),
-                    "install-error" => warn!(
-                        "Install error: {}",
-                        v.get("message").and_then(|m| m.as_str()).unwrap_or("?")
-                    ),
-                    "game-started" => info!("Game started."),
-                    "game-stopped" => info!("Game stopped."),
-                    _ => {}
+            }
+        } else {
+            match &note {
+                Notification::InstallProgress { percent, .. } => {
+                    info!("Downloading: {:.1}%/100%", percent)
                 }
+                Notification::InstallDone { .. } => info!("Install complete."),
+                Notification::InstallError { message, .. } => {
+                    warn!("Install error: {}", message)
+                }
+                Notification::GameStarted { .. } => info!("Game started."),
+                Notification::GameStopped => info!("Game stopped."),
+                _ => {}
             }
-            if terminal.contains(&ev) {
-                break;
-            }
+        }
+        if terminal.contains(&ev_name) {
+            break;
         }
     }
     Ok(())
+}
+
+fn notification_event_name(note: &Notification) -> &'static str {
+    match note {
+        Notification::Ready { .. } => "ready",
+        Notification::Presence { .. } => "presence",
+        Notification::InstallProgress { .. } => "install-progress",
+        Notification::InstallDone { .. } => "install-done",
+        Notification::InstallError { .. } => "install-error",
+        Notification::GameStarted { .. } => "game-started",
+        Notification::GameStopped => "game-stopped",
+        Notification::DownloadQueue { .. } => "download-queue",
+    }
 }
