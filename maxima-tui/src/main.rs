@@ -334,6 +334,11 @@ impl SelectedTab {
 
 #[tokio::main]
 async fn main() {
+    // Bring the Maxima server up if it isn't already, so its tray and any
+    // other clients are available (best-effort; the TUI keeps its own
+    // in-process session and defers LSX to the server if it's bound first).
+    maxima::server_client::ensure_running();
+
     let result = startup().await;
 
     if let Some(e) = result.err() {

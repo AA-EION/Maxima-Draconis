@@ -10,6 +10,7 @@ pub mod core;
 pub mod lsx;
 pub mod ooa;
 pub mod rtm;
+pub mod server_client;
 pub mod steam;
 pub mod util;
 

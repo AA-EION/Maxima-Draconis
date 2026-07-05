@@ -155,6 +155,12 @@ fn main() {
     install_panic_hook();
     init_logger();
 
+    // Bring the Maxima server up if it isn't already (and wasn't started at
+    // logon), so its tray / menu-bar and any other clients are available.
+    // Best-effort; this UI keeps running its own in-process session and its
+    // start_lsx defers to the server's LSX when the port is already bound.
+    maxima::server_client::ensure_running();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

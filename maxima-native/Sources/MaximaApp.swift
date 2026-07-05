@@ -16,17 +16,41 @@ private let napPreventionToken: NSObjectProtocol = ProcessInfo.processInfo.begin
 @main
 struct MaximaApp: App {
     @StateObject private var store = GameStore()
+    @Environment(\.openWindow) private var openWindow
 
     init() {
         _ = napPreventionToken
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             ContentView()
                 .environmentObject(store)
                 .frame(minWidth: 960, minHeight: 600)
                 .task { store.start() }
+        }
+
+        // macOS's idiomatic "bar icon": a menu-bar extra reflecting the
+        // shared server, with the same three actions the Windows tray and
+        // the CLI expose — open the UI, stop the server, quit. (Windows uses
+        // the native tray inside the server; Linux runs headless.)
+        MenuBarExtra("Maxima", systemImage: "gamecontroller") {
+            switch store.backendState {
+            case .ready(let persona):
+                Text(persona.isEmpty ? "Connected" : "Signed in as \(persona)")
+            case .connecting:
+                Text("Connecting…")
+            case .stopped:
+                Text("Server stopped")
+            }
+            Divider()
+            Button("Open Maxima") {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "main")
+            }
+            Button("Stop Server") { store.stopServer() }
+            Divider()
+            Button("Quit Maxima") { NSApp.terminate(nil) }
         }
     }
 }

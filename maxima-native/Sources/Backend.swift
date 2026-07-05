@@ -1,78 +1,76 @@
+import Darwin
 import Foundation
 
-/// Client for `maxima-cli ui-backend` — ONE persistent child process holds
-/// the logged-in session, LSX server and RTM presence (the same role the
-/// egui UI's bridge_thread plays in-process; upstream PR #23's server/thin-
-/// client architecture). Requests go down stdin as JSONL with ids; matched
-/// responses resolve continuations; unmatched objects are pushed events.
+/// Client for the multi-client `maxima-cli server` (upstream PR #23's
+/// server/thin-client architecture). Connects over loopback TCP; if no server
+/// is running it spawns one (`maxima-cli server`) detached and waits for it.
+/// Because the game is responsibility-disclaimed at the cxstart hop inside the
+/// server, the server can be started any way — by this app, at logon, or by
+/// another frontend — and every client shares one synced session.
 ///
-/// The child is spawned CleanSpawn-style: new session, no inherited fds
-/// beyond our pipes, App-Nap-disclaimed — the wine tree it spawns behaves
-/// exactly as if launched from Terminal.
+/// Requests go down as JSONL with ids; matched responses resolve
+/// continuations, unmatched objects are pushed events.
 actor Backend {
     enum BackendError: LocalizedError {
-        case notRunning
+        case notConnected
+        case cliNotFound
+        case serverUnavailable
         case requestFailed(String)
         var errorDescription: String? {
             switch self {
-            case .notRunning: return "Maxima backend is not running."
+            case .notConnected: return "Not connected to the Maxima server."
+            case .cliNotFound: return "maxima-cli not found (set its path in Settings)."
+            case .serverUnavailable: return "The Maxima server did not start."
             case .requestFailed(let s): return s
             }
         }
     }
 
-    private var pid: pid_t = -1
-    private var stdinWriter: FileHandle?
+    static let port: UInt16 = {
+        if let s = ProcessInfo.processInfo.environment["MAXIMA_SERVER_PORT"],
+           let p = UInt16(s) { return p }
+        return 13220
+    }()
+
+    private var writeHandle: FileHandle?
     private var nextId: UInt64 = 1
     private var pending: [UInt64: CheckedContinuation<[String: Any], Swift.Error>] = [:]
-
     private var eventContinuation: AsyncStream<[String: Any]>.Continuation?
 
-    var isRunning: Bool { pid > 0 }
+    var isConnected: Bool { writeHandle != nil }
 
-    /// Spawn the backend and return the pushed-event stream. The stream ends
-    /// when the backend process dies.
-    func start() throws -> AsyncStream<[String: Any]> {
-        guard let cli = MaximaCLI.locate() else { throw MaximaCLIError.cliNotFound }
+    /// Ensure a server is up (spawn if needed), connect, and return the
+    /// pushed-event stream. The stream ends if the connection drops.
+    func start() async throws -> AsyncStream<[String: Any]> {
+        if !Self.probe() {
+            try spawnServer()
+            // Wait for it to answer (login may run on first start).
+            var up = false
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if Self.probe() { up = true; break }
+            }
+            if !up { throw BackendError.serverUnavailable }
+        }
 
-        let toChild = Pipe()
-        let fromChild = Pipe()
-
-        var env = ProcessInfo.processInfo.environment
-        let wine = UserDefaults.standard.string(forKey: "wineCommand") ?? ""
-        if !wine.isEmpty { env["MAXIMA_WINE_COMMAND"] = wine }
-
-        let childPid = try CleanSpawn.spawn(
-            executable: cli,
-            arguments: ["ui-backend"],
-            environment: env,
-            stdinFD: toChild.fileHandleForReading.fileDescriptor,
-            stdoutFD: fromChild.fileHandleForWriting.fileDescriptor,
-            stderrFD: FileHandle.nullDevice.fileDescriptor
-        )
-        pid = childPid
-        stdinWriter = toChild.fileHandleForWriting
-        // Close our copies of the child-side ends so EOF propagates.
-        try? toChild.fileHandleForReading.close()
-        try? fromChild.fileHandleForWriting.close()
+        let fd = try Self.connect()
+        let readHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        writeHandle = FileHandle(fileDescriptor: dup(fd), closeOnDealloc: false)
 
         let (stream, continuation) = AsyncStream.makeStream(of: [String: Any].self)
         eventContinuation = continuation
 
-        let reader = fromChild.fileHandleForReading
         Task.detached { [weak self] in
             do {
-                for try await line in reader.bytes.lines {
+                for try await line in readHandle.bytes.lines {
                     guard let data = line.data(using: .utf8),
                           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     else { continue }
                     await self?.route(obj)
                 }
             } catch {}
-            // Child died / pipe closed.
-            var status: Int32 = 0
-            waitpid(childPid, &status, 0)
-            await self?.handleExit()
+            try? readHandle.close()
+            await self?.handleDisconnect()
         }
 
         return stream
@@ -92,25 +90,16 @@ actor Backend {
         }
     }
 
-    private func handleExit() {
-        pid = -1
-        stdinWriter = nil
-        for (_, cont) in pending {
-            cont.resume(throwing: BackendError.notRunning)
-        }
+    private func handleDisconnect() {
+        writeHandle = nil
+        for (_, cont) in pending { cont.resume(throwing: BackendError.notConnected) }
         pending.removeAll()
         eventContinuation?.finish()
         eventContinuation = nil
     }
 
-    func stop() {
-        // Closing stdin is the shutdown signal (backend exits on EOF).
-        try? stdinWriter?.close()
-        stdinWriter = nil
-    }
-
     func request(_ body: [String: Any]) async throws -> [String: Any] {
-        guard let writer = stdinWriter else { throw BackendError.notRunning }
+        guard let writer = writeHandle else { throw BackendError.notConnected }
         let id = nextId
         nextId += 1
         var payload = body
@@ -127,20 +116,25 @@ actor Backend {
         }
     }
 
+    /// Ask the server to shut down (used by the menu bar's Stop item).
+    func stopServer() async {
+        _ = try? await request(["cmd": "shutdown"])
+    }
+
     // Typed helpers ------------------------------------------------------
 
     func listGames() async throws -> [Game] {
         let resp = try await request(["cmd": "list-games"])
         let raw = resp["games"] ?? []
-        let data = try JSONSerialization.data(withJSONObject: raw)
-        return try JSONDecoder().decode([Game].self, from: data)
+        return try JSONDecoder().decode([Game].self,
+            from: JSONSerialization.data(withJSONObject: raw))
     }
 
     func friends() async throws -> [Friend] {
         let resp = try await request(["cmd": "friends"])
         let raw = resp["friends"] ?? []
-        let data = try JSONSerialization.data(withJSONObject: raw)
-        return try JSONDecoder().decode([Friend].self, from: data)
+        return try JSONDecoder().decode([Friend].self,
+            from: JSONSerialization.data(withJSONObject: raw))
     }
 
     func launch(slug: String, args: [String], exeOverride: String?, cloudSaves: Bool) async throws {
@@ -154,5 +148,50 @@ actor Backend {
         var body: [String: Any] = ["cmd": "install", "slug": slug]
         if let path, !path.isEmpty { body["path"] = path }
         _ = try await request(body)
+    }
+
+    // Transport ----------------------------------------------------------
+
+    /// True if a server answers on the control port.
+    nonisolated static func probe() -> Bool {
+        guard let fd = try? connect() else { return false }
+        Darwin.close(fd)
+        return true
+    }
+
+    /// Open a blocking TCP connection to 127.0.0.1:port; returns the fd.
+    nonisolated static func connect() throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw BackendError.notConnected }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard rc == 0 else {
+            Darwin.close(fd)
+            throw BackendError.notConnected
+        }
+        return fd
+    }
+
+    /// Spawn `maxima-cli server` detached so it outlives this app.
+    private func spawnServer() throws {
+        guard let cli = MaximaCLI.locate() else { throw BackendError.cliNotFound }
+        let p = Process()
+        p.executableURL = cli
+        p.arguments = ["server"]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        var env = ProcessInfo.processInfo.environment
+        let wine = UserDefaults.standard.string(forKey: "wineCommand") ?? ""
+        if !wine.isEmpty { env["MAXIMA_WINE_COMMAND"] = wine }
+        p.environment = env
+        try p.run()
     }
 }

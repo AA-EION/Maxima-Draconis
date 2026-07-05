@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: runs `maxima-cli server` at login.
+
+  Install (per-user, no sudo):
+    1. Edit the ProgramArguments path below to your maxima-cli location.
+    2. cp installer/autostart/com.armchairdevelopers.maxima.server.plist \
+         ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+
+  Stop / uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+    rm ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+
+  The server exposes a menu-bar item only when Maxima.app is open; the
+  launchd-run server itself is headless (macOS status items need a GUI app).
+  RunAtLoad + KeepAlive.SuccessfulExit=false restarts it if it crashes but
+  respects a clean `maxima-cli server-stop`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.armchairdevelopers.maxima.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/maxima-cli</string>
+        <string>server</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/maxima-server.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/maxima-server.err.log</string>
+</dict>
+</plist>

@@ -289,6 +289,14 @@ Section "Maxima Core" SEC_CORE
     nsExec::ExecToLog 'sc description MaximaBackgroundService "Maxima Background Service - EA Launcher replacement"'
     nsExec::ExecToLog 'sc start MaximaBackgroundService'
 
+    ; ---- Run the Maxima server at logon ----
+    ; The multi-client server holds the logged-in session, LSX, /authorize and
+    ; RTM, and shows a tray icon (Open Maxima / Stop Server). Registering it in
+    ; the per-user Run key starts it at logon so every frontend and any
+    ; link2ea:// launch finds it already running. Per-user (HKCU) so it doesn't
+    ; need the session's desktop as SYSTEM.
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MaximaServer" '"$INSTDIR\maxima-cli.exe" server'
+
     ; ---- Start Menu Shortcuts ----
     CreateDirectory "$SMPROGRAMS\Maxima"
     CreateShortcut "$SMPROGRAMS\Maxima\Maxima CLI.lnk" "$INSTDIR\maxima-cli.exe" "" "$INSTDIR\maxima-cli.exe" 0
@@ -337,6 +345,10 @@ SectionEnd
 
 ;---------- Uninstaller Section ----------
 Section "Uninstall"
+
+    ; Stop a running Maxima server and drop its logon entry.
+    nsExec::ExecToLog '"$INSTDIR\maxima-cli.exe" server-stop'
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MaximaServer"
 
     ; Stop and remove the Windows service
     nsExec::ExecToLog 'sc stop MaximaBackgroundService'

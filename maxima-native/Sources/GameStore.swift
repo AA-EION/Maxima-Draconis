@@ -35,8 +35,10 @@ final class GameStore: ObservableObject {
         Task { await runBackend() }
     }
 
-    func shutdown() {
-        Task { await backend.stop() }
+    /// Stop the shared server entirely (menu bar's "Stop Server"). Other
+    /// clients disconnect too — this ends the session for everyone.
+    func stopServer() {
+        Task { await backend.stopServer() }
     }
 
     private func runBackend() async {
