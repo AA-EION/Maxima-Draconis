@@ -99,6 +99,95 @@ pub const CROSSOVER_WINE: &str =
 pub const CROSSOVER_CXSTART: &str =
     "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxstart";
 
+/// posix_spawn with the exact attribute set Draconis's CleanSpawn uses for
+/// its (working) game launches from a `.app`: `POSIX_SPAWN_CLOEXEC_DEFAULT`
+/// + `POSIX_SPAWN_SETSID` + `responsibility_spawnattrs_setdisclaim`, with
+/// /dev/null stdio. The disclaim must be applied at THIS hop: the game
+/// inherits its "responsible process" from cxstart, and disclaiming only an
+/// upstream headless process leaves the game attributed to something with
+/// no GUI check-in — wine's display driver then starves waiting on
+/// WindowServer events (frozen blank window, main thread parked in
+/// mach_msg). Returns the child pid.
+#[cfg(target_os = "macos")]
+fn spawn_disclaimed(
+    exe: &str,
+    args: &[std::ffi::OsString],
+) -> Result<libc::pid_t, NativeError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    // Not exported by the libc crate for apple targets; value from <spawn.h>.
+    const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
+
+    let c_exe = CString::new(exe).map_err(|_| NativeError::Stringify)?;
+    let mut c_args: Vec<CString> = vec![c_exe.clone()];
+    for arg in args {
+        c_args.push(CString::new(arg.as_bytes()).map_err(|_| NativeError::Stringify)?);
+    }
+    let mut argv: Vec<*mut libc::c_char> =
+        c_args.iter().map(|c| c.as_ptr() as *mut _).collect();
+    argv.push(std::ptr::null_mut());
+
+    let env_strings: Vec<CString> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let mut pair = key.into_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(value.as_bytes());
+            CString::new(pair).ok()
+        })
+        .collect();
+    let mut envp: Vec<*mut libc::c_char> =
+        env_strings.iter().map(|c| c.as_ptr() as *mut _).collect();
+    envp.push(std::ptr::null_mut());
+
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return Err(NativeError::Io(std::io::Error::last_os_error()));
+        }
+        libc::posix_spawnattr_setflags(
+            &mut attr,
+            (libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short) | POSIX_SPAWN_SETSID,
+        );
+
+        // Private but stable since 10.14; resolved dynamically so a future
+        // macOS removing it degrades gracefully. Same call Draconis makes.
+        let disclaim_sym = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_spawnattrs_setdisclaim".as_ptr(),
+        );
+        if !disclaim_sym.is_null() {
+            let disclaim: extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int =
+                std::mem::transmute(disclaim_sym);
+            disclaim(&mut attr, 1);
+        }
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&mut actions);
+        let devnull = c"/dev/null".as_ptr();
+        libc::posix_spawn_file_actions_addopen(&mut actions, 0, devnull, libc::O_RDONLY, 0);
+        libc::posix_spawn_file_actions_addopen(&mut actions, 1, devnull, libc::O_WRONLY, 0);
+        libc::posix_spawn_file_actions_adddup2(&mut actions, 1, 2);
+
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_exe.as_ptr(),
+            &actions,
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+
+        if rc != 0 {
+            return Err(NativeError::Io(std::io::Error::from_raw_os_error(rc)));
+        }
+        Ok(pid)
+    }
+}
+
 /// Run a Windows exe via cxstart. cxstart exits right after the handoff, so
 /// wait-for-exit semantics are emulated by polling for the exe's process:
 /// grace period for it to appear (CrossOver cold start), then wait until
@@ -118,25 +207,26 @@ async fn run_via_cxstart(
         .to_string();
 
     info!(
-        "Launching {:?} via cxstart (bottle '{}')",
+        "Launching {:?} via cxstart (bottle '{}', disclaimed spawn)",
         exe, bottle
     );
 
-    let mut cmd = Command::new(CROSSOVER_CXSTART);
-    cmd.arg("--bottle")
-        .arg(&bottle)
-        .arg(&exe)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let mut cx_args: Vec<std::ffi::OsString> =
+        vec!["--bottle".into(), bottle.clone().into(), exe.clone()];
+    cx_args.extend(args);
 
-    let status = cmd.spawn()?.wait().await?;
-    if !status.success() {
-        return Err(NativeError::Wine(WineError::Command {
-            output: format!("cxstart handoff failed for {:?}", exe),
-            exit: status,
-        }));
+    let pid = spawn_disclaimed(CROSSOVER_CXSTART, &cx_args)?;
+
+    // Reap cxstart itself (it exits once the handoff is done).
+    let cx_status = tokio::task::spawn_blocking(move || {
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        status
+    })
+    .await
+    .unwrap_or(0);
+    if cx_status != 0 {
+        warn!("cxstart exited with raw status {}", cx_status);
     }
 
     let needle = std::path::Path::new(&exe)

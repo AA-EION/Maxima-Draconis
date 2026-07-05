@@ -56,7 +56,14 @@ enum CleanSpawn {
             throw Error(message: "posix_spawnattr_init failed")
         }
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSID)
+        // CLOEXEC_DEFAULT only — deliberately NOT SETSID. The backend's
+        // descendants include wine's macOS display driver, which needs a
+        // healthy GUI session context to talk to the WindowServer; a
+        // setsid-detached session leaves the game's CFRunLoop parked in
+        // mach_msg forever (frozen blank window). Draconis can setsid its
+        // cxstart because that's a short-lived handoff CLI, not the ancestor
+        // of the game's windowing.
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT)
         _ = CleanSpawn.disclaim?(&attr, 1) // best effort; private API
 
         var actions: posix_spawn_file_actions_t?
