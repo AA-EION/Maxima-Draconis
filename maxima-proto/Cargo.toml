@@ -1,0 +1,19 @@
+[package]
+name = "maxima-proto"
+version = "1.0.0"
+edition = "2021"
+
+# The RPC glue between the Maxima server and its frontends (PR #23's
+# maxima_proto). Deliberately has NO maxima-lib dependency — it defines the
+# wire types (DTOs) and the client, so frontends can be true thin clients
+# without linking the server's EA/auth/LSX/download logic.
+[lib]
+name = "maxima_proto"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time", "process"] }
+thiserror = "1"
+log = "0.4"
