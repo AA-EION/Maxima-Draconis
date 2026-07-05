@@ -1,13 +1,18 @@
-use std::sync::mpsc::{self, Receiver, Sender};
+//! TUI backend as a **true thin client** of the Maxima server.
+//!
+//! Holds no in-process `Maxima`: it connects to `maxima-cli server` over the
+//! `maxima-proto` RPC (spawning the server if it isn't already running) and
+//! renders whatever the server reports. Login, LSX, the library and RTM all
+//! live in the server; this thread only forwards UI requests and relays
+//! responses. Run the TUI and the egui UI at once and both reflect the same
+//! session — the PR #23 promise.
 
-use anyhow::{bail, Result};
-use log::info;
-use maxima::core::{
-    auth::{
-        context::AuthContext, login::begin_oauth_login_flow, nucleus_token_exchange, TokenResponse,
-    },
-    LockedMaxima, Maxima, MaximaOptionsBuilder,
-};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+
+use anyhow::Result;
+use log::{info, warn};
+use maxima_proto::{FriendDto, GameDto, MaximaClient};
 
 pub struct InteractThreadLoginResponse {
     pub success: bool,
@@ -18,21 +23,15 @@ pub enum MaximaLibRequest {
     LoginRequest,
     GetGamesRequest,
     GetFriendsRequest,
-    GetUserAvatarRequest(String, String),
-    GetGameImagesRequest(String),
-    GetGameDetailsRequest(String),
-    StartGameRequest(String, bool),
+    StartGameRequest(String),
     ShutdownRequest,
 }
 
 pub enum MaximaLibResponse {
     LoginResponse(InteractThreadLoginResponse),
     LoginCacheEmpty,
-    GameInfoResponse(),
-    FriendInfoResponse(),
-    UserAvatarResponse(),
-    GameDetailsResponse(),
-    GameUIImagesResponse(),
+    GameInfoResponse(Vec<GameDto>),
+    FriendInfoResponse(Vec<FriendDto>),
     InteractionThreadDiedResponse,
 }
 
@@ -47,138 +46,92 @@ impl BridgeThread {
         let (tx1, rx0) = mpsc::channel();
 
         tokio::task::spawn(async move {
-            let die_fallback_transmitter = tx1.clone();
-            //panic::set_hook(Box::new( |_| {}));
-            let result = BridgeThread::run(rx1, tx1).await;
-            if result.is_err() {
-                die_fallback_transmitter
-                    .send(MaximaLibResponse::InteractionThreadDiedResponse)
-                    .unwrap();
-                panic!("Interact thread failed! {}", result.err().unwrap());
+            let die = tx1.clone();
+            if let Err(err) = BridgeThread::run(rx1, tx1).await {
+                warn!("TUI backend client failed: {}", err);
+                let _ = die.send(MaximaLibResponse::InteractionThreadDiedResponse);
             } else {
-                info!("Interact thread shut down")
+                info!("TUI backend client shut down");
             }
         });
 
         Self { rx: rx0, tx: tx0 }
     }
 
-    async fn run(rx1: Receiver<MaximaLibRequest>, tx1: Sender<MaximaLibResponse>) -> Result<()> {
-        let maxima_arc: LockedMaxima = Maxima::new_with_options(
-            MaximaOptionsBuilder::default()
-                .dummy_local_user(false)
-                .load_auth_storage(true)
-                .build()?,
-        )
-        .await?;
+    async fn run(
+        rx: Receiver<MaximaLibRequest>,
+        tx: Sender<MaximaLibResponse>,
+    ) -> Result<()> {
+        // Connect to the server, spawning `maxima-cli server` if it isn't up.
+        let port = maxima_proto::server_port();
+        let cli = locate_cli();
+        let client: Arc<MaximaClient> = MaximaClient::connect_or_spawn(port, &cli).await?;
 
-        {
-            let maxima = maxima_arc.lock().await;
-            if maxima.start_lsx(maxima_arc.clone()).await.is_ok() {
-                info!("LSX started");
-            } else {
-                info!("LSX failed to start!");
-            }
-
-            let mut auth_storage = maxima.auth_storage().lock().await;
-            let logged_in = auth_storage.logged_in().await?;
-            if logged_in {
-                drop(auth_storage);
-
-                let user = maxima.local_user().await?;
-                let message = MaximaLibResponse::LoginResponse(InteractThreadLoginResponse {
+        // The server's `ready` carries the signed-in persona.
+        match client.await_ready().await {
+            Ok(persona) if !persona.is_empty() => {
+                tx.send(MaximaLibResponse::LoginResponse(InteractThreadLoginResponse {
                     success: true,
-                    name: user.player().as_ref().unwrap().display_name().to_owned(),
-                });
-
-                tx1.send(message)?;
-            } else {
-                tx1.send(MaximaLibResponse::LoginCacheEmpty)?;
+                    name: persona,
+                }))?;
+            }
+            _ => {
+                tx.send(MaximaLibResponse::LoginCacheEmpty)?;
             }
         }
 
-        'outer: loop {
-            let request = rx1.try_recv();
-            if request.is_err() {
-                continue;
-            }
-
-            match request? {
-                MaximaLibRequest::LoginRequest => {
-                    let channel = tx1.clone();
-                    let maxima = maxima_arc.clone();
-                    async move {
-                        let maxima = maxima.lock().await;
-
-                        let mut auth_storage = maxima.auth_storage().lock().await;
-                        let logged_in = auth_storage.logged_in().await?;
-                        if !logged_in {
-                            let res = login_flow().await.unwrap();
-                            maxima.auth_storage().lock().await.add_account(&res);
-                        };
-
-                        channel
-                            .send(MaximaLibResponse::LoginResponse(
-                                InteractThreadLoginResponse {
-                                    success: true,
-                                    name: maxima
-                                        .local_user()
-                                        .await?
-                                        .player()
-                                        .as_ref()
-                                        .unwrap()
-                                        .display_name()
-                                        .to_owned(),
-                                },
-                            ))
-                            .unwrap();
-
-                        Ok::<(), anyhow::Error>(())
+        // Poll the UI request channel (std mpsc) without blocking the async
+        // task, awaiting each RPC as it arrives.
+        loop {
+            match rx.try_recv() {
+                Ok(req) => match req {
+                    MaximaLibRequest::LoginRequest => {
+                        let persona = client.persona();
+                        tx.send(MaximaLibResponse::LoginResponse(InteractThreadLoginResponse {
+                            success: !persona.is_empty(),
+                            name: persona,
+                        }))?;
                     }
-                    .await?;
+                    MaximaLibRequest::GetGamesRequest => {
+                        if let Ok(games) = client.list_games().await {
+                            tx.send(MaximaLibResponse::GameInfoResponse(games))?;
+                        }
+                    }
+                    MaximaLibRequest::GetFriendsRequest => {
+                        if let Ok(friends) = client.friends().await {
+                            tx.send(MaximaLibResponse::FriendInfoResponse(friends))?;
+                        }
+                    }
+                    MaximaLibRequest::StartGameRequest(slug) => {
+                        if let Err(err) = client.launch(&slug, vec![], None, true).await {
+                            warn!("launch failed: {}", err);
+                        }
+                    }
+                    // Disconnect only — leave the shared server running for
+                    // other clients (that's the point of the server).
+                    MaximaLibRequest::ShutdownRequest => break Ok(()),
+                },
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !client.is_connected() {
+                        break Err(anyhow::anyhow!("server connection closed"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                MaximaLibRequest::GetGamesRequest => {
-                    let channel = tx1.clone();
-                    let maxima = maxima_arc.clone();
-                }
-                MaximaLibRequest::GetFriendsRequest => {
-                    let channel = tx1.clone();
-                    let maxima = maxima_arc.clone();
-                }
-                MaximaLibRequest::GetGameImagesRequest(slug) => {
-                    let channel = tx1.clone();
-                    let maxima = maxima_arc.clone();
-                }
-                MaximaLibRequest::GetUserAvatarRequest(id, url) => {
-                    let channel = tx1.clone();
-                }
-                MaximaLibRequest::GetGameDetailsRequest(slug) => {
-                    let channel = tx1.clone();
-                    let maxima = maxima_arc.clone();
-                }
-                MaximaLibRequest::StartGameRequest(offer_id, hardcode) => {
-                    //start_game_request(maxima_arc.clone(), offer_id.clone(), hardcode).await;
-                }
-                MaximaLibRequest::ShutdownRequest => break 'outer Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => break Ok(()),
             }
         }
     }
 }
 
-pub async fn login_flow() -> Result<TokenResponse> {
-    let mut auth_context = AuthContext::new()?;
-    begin_oauth_login_flow(&mut auth_context).await?;
+/// Locate `maxima-cli` next to this binary (installer / cargo layout).
+fn locate_cli() -> std::path::PathBuf {
+    #[cfg(windows)]
+    const NAME: &str = "maxima-cli.exe";
+    #[cfg(not(windows))]
+    const NAME: &str = "maxima-cli";
 
-    if auth_context.code().is_none() {
-        bail!("Login failed!");
-    }
-
-    info!("Received login...");
-
-    let token_res = nucleus_token_exchange(&auth_context).await;
-    if token_res.is_err() {
-        bail!("Login failed: {}", token_res.err().unwrap().to_string());
-    }
-
-    Ok(token_res?)
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(NAME)))
+        .unwrap_or_else(|| std::path::PathBuf::from(NAME))
 }

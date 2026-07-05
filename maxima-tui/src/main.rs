@@ -1,17 +1,7 @@
-use clap::{Parser, Subcommand};
-
-use futures::StreamExt;
-use inquire::Select;
-use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
-use regex::Regex;
+use log::{error, info, warn};
 use service::{BridgeThread, MaximaLibRequest, MaximaLibResponse};
 
-use std::{
-    io::stdout,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{io::stdout, time::Duration};
 
 #[cfg(windows)]
 use is_elevated::is_elevated;
@@ -22,43 +12,14 @@ use maxima::{
     util::service::{is_service_running, is_service_valid, register_service_user, start_service},
 };
 
-use maxima::{
-    content::downloader::ZipDownloader,
-    core::{
-        auth::{nucleus_token_exchange, TokenResponse},
-        clients::JUNO_PC_CLIENT_ID,
-        launch::LaunchMode,
-        library::OwnedTitle,
-        service_layer::{
-            ServiceGetBasicPlayerRequestBuilder, ServiceGetLegacyCatalogDefsRequestBuilder,
-            ServiceLegacyOffer, ServicePlayer, SERVICE_REQUEST_GETBASICPLAYER,
-            SERVICE_REQUEST_GETLEGACYCATALOGDEFS,
-        },
-        LockedMaxima, MaximaOptionsBuilder,
-    },
-    ooa,
-    rtm::client::BasicPresence,
-};
-use maxima::{
-    content::ContentService,
-    core::{
-        auth::{
-            context::AuthContext,
-            login::{begin_oauth_login_flow, manual_login},
-            nucleus_auth_exchange,
-        },
-        launch::{self, LaunchOptions},
-        service_layer::ServiceUserGameProduct,
-        Maxima, MaximaEvent,
-    },
-    util::{log::init_logger, native::take_foreground_focus, registry::check_registry_validity},
+// The TUI is a thin client now — it holds no in-process `Maxima`. Only these
+// host-side utilities remain (logging, wine registry check, focus). Session
+// logic lives in `service.rs`'s MaximaClient.
+use maxima::util::{
+    native::take_foreground_focus, registry::check_registry_validity,
 };
 
-lazy_static! {
-    static ref MANUAL_LOGIN_PATTERN: Regex = Regex::new(r"^(.*):(.*)$").unwrap();
-}
-
-use anyhow::{bail, Result};
+use anyhow::Result;
 use color_eyre::config::HookBuilder;
 use ratatui::{
     crossterm::{
@@ -80,6 +41,8 @@ struct App {
     popup: Option<String>,
     bridge: BridgeThread,
     username: String,
+    /// Library as reported by the server (thin-client state).
+    games: Vec<maxima_proto::GameDto>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +71,7 @@ impl App {
             popup: Some("Logging in...".to_owned()),
             bridge: BridgeThread::new(),
             username: String::new(),
+            games: Vec::new(),
         }
     }
 
@@ -158,6 +122,11 @@ impl App {
             MaximaLibResponse::LoginResponse(response) => {
                 self.popup = None;
                 self.username = response.name;
+                // Now that we're connected to the server, pull the library.
+                let _ = self.bridge.tx.send(MaximaLibRequest::GetGamesRequest);
+            }
+            MaximaLibResponse::GameInfoResponse(games) => {
+                self.games = games;
             }
             MaximaLibResponse::LoginCacheEmpty => {
                 self.popup = Some("No login cache found".to_owned());
@@ -235,7 +204,12 @@ impl Widget for &App {
         render_title(title_area, buf, &title_text);
         if !self.username.is_empty() {
             self.render_tabs(tabs_area, buf);
-            self.selected_tab.render(inner_area, buf);
+            // The Games tab shows real library state from the server; other
+            // tabs are the stock SelectedTab renderers.
+            match self.selected_tab {
+                SelectedTab::Games => self.render_library(inner_area, buf),
+                other => other.render(inner_area, buf),
+            }
             render_footer(footer_area, buf);
         }
 
@@ -254,6 +228,32 @@ impl Widget for &App {
 }
 
 impl App {
+    /// Render the real library reported by the server (thin-client state).
+    fn render_library(&self, area: Rect, buf: &mut Buffer) {
+        let lines: Vec<Line> = if self.games.is_empty() {
+            vec![Line::from("Loading library from the Maxima server…")]
+        } else {
+            self.games
+                .iter()
+                .map(|g| {
+                    let mark = if g.installed { "●" } else { "○" };
+                    Line::from(format!(
+                        "{} {}",
+                        mark,
+                        if g.display_name.is_empty() { &g.name } else { &g.display_name }
+                    ))
+                })
+                .collect()
+        };
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Library ({}) ", self.games.len())),
+            )
+            .render(area, buf);
+    }
+
     fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
         let titles = SelectedTab::iter().map(SelectedTab::title);
         let highlight_style = (Color::default(), self.selected_tab.palette().c700);
@@ -430,69 +430,3 @@ fn restore_terminal() -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn start_game(
-    offer_id: &str,
-    game_path_override: Option<String>,
-    game_args: Vec<String>,
-    login: Option<String>,
-    maxima_arc: LockedMaxima,
-) -> Result<()> {
-    {
-        let mut maxima = maxima_arc.lock().await;
-        maxima.start_lsx(maxima_arc.clone()).await?;
-
-        if login.is_none() {
-            maxima.rtm().login().await?;
-        }
-    }
-
-    let launch_options = LaunchOptions {
-        path_override: game_path_override,
-        arguments: game_args,
-        cloud_saves: true,
-        // TUI launches the way EA Desktop's UI does — Steam-Play
-        // handoffs come through bootstrap → /authorize, not through
-        // the TUI's launch path.
-        steam_app_id: None,
-    };
-
-    if login.is_none() {
-        launch::start_game(
-            maxima_arc.clone(),
-            LaunchMode::Online(offer_id.to_owned()),
-            launch_options,
-        )
-        .await?;
-    } else if let Some(captures) = MANUAL_LOGIN_PATTERN.captures(&login.unwrap()) {
-        let persona = &captures[1];
-        let password = &captures[2];
-
-        launch::start_game(
-            maxima_arc.clone(),
-            LaunchMode::OnlineOffline(offer_id.to_owned(), persona.to_owned(), password.to_owned()),
-            launch_options,
-        )
-        .await?;
-    }
-
-    loop {
-        let mut maxima = maxima_arc.lock().await;
-
-        for event in maxima.consume_pending_events() {
-            match event {
-                MaximaEvent::ReceivedLSXRequest(_pid, _request) => (),
-                _ => {}
-            }
-        }
-
-        maxima.update().await;
-        if maxima.playing().is_none() {
-            break;
-        }
-
-        drop(maxima);
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-
-    Ok(())
-}
