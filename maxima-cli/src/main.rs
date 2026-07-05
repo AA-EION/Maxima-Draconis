@@ -1,4 +1,6 @@
-mod ui_backend;
+mod server;
+#[cfg(windows)]
+mod tray;
 
 use clap::{Parser, Subcommand};
 
@@ -268,15 +270,24 @@ enum Mode {
         #[arg(long)]
         wine_prefix: Option<String>,
     },
-    /// Long-running JSONL backend for native UI frontends: holds the
-    /// logged-in session, LSX server, /authorize endpoint and RTM presence
-    /// open, reads JSON requests from stdin (list-games, friends, launch,
-    /// install) and pushes responses + events (presence diffs, install
-    /// progress, game lifecycle) on stdout. One backend process = the same
-    /// role the egui UI's bridge_thread plays in-process; architecture
-    /// mirrors upstream PR #23's "Maxima Server" direction. Exits on stdin
-    /// EOF.
-    UiBackend,
+    /// The multi-client Maxima server: holds the logged-in session, LSX
+    /// server, /authorize endpoint and RTM presence, and serves many
+    /// concurrent clients over loopback TCP (default 127.0.0.1:13220,
+    /// override with MAXIMA_SERVER_PORT). Every client sees the same state —
+    /// launch a game from the CLI and a connected UI shows it. This is
+    /// upstream PR #23's "Maxima Server" architecture. Runs until
+    /// `server-stop`, the tray's Stop item, or a `shutdown` request.
+    /// Normally started automatically by a frontend (or at logon); run it
+    /// by hand for a headless machine.
+    Server,
+    /// Stop a running Maxima server (sends `shutdown` to its control port).
+    ServerStop,
+    /// Report whether a Maxima server is running, and its session state.
+    ServerStatus {
+        /// Emit a single JSON object instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Register Maxima's URL protocol handlers with the host OS. On macOS
     /// this registers MaximaBootstrap.app (built by
     /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
@@ -457,7 +468,7 @@ fn json_mode(args: &Args) -> bool {
             | Some(Mode::Verify { json: true, .. })
             | Some(Mode::Launch { json: true, .. })
             | Some(Mode::BottleInfo { json: true, .. })
-            | Some(Mode::UiBackend)
+            | Some(Mode::ServerStatus { json: true })
     )
 }
 
@@ -589,6 +600,17 @@ async fn startup(args: Args) -> Result<()> {
     // exit hits the file sink and the panic hook is already installed by
     // the time the runtime is built.
 
+    // Pure client-side control commands talk to a *running* server and need
+    // no session of their own — short-circuit before any login / Maxima
+    // setup so `server-stop` doesn't itself try to authenticate.
+    match &args.mode {
+        Some(Mode::ServerStop) => return server::send_shutdown(server::server_port()).await,
+        Some(Mode::ServerStatus { json }) => {
+            return server::print_status(server::server_port(), *json).await
+        }
+        _ => {}
+    }
+
     info!("Starting Maxima...");
 
     native_setup().await?;
@@ -654,6 +676,27 @@ async fn startup(args: Args) -> Result<()> {
             // predictable for callers that mix both styles.
             let mut game_args = game_args;
             game_args.extend(trailing_args);
+
+            // If a Maxima server is already running, forward the launch to it
+            // so its session drives the game and every connected client
+            // (egui UI, tray) sees `game-started`/`game-stopped`. Only when a
+            // server is up — a bare `maxima-cli launch` with no server keeps
+            // the standalone in-process path below (Draconis's contract).
+            // `--login` (offline/manual) is never forwarded; it's a
+            // self-contained mode.
+            let port = server::server_port();
+            if login.is_none() && server::is_running(port).await {
+                let mut req = serde_json::json!({"id": 1, "cmd": "launch", "slug": slug});
+                if !game_args.is_empty() {
+                    req["args"] = serde_json::json!(game_args);
+                }
+                if let Some(p) = &game_path {
+                    req["exe_override"] = serde_json::json!(p);
+                }
+                info!("Forwarding launch of '{}' to the running Maxima server", slug);
+                return server::forward_streaming(port, req, &["game-stopped"], json).await;
+            }
+
             let offer_id = if login.is_none() {
                 let mut maxima = maxima_arc.lock().await;
 
@@ -823,6 +866,31 @@ async fn startup(args: Args) -> Result<()> {
             only_listed_files,
             json,
         } => {
+            // Forward a *plain* install to a running server so its download
+            // queue drives it and every client sees progress. The
+            // specialized CEG-fix flags (--replace-files / --only-listed-
+            // files / --build-id) stay in-process — the server API doesn't
+            // model surgical file replacement.
+            let port = server::server_port();
+            if replace_files.is_empty()
+                && !only_listed_files
+                && build_id.is_none()
+                && server::is_running(port).await
+            {
+                let mut req = serde_json::json!({"id": 1, "cmd": "install", "slug": slug});
+                if let Some(p) = &path {
+                    req["path"] = serde_json::json!(p);
+                }
+                info!("Forwarding install of '{}' to the running Maxima server", slug);
+                return server::forward_streaming(
+                    port,
+                    req,
+                    &["install-done", "install-error"],
+                    json,
+                )
+                .await;
+            }
+
             // macOS: select/create the per-game CrossOver bottle before the
             // install — the touchup steps (vcredist etc.) run through wine
             // and resolve the prefix via wine_prefix_dir() — and default
@@ -900,7 +968,10 @@ async fn startup(args: Args) -> Result<()> {
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::BottleInfo { slug, json } => bottle_info(maxima_arc.clone(), &slug, json).await,
-        Mode::UiBackend => ui_backend::run_ui_backend(maxima_arc.clone()).await,
+        Mode::Server => server::run_server(maxima_arc.clone()).await,
+        // ServerStop / ServerStatus are handled earlier (pure client, no
+        // login); they never reach this match.
+        Mode::ServerStop | Mode::ServerStatus { .. } => Ok(()),
         Mode::RegisterProtocols => {
             #[cfg(unix)]
             {

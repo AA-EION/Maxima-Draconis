@@ -198,8 +198,6 @@ async fn run_via_cxstart(
     exe: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
 ) -> Result<String, NativeError> {
-    use sysinfo::{ProcessExt, System, SystemExt};
-
     let bottle = prefix
         .file_name()
         .and_then(|n| n.to_str())
@@ -237,16 +235,27 @@ async fn run_via_cxstart(
         return Ok(String::new());
     }
 
+    // Detect the game via `pgrep -f`, NOT sysinfo: on macOS sysinfo can't
+    // read the command line of wine's (Rosetta-hosted) processes, so a
+    // sysinfo scan never sees the game and the poll below always ran out its
+    // full timeout. `pgrep -f <basename>` matches the game (`C:\…\Titanfall2
+    // .exe`) and its winewrapper — which exit together — and nothing else
+    // (the bootstrap's argv is an opaque base64 blob). It returns exit 0
+    // when a match exists, 1 when none.
+    // ponytail: two concurrent launches of the SAME exe alias here — a
+    // degenerate case (you can't run one game twice), left simple.
+    // Absolute path: the bootstrap (and a launchd-started server) can have a
+    // minimal PATH that doesn't include /usr/bin, so `Command::new("pgrep")`
+    // would fail to spawn and report the game as never-running.
     let running = |needle: &str| -> bool {
-        let sys = System::new_all();
-        sys.processes().values().any(|p| {
-            p.name().to_lowercase().contains(needle)
-                || p
-                    .cmd()
-                    .first()
-                    .map(|c| c.to_lowercase().contains(needle))
-                    .unwrap_or(false)
-        })
+        std::process::Command::new("/usr/bin/pgrep")
+            .arg("-if") // -i: case-insensitive (proc is "Titanfall2.exe")
+            .arg(needle)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     };
 
     let mut appeared = false;
