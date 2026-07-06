@@ -7,8 +7,11 @@
 //! on demand (or it starts at logon), and it stays up for every client.
 
 mod server;
+mod status_icon;
 #[cfg(windows)]
 mod tray;
+#[cfg(all(target_os = "linux", feature = "linux-tray"))]
+mod linux_tray;
 
 use anyhow::{bail, Result};
 use log::{error, info, warn};

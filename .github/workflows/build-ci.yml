@@ -112,15 +112,23 @@ jobs:
 
     - name: Build Maxima
       if: runner.os == 'Linux'
-      # Only build the Draconis-relevant crates. maxima-ui pulls accesskit_unix →
-      # zbus 3 → async-io 1.13 → rustix 0.37.28, which doesn't build on modern
-      # nightly (uses `rustc_attrs` which is now a reserved namespace).
+      # Build the Draconis-relevant crates + the server. maxima-ui pulls
+      # accesskit_unix → zbus 3 → async-io 1.13 → rustix 0.37.28, which doesn't
+      # build on modern nightly (uses `rustc_attrs`, now a reserved namespace).
       # maxima-service is windows-only. We skip both here.
       run: |
         cargo build --release --target x86_64-unknown-linux-musl \
-          -p maxima-cli -p maxima-bootstrap
+          -p maxima-cli -p maxima-bootstrap -p maxima-server
       env:
         RUSTFLAGS: "-C target-feature=+crt-static"
+
+    - name: Check Linux SNI tray (feature linux-tray)
+      if: runner.os == 'Linux'
+      # The optional server status-icon tray (ksni, pure D-Bus). Off by default,
+      # so this is the only place it's compiled — checked on the host gnu target
+      # (a full cross-static musl build of zbus isn't needed just to typecheck).
+      run: |
+        cargo check -p maxima-server --features linux-tray
 
     - name: File Permissions
       if: runner.os == 'Linux'

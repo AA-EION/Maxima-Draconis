@@ -32,10 +32,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
-/// Default control port. LSX is 3216, authorize is 13219; the server control
-/// channel is 13220.
-pub const DEFAULT_PORT: u16 = maxima_proto::DEFAULT_PORT;
-
 pub fn server_port() -> u16 {
     maxima_proto::server_port()
 }
@@ -116,8 +112,9 @@ pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
 
     info!("Maxima server listening on 127.0.0.1:{} (persona: {})", port, persona);
 
-    #[cfg(windows)]
-    crate::tray::spawn_tray(port);
+    // The server owns its status-bar icon on every OS (Windows tray / macOS
+    // menu-bar host / Linux SNI behind a feature). Menu: Open Maxima / Stop.
+    crate::status_icon::spawn(port);
 
     let tick_state = state.clone();
     tokio::spawn(async move { tick_loop(tick_state).await });

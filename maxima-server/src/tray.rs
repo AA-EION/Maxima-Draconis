@@ -26,9 +26,10 @@ use winapi::um::shellapi::{
 };
 use winapi::um::winuser::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadIconW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, IDI_APPLICATION, MF_STRING, MSG, TPM_LEFTALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    GetCursorPos, GetMessageW, LoadIconW, MAKEINTRESOURCEW, PostMessageW, RegisterClassW,
+    SetForegroundWindow, TrackPopupMenu, TranslateMessage, IDI_APPLICATION, MF_STRING, MSG,
+    TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_NULL, WM_RBUTTONUP,
+    WNDCLASSW,
 };
 
 const TRAY_CALLBACK: UINT = WM_APP + 1;
@@ -95,7 +96,13 @@ unsafe fn run(_port: u16) {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = TRAY_CALLBACK;
-    nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    // Maxima's own logo (embedded by build.rs / winres as icon id 1), falling
+    // back to the generic application icon if the resource isn't present.
+    let mut icon = LoadIconW(hinstance, MAKEINTRESOURCEW(1));
+    if icon.is_null() {
+        icon = LoadIconW(null_mut(), IDI_APPLICATION);
+    }
+    nid.hIcon = icon;
     let tip = wide("Maxima server");
     for (i, ch) in tip.iter().enumerate().take(nid.szTip.len()) {
         nid.szTip[i] = *ch;

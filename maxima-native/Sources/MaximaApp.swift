@@ -41,10 +41,25 @@ private let napPreventionToken: NSObjectProtocol = ProcessInfo.processInfo.begin
     reason: "Maxima keeps its game session backend responsive"
 )
 
+/// When launched with `--menubar` (the server spawns the menu-bar host this
+/// way), Maxima runs as a menu-bar accessory: no Dock icon, no auto-opened
+/// window — just the `MenuBarExtra`. "Open Maxima" promotes it to a regular
+/// windowed app on demand. Launched normally (double-click), it's a regular
+/// windowed app from the start.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static let menubarMode = CommandLine.arguments.contains("--menubar")
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if AppDelegate.menubarMode {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+}
+
 @main
 struct MaximaApp: App {
     @StateObject private var store = GameStore()
     @Environment(\.openWindow) private var openWindow
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         _ = napPreventionToken
@@ -57,6 +72,9 @@ struct MaximaApp: App {
                 .frame(minWidth: 960, minHeight: 600)
                 .task { store.start() }
         }
+        // In menu-bar mode the window is suppressed at launch; "Open Maxima"
+        // opens it on demand.
+        .defaultLaunchBehavior(AppDelegate.menubarMode ? .suppressed : .automatic)
 
         // macOS's idiomatic "bar icon": a menu-bar extra reflecting the
         // shared server, with the same three actions the Windows tray and
@@ -81,6 +99,8 @@ struct MaximaApp: App {
             }
             Divider()
             Button("Open Maxima") {
+                // Promote from menu-bar accessory to a regular windowed app.
+                NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "main")
             }

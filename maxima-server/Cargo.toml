@@ -12,6 +12,16 @@ edition = "2021"
 name = "maxima-server"
 path = "src/main.rs"
 
+[features]
+# Linux desktop StatusNotifierItem tray (no GTK; pure-Rust via ksni). Off by
+# default so the standard Linux/server build stays headless + dep-free. See
+# docs/MACOS_BUNDLING.md.
+linux-tray = ["dep:ksni"]
+
+[build-dependencies]
+# Embeds logo.ico + version info into maxima-server.exe (Windows only).
+maxima-resources = { path = "../maxima-resources" }
+
 [dependencies]
 maxima-lib = { path = "../maxima-lib" }
 maxima-proto = { path = "../maxima-proto" }
@@ -22,3 +32,8 @@ log = "0.4.19"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [ "winuser", "shellapi", "libloaderapi", "windef", "minwindef", "wingdi" ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only pulled in when the `linux-tray` feature is enabled (SNI tray). Pure
+# Rust (D-Bus, no GTK).
+ksni = { version = "0.2.2", optional = true }
