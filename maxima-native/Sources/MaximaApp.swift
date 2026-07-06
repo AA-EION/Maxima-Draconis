@@ -1,7 +1,35 @@
+import AppKit
 import SwiftUI
 
 /// Maxima's brand orange — same value as the egui UI's `F9B233` accent.
 let maximaOrange = Color(red: 249 / 255, green: 178 / 255, blue: 51 / 255)
+
+/// The server's status-bar mark: a solid circle with the letter **M** knocked
+/// out of it (the M is the negative/transparent part). Drawn as a template
+/// image so the menu bar tints the circle to match light/dark automatically.
+func maximaStatusIcon() -> NSImage {
+    let size = NSSize(width: 18, height: 18)
+    let image = NSImage(size: size, flipped: false) { rect in
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+        // Positive: the solid circle.
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fillEllipse(in: rect.insetBy(dx: 1, dy: 1))
+        // Negative: cut the M out of the circle.
+        ctx.setBlendMode(.destinationOut)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: rect.height * 0.6, weight: .heavy),
+            .foregroundColor: NSColor.black,
+        ]
+        let m = "M" as NSString
+        let ms = m.size(withAttributes: attrs)
+        m.draw(
+            at: NSPoint(x: rect.midX - ms.width / 2, y: rect.midY - ms.height / 2),
+            withAttributes: attrs)
+        return true
+    }
+    image.isTemplate = true
+    return image
+}
 
 /// Held for the app's lifetime: Maxima.app must never App Nap. macOS
 /// responsibility-attributes the backend — and transitively the wine/game
@@ -34,7 +62,15 @@ struct MaximaApp: App {
         // shared server, with the same three actions the Windows tray and
         // the CLI expose — open the UI, stop the server, quit. (Windows uses
         // the native tray inside the server; Linux runs headless.)
-        MenuBarExtra("Maxima", systemImage: "gamecontroller") {
+        MenuBarExtra {
+            menuBarContent
+        } label: {
+            Image(nsImage: maximaStatusIcon())
+        }
+    }
+
+    @ViewBuilder private var menuBarContent: some View {
+        Group {
             switch store.backendState {
             case .ready(let persona):
                 Text(persona.isEmpty ? "Connected" : "Signed in as \(persona)")
