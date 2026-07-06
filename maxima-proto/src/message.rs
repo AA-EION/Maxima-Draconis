@@ -45,6 +45,17 @@ pub enum Request {
         slug: String,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
+        build_id: Option<String>,
+        /// Files (relative to the install path) to force-replace before the
+        /// install runs — deleted so the downloader re-fetches them. Not
+        /// game-specific: any file of any title (the Steam-CEG fix is just
+        /// one caller).
+        #[serde(default)]
+        replace_files: Vec<String>,
+        /// Restrict the install to ONLY `replace_files` (surgical refresh).
+        #[serde(default)]
+        only_listed_files: bool,
     },
     LocateGame {
         path: String,
@@ -54,6 +65,28 @@ pub enum Request {
         #[serde(default)]
         write: bool,
     },
+    /// Size-verify a game's files against the build manifest; `repair`
+    /// re-downloads the broken ones.
+    Verify {
+        slug: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        repair: bool,
+    },
+    /// Download a single named file from a game's build manifest.
+    DownloadFile {
+        slug: String,
+        #[serde(default)]
+        build_id: Option<String>,
+        file: String,
+    },
+    /// Read-only bottle / prefix / game-dir readout (creates nothing).
+    BottleInfo {
+        slug: String,
+    },
+    /// Register Maxima's URL protocol handlers with the host OS.
+    RegisterProtocols,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,6 +157,21 @@ pub enum Notification {
         current: Option<String>,
         #[serde(default)]
         queued: Vec<String>,
+    },
+    VerifyProgress {
+        slug: String,
+        files_checked: u64,
+        total_files: u64,
+    },
+    VerifyDone {
+        slug: String,
+        ok: u64,
+        broken: u64,
+        repaired: bool,
+    },
+    VerifyError {
+        slug: String,
+        message: String,
     },
 }
 

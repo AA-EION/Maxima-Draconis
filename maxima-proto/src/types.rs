@@ -87,6 +87,25 @@ impl PresenceDto {
     }
 }
 
+/// Read-only bottle / wine-prefix / game-dir readout for a title.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct BottleInfoDto {
+    pub slug: String,
+    pub bottle_name: Option<String>,
+    pub wine_prefix: Option<String>,
+    pub wine_prefix_exists: bool,
+    pub default_game_dir: Option<String>,
+    pub game_dir_exists: bool,
+}
+
+/// Result of a verify pass over a game's files.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct VerifyResultDto {
+    pub verified: u64,
+    pub broken: Vec<String>,
+    pub repaired: bool,
+}
+
 /// Session status snapshot.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct StatusDto {

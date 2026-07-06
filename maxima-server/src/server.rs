@@ -348,13 +348,25 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
         )
         .await
         .map(|_| json!({})),
-        Request::Install { slug, path } => {
-            cmd_install(state, slug, path).await.map(|_| json!({}))
+        Request::Install { slug, path, build_id, replace_files, only_listed_files } => {
+            cmd_install(state, slug, path, build_id, replace_files, only_listed_files)
+                .await
+                .map(|_| json!({}))
         }
         Request::LocateGame { path } => cmd_locate(state, &path).await.map(|_| json!({})),
         Request::CloudSync { slug, write } => {
             cmd_cloud_sync(state, &slug, write).await.map(|_| json!({}))
         }
+        Request::Verify { slug, path, repair } => {
+            cmd_verify(state, slug, path, repair).await.map(|_| json!({}))
+        }
+        Request::DownloadFile { slug, build_id, file } => {
+            cmd_download_file(state, &slug, build_id, &file).await.map(|_| json!({}))
+        }
+        Request::BottleInfo { slug } => {
+            cmd_bottle_info(state, &slug).await.map(|b| json!({ "bottle": b }))
+        }
+        Request::RegisterProtocols => cmd_register_protocols().await.map(|_| json!({})),
     };
 
     match result {
@@ -572,31 +584,117 @@ async fn cmd_launch(
     Ok(())
 }
 
-async fn cmd_install(state: &Arc<ServerState>, typed: String, path: Option<String>) -> Result<()> {
-    use maxima::content::manager::QueuedGameBuilder;
-
-    if state.installing.lock().await.is_some() {
-        anyhow::bail!("another install is already running");
-    }
-    let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-
-    let install_path = match path {
-        Some(p) => std::path::PathBuf::from(p),
+/// Resolve the install path for a game — explicit, or the conventional
+/// per-bottle dir.
+fn install_dir_for(slug: &str, path: Option<String>) -> Result<std::path::PathBuf> {
+    match path {
+        Some(p) => Ok(std::path::PathBuf::from(p)),
         None => {
             let prefix = std::env::var("MAXIMA_WINE_PREFIX")
                 .map_err(|_| anyhow::anyhow!("no path and no bottle selected for {}", slug))?;
-            std::path::Path::new(&prefix).join("drive_c").join("Games").join(&slug)
+            Ok(std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug))
+        }
+    }
+}
+
+/// Reject `..` / absolute segments so a bad replace-files entry can't escape
+/// the install dir.
+fn safe_relative(relative: &str) -> Result<()> {
+    if relative
+        .split(['/', '\\'])
+        .any(|seg| seg == ".." || seg.is_empty())
+        || std::path::PathBuf::from(relative).is_absolute()
+    {
+        anyhow::bail!("replace-files entries must be relative paths without '..': '{}'", relative);
+    }
+    Ok(())
+}
+
+async fn cmd_install(
+    state: &Arc<ServerState>,
+    typed: String,
+    path: Option<String>,
+    build_id_override: Option<String>,
+    replace_files: Vec<String>,
+    only_listed_files: bool,
+) -> Result<()> {
+    use maxima::content::manager::QueuedGameBuilder;
+    use maxima::content::{downloader::ZipDownloader, ContentService};
+
+    let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
+    let install_path = install_dir_for(&slug, path)?;
+
+    // Pre-install replace step: delete listed files so the downloader
+    // re-fetches them (works for ANY file of ANY game — the Steam-CEG fix
+    // is just one caller).
+    for relative in replace_files.iter().filter(|s| !s.is_empty()) {
+        safe_relative(relative)?;
+        let target = install_path.join(relative);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            if meta.is_file() {
+                let _ = std::fs::remove_file(&target);
+            }
+        }
+    }
+
+    // Resolve the build id.
+    let build_id = match build_id_override {
+        Some(b) => b,
+        None => {
+            let mut maxima = state.maxima.lock().await;
+            let builds =
+                maxima.content_manager().service().available_builds(&offer_id).await?;
+            builds
+                .live_build()
+                .ok_or_else(|| anyhow::anyhow!("no live build for {}", slug))?
+                .build_id()
+                .to_owned()
         }
     };
 
+    // Surgical refresh: pull ONLY the listed files from the manifest, never
+    // run the full install. Runs inline (few files) and broadcasts progress.
+    if only_listed_files {
+        let auth = { state.maxima.lock().await.auth_storage().clone() };
+        let content_service = ContentService::new(auth);
+        let url = content_service.download_url(&offer_id, Some(&build_id)).await?;
+        let downloader = ZipDownloader::new(&offer_id, url.url(), install_path.clone()).await?;
+        let entries = downloader.manifest().entries();
+        let listed: Vec<&String> = replace_files.iter().filter(|s| !s.is_empty()).collect();
+        let total = listed.len().max(1);
+
+        for (idx, relative) in listed.iter().enumerate() {
+            let normalized = relative.replace('\\', "/");
+            let entry = entries
+                .iter()
+                .find(|e| {
+                    let n = e.name();
+                    n.eq_ignore_ascii_case(&normalized)
+                        || (n.contains('\\')
+                            && n.replace('\\', "/").eq_ignore_ascii_case(&normalized))
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("file '{}' not found in build {} manifest", relative, build_id)
+                })?;
+            state.notify(Notification::InstallProgress {
+                slug: slug.clone(),
+                percent: (idx as f64 / total as f64) * 100.0,
+            });
+            downloader.download_single_file(entry, None).await?;
+        }
+        state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 100.0 });
+        state.notify(Notification::InstallDone { slug: Some(slug) });
+        return Ok(());
+    }
+
+    // Full install: queue it; the tick loop broadcasts progress.
+    if state.installing.lock().await.is_some() {
+        anyhow::bail!("another install is already running");
+    }
     let mut maxima = state.maxima.lock().await;
-    let builds = maxima.content_manager().service().available_builds(&offer_id).await?;
-    let build = builds
-        .live_build()
-        .ok_or_else(|| anyhow::anyhow!("no live build for {}", slug))?;
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
-        .build_id(build.build_id().to_owned())
+        .build_id(build_id)
         .path(install_path)
         .build()?;
     maxima.content_manager().install_now(game).await?;
@@ -605,6 +703,198 @@ async fn cmd_install(state: &Arc<ServerState>, typed: String, path: Option<Strin
     *state.installing.lock().await = Some(slug.clone());
     state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 0.0 });
     state.notify(Notification::DownloadQueue { current: Some(slug), queued: vec![] });
+    Ok(())
+}
+
+/// Size-verify a game's files against the build manifest; `repair`
+/// re-downloads the broken ones via the same replace-files primitive.
+async fn cmd_verify(
+    state: &Arc<ServerState>,
+    typed: String,
+    path: Option<String>,
+    repair: bool,
+) -> Result<()> {
+    use maxima::content::{downloader::ZipDownloader, ContentService};
+    use tokio::fs;
+
+    let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
+    let install_path = install_dir_for(&slug, path.clone())?;
+    if !fs::try_exists(&install_path).await.unwrap_or(false) {
+        anyhow::bail!("install path '{}' doesn't exist", install_path.display());
+    }
+
+    let (manifest_url, build_id) = {
+        let maxima = state.maxima.lock().await;
+        let content_service = ContentService::new(maxima.auth_storage().clone());
+        let builds = content_service.available_builds(&offer_id).await?;
+        let build = builds
+            .live_build()
+            .ok_or_else(|| anyhow::anyhow!("no live build for {}", offer_id))?;
+        let build_id = build.build_id().to_owned();
+        let url = content_service.download_url(&offer_id, Some(&build_id)).await?;
+        (url.url().to_owned(), build_id)
+    };
+
+    let downloader = ZipDownloader::new(&offer_id, &manifest_url, &install_path).await?;
+    let entries = downloader.manifest().entries();
+    let total = entries.len() as u64;
+    info!("Verifying {} files for '{}' (build {})", total, offer_id, build_id);
+
+    let mut broken: Vec<String> = Vec::new();
+    let progress_every = std::cmp::max(entries.len() / 20, 100);
+    for (i, entry) in entries.iter().enumerate() {
+        let name = entry.name();
+        if name.ends_with('/') || *entry.uncompressed_size() == 0 {
+            continue;
+        }
+        let expected = *entry.uncompressed_size();
+        let actual = fs::metadata(install_path.join(name))
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+        if actual != expected {
+            broken.push(name.clone());
+        }
+        if (i + 1) % progress_every == 0 {
+            state.notify(Notification::VerifyProgress {
+                slug: slug.clone(),
+                files_checked: (i + 1) as u64,
+                total_files: total,
+            });
+        }
+    }
+
+    let ok = total - broken.len() as u64;
+    if broken.is_empty() {
+        state.notify(Notification::VerifyDone {
+            slug: slug.clone(),
+            ok,
+            broken: 0,
+            repaired: false,
+        });
+        return Ok(());
+    }
+
+    if repair {
+        info!("Repairing {} broken file(s)…", broken.len());
+        let broken_clone = broken.clone();
+        // Reuse the surgical replace path.
+        Box::pin(cmd_install(
+            state,
+            slug.clone(),
+            path,
+            None,
+            broken_clone,
+            true,
+        ))
+        .await?;
+        state.notify(Notification::VerifyDone {
+            slug,
+            ok,
+            broken: broken.len() as u64,
+            repaired: true,
+        });
+    } else {
+        state.notify(Notification::VerifyDone {
+            slug,
+            ok,
+            broken: broken.len() as u64,
+            repaired: false,
+        });
+    }
+    Ok(())
+}
+
+/// Download a single named file from a game's build manifest into its
+/// install dir.
+async fn cmd_download_file(
+    state: &Arc<ServerState>,
+    typed: &str,
+    build_id: Option<String>,
+    file: &str,
+) -> Result<()> {
+    use maxima::content::{downloader::ZipDownloader, ContentService};
+
+    let (slug, offer_id) = resolve_game(&state.maxima, typed).await?;
+    let install_path = install_dir_for(&slug, None)?;
+
+    let auth = { state.maxima.lock().await.auth_storage().clone() };
+    let content_service = ContentService::new(auth);
+    let build_id = match build_id {
+        Some(b) => b,
+        None => {
+            let builds = content_service.available_builds(&offer_id).await?;
+            builds
+                .live_build()
+                .ok_or_else(|| anyhow::anyhow!("no live build for {}", offer_id))?
+                .build_id()
+                .to_owned()
+        }
+    };
+    let url = content_service.download_url(&offer_id, Some(&build_id)).await?;
+    let downloader = ZipDownloader::new(&offer_id, url.url(), install_path).await?;
+    let entry = downloader
+        .manifest()
+        .entries()
+        .iter()
+        .find(|e| e.name() == file)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("file '{}' not found in build {}", file, build_id))?;
+    downloader.download_single_file(&entry, None).await?;
+    info!("Downloaded {} from build {}", file, build_id);
+    Ok(())
+}
+
+/// Read-only bottle / prefix / game-dir readout (creates nothing).
+async fn cmd_bottle_info(
+    state: &Arc<ServerState>,
+    typed: &str,
+) -> Result<maxima_proto::types::BottleInfoDto> {
+    let slug = {
+        let mut maxima = state.maxima.lock().await;
+        maxima.mut_library().canonical_slug(typed).await
+    };
+
+    let env_prefix = std::env::var("MAXIMA_WINE_PREFIX").ok().map(std::path::PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
+        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
+        None => {
+            let name = format!("Maxima-{}", slug);
+            let p = maxima::unix::crossover::bottles_dir().ok().map(|d| d.join(&name));
+            (Some(name), p)
+        }
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
+        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
+        None => (None, maxima::unix::wine::wine_prefix_dir().ok()),
+    };
+    #[cfg(windows)]
+    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = (None, None);
+
+    let game_dir = prefix.as_ref().map(|p| p.join("drive_c").join("Games").join(&slug));
+    let wine_prefix_exists = prefix.as_ref().map(|p| p.join("system.reg").exists()).unwrap_or(false);
+    let game_dir_exists = game_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    Ok(maxima_proto::types::BottleInfoDto {
+        slug,
+        bottle_name,
+        wine_prefix: prefix.as_ref().map(|p| p.display().to_string()),
+        wine_prefix_exists,
+        default_game_dir: game_dir.as_ref().map(|p| p.display().to_string()),
+        game_dir_exists,
+    })
+}
+
+/// Register Maxima's URL protocol handlers with the host OS.
+async fn cmd_register_protocols() -> Result<()> {
+    #[cfg(unix)]
+    {
+        maxima::util::registry::set_up_registry()?;
+        info!("Protocol handlers registered");
+    }
     Ok(())
 }
 

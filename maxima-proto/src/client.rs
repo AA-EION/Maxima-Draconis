@@ -15,7 +15,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
 use crate::message::{Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage};
-use crate::types::{FriendDto, GameDetailsDto, GameDto, GameImagesDto, StatusDto, UserDto};
+use crate::types::{
+    BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, StatusDto, UserDto,
+};
 
 pub const DEFAULT_PORT: u16 = 13220;
 
@@ -261,9 +263,66 @@ impl MaximaClient {
     }
 
     pub async fn install(&self, slug: &str, path: Option<String>) -> Result<(), ClientError> {
-        self.request(Request::Install { slug: slug.to_owned(), path })
+        self.install_full(slug, path, None, vec![], false).await
+    }
+
+    /// Install with the full option set: a specific `build_id`, a
+    /// `replace_files` list (force-refresh those files of any game), and
+    /// `only_listed_files` (surgical refresh, e.g. the Steam-CEG fix).
+    pub async fn install_full(
+        &self,
+        slug: &str,
+        path: Option<String>,
+        build_id: Option<String>,
+        replace_files: Vec<String>,
+        only_listed_files: bool,
+    ) -> Result<(), ClientError> {
+        self.request(Request::Install {
+            slug: slug.to_owned(),
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn verify(
+        &self,
+        slug: &str,
+        path: Option<String>,
+        repair: bool,
+    ) -> Result<(), ClientError> {
+        self.request(Request::Verify { slug: slug.to_owned(), path, repair })
             .await
             .map(|_| ())
+    }
+
+    pub async fn download_file(
+        &self,
+        slug: &str,
+        build_id: Option<String>,
+        file: &str,
+    ) -> Result<(), ClientError> {
+        self.request(Request::DownloadFile {
+            slug: slug.to_owned(),
+            build_id,
+            file: file.to_owned(),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn bottle_info(&self, slug: &str) -> Result<BottleInfoDto, ClientError> {
+        self.request(Request::BottleInfo { slug: slug.to_owned() })
+            .await?
+            .field("bottle")
+            .ok_or(ClientError::Malformed("bottle"))
+    }
+
+    pub async fn register_protocols(&self) -> Result<(), ClientError> {
+        self.request(Request::RegisterProtocols).await.map(|_| ())
     }
 
     pub async fn locate_game(&self, path: &str) -> Result<(), ClientError> {

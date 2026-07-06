@@ -20,6 +20,6 @@ pub use message::{
     Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage,
 };
 pub use types::{
-    ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, PresenceDto, StatusDto,
-    UserDto,
+    BottleInfoDto, ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, PresenceDto,
+    StatusDto, UserDto, VerifyResultDto,
 };
