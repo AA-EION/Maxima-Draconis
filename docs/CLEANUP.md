@@ -13,7 +13,12 @@ remembers). When you notice new leftovers, add a row.
 
 ---
 
-## 1. `maxima-cli` — dormant in-process implementations (DEAD)
+> **Status:** §1 and §2 below are **DONE** (commit `refactor(cli): delete dead
+> in-process product commands; forward locate-game`) — kept here as a record of
+> what was removed. §5 (status icon) is **DONE** (server owns the icon on all
+> OSes). §3, §4, §6 remain.
+
+## 1. `maxima-cli` — dormant in-process implementations (DEAD) — ✅ removed
 
 `startup()` in [maxima-cli/src/main.rs](../maxima-cli/src/main.rs) has a
 *forward-first* block near the top (~L596–652). It routes every product command
@@ -48,13 +53,10 @@ interactive/diagnostic shell.
 
 ---
 
-## 2. `maxima-cli` — inconsistent forwarding (LEFTOVER)
+## 2. `maxima-cli` — inconsistent forwarding — ✅ fixed
 
-- **`Mode::LocateGame`** is *not* in the forward-first block, so `locate_game`
-  (~L2302) still spins up its own session in-process. The proto already has a
-  `LocateGame` RPC and `server::` has no runner for it. **Plan:** add
-  `server::run_locate_game` and forward it, then the in-process `locate_game`
-  joins the dead list above.
+- **`Mode::LocateGame`** now forwards via `server::run_locate_game`
+  (`client.locate_game`), and the in-process `locate_game` was deleted.
 
 ## 3. `maxima-cli` — entry points that duplicate the server (REDUNDANT, decide)
 
@@ -87,13 +89,11 @@ proto would mean adding RPCs nobody but a developer calls. Left as-is.
 
 ---
 
-## 5. Cross-cutting: two dead exit-detection / tray gaps
+## 5. Status icon — ✅ server-owned on all OSes
 
-- **`maxima-server` status icon is Windows-only.** [tray.rs](../maxima-server/src/tray.rs)
-  is `#![cfg(windows)]`; on macOS/Linux the server draws nothing. The
-  server-owned status icon on macOS + Linux is the subject of the bundling work
-  (see [docs/MACOS_BUNDLING.md](MACOS_BUNDLING.md)); until that lands, the macOS
-  icon only exists while `Maxima.app` (the UI) is open, and Linux is headless.
+`maxima-server/src/status_icon.rs` dispatches per-OS: Windows tray (now the
+`logo.ico`), macOS spawns the `Maxima.app --menubar` host, Linux SNI tray behind
+the off-by-default `linux-tray` feature. See [MACOS_BUNDLING.md](MACOS_BUNDLING.md).
 
 ## 6. egui `maxima-ui` — still an in-process session (HALF-DONE, task #24)
 
