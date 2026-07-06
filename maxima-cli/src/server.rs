@@ -64,38 +64,14 @@ pub async fn print_status(port: u16, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-/// Locate the `maxima-server` binary: next to this executable (installer /
-/// cargo layout) or on `PATH` as a fallback.
-pub fn locate_server_binary() -> std::path::PathBuf {
-    #[cfg(windows)]
-    const NAME: &str = "maxima-server.exe";
-    #[cfg(not(windows))]
-    const NAME: &str = "maxima-server";
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join(NAME);
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    // The stable App Support copy (macOS) — see docs/MACOS_BUNDLING.md.
-    if let Some(dir) = maxima::server_client::app_support_bin_dir() {
-        let p = dir.join(NAME);
-        if p.is_file() {
-            return p;
-        }
-    }
-    std::path::PathBuf::from(NAME)
-}
-
-/// Ensure a server is up, spawning `maxima-server` detached if not.
+/// Ensure a server is up, spawning `maxima-server` detached if not. Discovery
+/// (sibling → App Support → PATH) is shared with every other frontend via
+/// `maxima::server_client::locate_server`.
 pub async fn ensure_server_running(port: u16) -> Result<()> {
     if is_running(port).await {
         return Ok(());
     }
-    let bin = locate_server_binary();
+    let bin = maxima::server_client::locate_server();
     info!("No server on port {}; starting {}", port, bin.display());
     let mut cmd = std::process::Command::new(bin);
     cmd.stdin(std::process::Stdio::null())

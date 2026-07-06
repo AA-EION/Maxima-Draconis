@@ -792,7 +792,7 @@ async fn startup(args: Args) -> Result<()> {
 /// the background service with the OS and sets the boot policy. No login, no
 /// server connection.
 fn run_service(action: &ServiceAction) -> Result<()> {
-    use maxima::service::{self, BootPolicy};
+    use maxima::server_client::{self as service, BootPolicy};
 
     match action {
         ServiceAction::Install { boot } => {
