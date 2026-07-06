@@ -32,7 +32,13 @@ final class GameStore: ObservableObject {
     // Backend lifecycle ---------------------------------------------------
 
     func start() {
-        Task { await runBackend() }
+        Task { await runBackend(force: false) }
+    }
+
+    /// Explicit "Start Server" action — spawns the server even under the
+    /// `manual` boot policy (used by the footer/menu when it's stopped).
+    func startServerManually() {
+        Task { await runBackend(force: true) }
     }
 
     /// Stop the shared server entirely (menu bar's "Stop Server"). Other
@@ -41,10 +47,10 @@ final class GameStore: ObservableObject {
         Task { await backend.stopServer() }
     }
 
-    private func runBackend() async {
+    private func runBackend(force: Bool) async {
         backendState = .connecting
         do {
-            let events = try await backend.start()
+            let events = try await backend.start(force: force)
             Task { [weak self] in
                 for await event in events {
                     await self?.handle(event: event)

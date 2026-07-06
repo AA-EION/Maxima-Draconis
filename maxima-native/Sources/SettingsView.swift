@@ -6,6 +6,10 @@ struct SettingsView: View {
     @AppStorage("maximaCliPath") private var cliPath = ""
     @State private var registerResult: String?
     @State private var registering = false
+    @State private var bootPolicy = Backend.bootPolicy()
+    @State private var serviceBusy = false
+    @State private var serviceResult: String?
+    @State private var showUninstallConfirm = false
 
     private var crossOverWine: String {
         "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
@@ -54,6 +58,49 @@ struct SettingsView: View {
                     Text("Games install into per-game bottles named Maxima-<slug>. A custom bottles location set in CrossOver's preferences is honored automatically.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                section("Background service", icon: "gearshape.2") {
+                    Text("The Maxima server runs independently of this app — closing the window doesn't stop it. Choose when it starts.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Picker("Start the server", selection: $bootPolicy) {
+                        Text("At login — always running").tag("auto")
+                        Text("When a game or app opens").tag("on-demand")
+                        Text("Only when I start it").tag("manual")
+                    }
+                    .pickerStyle(.radioGroup)
+                    .disabled(serviceBusy)
+                    .onChange(of: bootPolicy) { _, new in applyBootPolicy(new) }
+
+                    HStack {
+                        if serviceBusy { ProgressView().controlSize(.small) }
+                        if let result = serviceResult {
+                            Text(result).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Uninstall service…", role: .destructive) {
+                            showUninstallConfirm = true
+                        }
+                        .buttonStyle(.glass)
+                        .disabled(serviceBusy)
+                    }
+                    Text("Uninstall removes the autostart, protocol registrations and installed binaries, leaving no trace that could interfere with the official EA app.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .confirmationDialog(
+                    "Uninstall the Maxima background service?",
+                    isPresented: $showUninstallConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("Uninstall", role: .destructive) { uninstallService(purge: false) }
+                    Button("Uninstall & delete login/data", role: .destructive) {
+                        uninstallService(purge: true)
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The server will stop and its autostart, protocol claims and binaries will be removed. Game bottles are kept.")
                 }
 
                 section("URL protocols", icon: "link") {
@@ -134,6 +181,34 @@ struct SettingsView: View {
                 registerResult = error.localizedDescription
             }
             registering = false
+        }
+    }
+
+    private func applyBootPolicy(_ policy: String) {
+        serviceBusy = true
+        serviceResult = nil
+        Task {
+            do {
+                try await MaximaCLI.serviceInstall(boot: policy)
+                serviceResult = "Saved ✓"
+            } catch {
+                serviceResult = error.localizedDescription
+            }
+            serviceBusy = false
+        }
+    }
+
+    private func uninstallService(purge: Bool) {
+        serviceBusy = true
+        serviceResult = nil
+        Task {
+            do {
+                try await MaximaCLI.serviceUninstall(purge: purge)
+                serviceResult = "Uninstalled ✓"
+            } catch {
+                serviceResult = error.localizedDescription
+            }
+            serviceBusy = false
         }
     }
 }

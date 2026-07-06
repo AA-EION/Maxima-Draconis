@@ -201,6 +201,21 @@ enum MaximaCLI {
         _ = try await run(["register-protocols"])
     }
 
+    // Background service ---------------------------------------------------
+
+    /// Register the server with the OS + set the boot policy
+    /// (`auto` / `on-demand` / `manual`).
+    static func serviceInstall(boot: String) async throws {
+        _ = try await run(["service", "install", "--boot", boot])
+    }
+
+    /// Unregister + remove the service, leaving no trace.
+    static func serviceUninstall(purge: Bool) async throws {
+        var args = ["service", "uninstall"]
+        if purge { args.append("--purge") }
+        _ = try await run(args)
+    }
+
     static func install(slug: String) -> AsyncThrowingStream<CLIEvent, Error> {
         stream(["install", slug, "--json"])
     }

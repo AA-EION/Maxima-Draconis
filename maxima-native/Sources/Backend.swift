@@ -39,10 +39,30 @@ actor Backend {
 
     var isConnected: Bool { writeHandle != nil }
 
-    /// Ensure a server is up (spawn if needed), connect, and return the
-    /// pushed-event stream. The stream ends if the connection drops.
-    func start() async throws -> AsyncStream<[String: Any]> {
+    /// Boot policy from the Maxima config (shared with the CLI / egui). Governs
+    /// whether opening this app may auto-spawn the server. `manual` means the
+    /// user starts it explicitly, so we don't spawn unless `force` is set (the
+    /// "Start Server" action).
+    nonisolated static func bootPolicy() -> String {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Maxima/config.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let p = obj["boot_policy"] as? String
+        else { return "on-demand" }
+        return p
+    }
+
+    /// Ensure a server is up (spawn if needed, unless the boot policy is
+    /// `manual` and `force` is false), connect, and return the pushed-event
+    /// stream. The stream ends if the connection drops.
+    func start(force: Bool = false) async throws -> AsyncStream<[String: Any]> {
         if !Self.probe() {
+            if !force && Self.bootPolicy() == "manual" {
+                // Manual policy: don't auto-spawn — surface as stopped so the UI
+                // can offer a "Start Server" action.
+                throw BackendError.serverUnavailable
+            }
             try spawnServer()
             // Wait for it to answer (login may run on first start).
             var up = false

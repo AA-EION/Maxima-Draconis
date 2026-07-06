@@ -213,12 +213,13 @@ struct ContentView: View {
                     .font(.caption)
                     .lineLimit(1)
                 Button {
-                    store.start()
+                    store.startServerManually()
                 } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Image(systemName: "play.circle")
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.mini)
+                .help("Start the Maxima server")
             }
             Spacer()
         }
