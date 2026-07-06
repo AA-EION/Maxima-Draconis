@@ -601,17 +601,42 @@ async fn startup(args: Args) -> Result<()> {
         _ => {}
     }
 
-    // Forward launch/install to a running server BEFORE any in-process setup,
-    // so a forwarded command does no redundant (and potentially conflicting)
-    // login / wine setup of its own — the CLI is a client. Only when no
-    // server is running does control fall through to the standalone
-    // in-process paths below (Draconis's contract). The specialized CEG-fix
-    // install flags always stay in-process.
+    // The CLI is a pure client: every product command runs against the
+    // `maxima-server` (spawning it if it isn't up), so the CLI holds NO
+    // session of its own — no login, no LSX, no in-process download. Only the
+    // developer/diagnostic subcommands fall through to the legacy in-process
+    // path below. `launch --login` (manual/offline) is self-contained and
+    // also stays in-process.
     let port = server::server_port();
     match &args.mode {
-        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json })
-            if server::is_running(port).await =>
-        {
+        Some(Mode::ListGames { json }) => return server::run_list_games(port, *json).await,
+        Some(Mode::BottleInfo { slug, json }) => {
+            return server::run_bottle_info(port, slug, *json).await
+        }
+        Some(Mode::RegisterProtocols) => return server::run_register_protocols(port).await,
+        Some(Mode::CloudSync { game_slug, write }) => {
+            return server::run_cloud_sync(port, game_slug, *write).await
+        }
+        Some(Mode::Verify { slug, path, repair, json }) => {
+            return server::run_verify(port, slug, Some(path.clone()), *repair, *json).await
+        }
+        Some(Mode::DownloadSpecificFile { offer_id, build_id, file }) => {
+            return server::run_download_file(port, offer_id, Some(build_id.clone()), file).await
+        }
+        Some(Mode::Install { slug, path, build_id, replace_files, only_listed_files, json }) => {
+            return server::run_install(
+                port,
+                slug,
+                path.clone(),
+                build_id.clone(),
+                replace_files.clone(),
+                *only_listed_files,
+                *json,
+            )
+            .await;
+        }
+        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json }) => {
+            server::ensure_server_running(port).await?;
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
             let req = maxima_proto::Request::Launch {
@@ -622,19 +647,6 @@ async fn startup(args: Args) -> Result<()> {
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(port, req, &["game-stopped"], *json).await;
-        }
-        Some(Mode::Install { slug, path, build_id: None, replace_files, only_listed_files: false, json })
-            if replace_files.is_empty() && server::is_running(port).await =>
-        {
-            let req = maxima_proto::Request::Install { slug: slug.clone(), path: path.clone() };
-            info!("Forwarding install of '{}' to the Maxima server", slug);
-            return server::forward_streaming(
-                port,
-                req,
-                &["install-done", "install-error"],
-                *json,
-            )
-            .await;
         }
         _ => {}
     }

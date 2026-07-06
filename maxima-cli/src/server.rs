@@ -162,6 +162,184 @@ pub async fn forward_streaming(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Pure-client command runners. Each ensures a server is up (spawning
+// `maxima-server` if needed) and forwards the request — the CLI holds no
+// session of its own. Streaming commands translate the server's proto
+// notifications back into the exact JSONL shapes consumers (Draconis) expect.
+// ---------------------------------------------------------------------------
+
+async fn connect_ensuring(port: u16) -> Result<std::sync::Arc<maxima_proto::MaximaClient>> {
+    ensure_server_running(port).await?;
+    Ok(maxima_proto::MaximaClient::connect(port).await?)
+}
+
+pub async fn run_list_games(port: u16, json: bool) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    let games = client.list_games().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&games)?);
+    } else {
+        info!("Owned games:");
+        for g in &games {
+            info!(
+                "{:<36} - {:<36} - {:<26} - Installed: {}",
+                g.slug, g.name, g.offer_id, g.installed
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_bottle_info(port: u16, slug: &str, json: bool) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    let b = client.bottle_info(slug).await?;
+    if json {
+        println!("{}", serde_json::to_string(&b)?);
+    } else {
+        info!("slug:             {}", b.slug);
+        info!(
+            "bottle:           {} (exists: {})",
+            b.bottle_name.as_deref().unwrap_or("-"),
+            b.wine_prefix_exists
+        );
+        info!("wine prefix:      {}", b.wine_prefix.as_deref().unwrap_or("-"));
+        info!(
+            "default game dir: {} (exists: {})",
+            b.default_game_dir.as_deref().unwrap_or("-"),
+            b.game_dir_exists
+        );
+    }
+    Ok(())
+}
+
+pub async fn run_register_protocols(port: u16) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    client.register_protocols().await?;
+    println!("Protocol handlers registered.");
+    Ok(())
+}
+
+pub async fn run_cloud_sync(port: u16, slug: &str, write: bool) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    client
+        .request(Request::CloudSync { slug: slug.to_owned(), write })
+        .await?;
+    info!("Cloud sync {} done", if write { "write" } else { "read" });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_install(
+    port: u16,
+    slug: &str,
+    path: Option<String>,
+    build_id: Option<String>,
+    replace_files: Vec<String>,
+    only_listed_files: bool,
+    json: bool,
+) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    let mut events = client.subscribe();
+    client
+        .install_full(slug, path, build_id, replace_files, only_listed_files)
+        .await?;
+    loop {
+        let note = match events.recv().await {
+            Ok(n) => n,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        match note {
+            Notification::InstallProgress { percent, .. } => {
+                if json {
+                    emit(&json!({"event": "progress", "percent": percent}));
+                } else {
+                    info!("Downloading: {:.1}%/100%", percent);
+                }
+            }
+            Notification::InstallDone { .. } => {
+                if json {
+                    emit(&json!({"event": "done"}));
+                } else {
+                    info!("Install complete.");
+                }
+                break;
+            }
+            Notification::InstallError { message, .. } => {
+                if json {
+                    emit(&json!({"event": "error", "message": message}));
+                }
+                anyhow::bail!("{}", message);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_verify(
+    port: u16,
+    slug: &str,
+    path: Option<String>,
+    repair: bool,
+    json: bool,
+) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    let mut events = client.subscribe();
+    client.verify(slug, path, repair).await?;
+    loop {
+        let note = match events.recv().await {
+            Ok(n) => n,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        match note {
+            Notification::VerifyProgress { files_checked, total_files, .. } => {
+                if json {
+                    emit(&json!({"event": "progress", "phase": "verify",
+                        "files_checked": files_checked, "total_files": total_files}));
+                }
+            }
+            Notification::VerifyDone { ok, broken, repaired, .. } => {
+                if json {
+                    emit(&json!({"event": "verify_done", "ok": ok, "broken": broken}));
+                    emit(&json!({"event": "done", "verified": ok + broken,
+                        "broken": broken, "repaired": if repaired { broken } else { 0 }}));
+                } else {
+                    info!("Verify done — {} ok, {} broken (repaired: {})", ok, broken, repaired);
+                }
+                break;
+            }
+            Notification::VerifyError { message, .. } => {
+                if json {
+                    emit(&json!({"event": "error", "message": message}));
+                }
+                anyhow::bail!("{}", message);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_download_file(
+    port: u16,
+    slug: &str,
+    build_id: Option<String>,
+    file: &str,
+) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    client.download_file(slug, build_id, file).await?;
+    info!("Downloaded {}", file);
+    Ok(())
+}
+
+fn emit(value: &serde_json::Value) {
+    println!("{}", value);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 fn notification_event_name(note: &Notification) -> &'static str {
     match note {
         Notification::Ready { .. } => "ready",
@@ -172,5 +350,8 @@ fn notification_event_name(note: &Notification) -> &'static str {
         Notification::GameStarted { .. } => "game-started",
         Notification::GameStopped => "game-stopped",
         Notification::DownloadQueue { .. } => "download-queue",
+        Notification::VerifyProgress { .. } => "verify-progress",
+        Notification::VerifyDone { .. } => "verify-done",
+        Notification::VerifyError { .. } => "verify-error",
     }
 }
