@@ -179,19 +179,57 @@ actor Backend {
         return fd
     }
 
-    /// Spawn the `maxima-server` binary detached so it outlives this app.
+    /// Spawn `maxima-server` **fully detached** so it outlives this app.
+    ///
+    /// `Process`/NSTask leaves the child inside the app's launchd job, so
+    /// macOS reaps it when the app quits — that's the "server dies when I close
+    /// the window" bug. `posix_spawn` with `POSIX_SPAWN_SETSID` puts the server
+    /// in its own session (its own launchd job context), independent of this
+    /// app's lifecycle. This is only the *fallback* path — when the launchd
+    /// service is installed (Settings → boot policy), the server is owned by
+    /// launchd and this never runs.
     private func spawnServer() throws {
         guard let server = MaximaCLI.locateServer() else { throw BackendError.cliNotFound }
-        let p = Process()
-        p.executableURL = server
-        p.arguments = []
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        let path = server.path
+
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addopen(&fileActions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&fileActions, 1, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&fileActions, 2, "/dev/null", O_WRONLY, 0)
+
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // SETSID: new session → survives the app. CLOEXEC_DEFAULT: don't leak
+        // the app's fds (TCP sockets, etc.) into the server.
+        let POSIX_SPAWN_SETSID: Int16 = 0x0400
+        let POSIX_SPAWN_CLOEXEC_DEFAULT: Int16 = 0x4000
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
+
         var env = ProcessInfo.processInfo.environment
         let wine = UserDefaults.standard.string(forKey: "wineCommand") ?? ""
         if !wine.isEmpty { env["MAXIMA_WINE_COMMAND"] = wine }
-        p.environment = env
-        try p.run()
+        let envStrings = env.map { "\($0.key)=\($0.value)" }
+
+        var pid: pid_t = 0
+        let rc = Self.withCStringArray([path]) { argv in
+            Self.withCStringArray(envStrings) { envp in
+                posix_spawn(&pid, path, &fileActions, &attr, argv, envp)
+            }
+        }
+        guard rc == 0 else { throw BackendError.serverUnavailable }
+    }
+
+    /// Build a NULL-terminated C string array for posix_spawn, freeing the
+    /// dup'd strings after `body` returns.
+    private nonisolated static func withCStringArray<R>(
+        _ strings: [String], _ body: (UnsafePointer<UnsafeMutablePointer<CChar>?>) -> R
+    ) -> R {
+        var cStrings: [UnsafeMutablePointer<CChar>?] = strings.map { strdup($0) }
+        cStrings.append(nil)
+        defer { cStrings.forEach { free($0) } }
+        return body(&cStrings)
     }
 }

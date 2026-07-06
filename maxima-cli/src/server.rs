@@ -104,7 +104,14 @@ pub async fn ensure_server_running(port: u16) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // New session so the server outlives this CLI process (and any launchd
+        // app-job / terminal session it belongs to). SETSID > process group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {

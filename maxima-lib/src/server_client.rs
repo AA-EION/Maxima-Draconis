@@ -168,7 +168,16 @@ pub fn ensure_running() {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // New session → the server is independent of this frontend's lifecycle
+        // (a GUI/TUI that quits, or the launchd app-job it belongs to). A plain
+        // process group isn't enough on macOS: children stay in the app's
+        // launchd job and get reaped on quit. SETSID fully detaches.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
