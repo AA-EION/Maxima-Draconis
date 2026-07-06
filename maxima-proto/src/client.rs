@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
 use crate::message::{Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage};
-use crate::types::{FriendDto, GameDetailsDto, GameDto, StatusDto};
+use crate::types::{FriendDto, GameDetailsDto, GameDto, GameImagesDto, StatusDto, UserDto};
 
 pub const DEFAULT_PORT: u16 = 13220;
 
@@ -228,6 +228,20 @@ impl MaximaClient {
             .await?
             .field("details")
             .ok_or(ClientError::Malformed("details"))
+    }
+
+    pub async fn whoami(&self) -> Result<UserDto, ClientError> {
+        self.request(Request::WhoAmI)
+            .await?
+            .field("user")
+            .ok_or(ClientError::Malformed("user"))
+    }
+
+    pub async fn game_images(&self, slug: &str) -> Result<GameImagesDto, ClientError> {
+        self.request(Request::GameImages { slug: slug.to_owned() })
+            .await?
+            .field("images")
+            .ok_or(ClientError::Malformed("images"))
     }
 
     pub async fn launch(

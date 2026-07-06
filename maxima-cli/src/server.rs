@@ -322,14 +322,25 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
                 .map(|friends| {
                     let list: Vec<FriendDto> = friends
                         .iter()
-                        .map(|f| FriendDto { id: f.id().clone(), name: f.display_name().to_string() })
+                        .map(|f| FriendDto {
+                            id: f.id().clone(),
+                            name: f.display_name().to_string(),
+                            avatar_url: f
+                                .avatar()
+                                .as_ref()
+                                .map(|a| a.medium().path().to_string()),
+                        })
                         .collect();
                     json!({ "friends": list })
                 })
                 .map_err(Into::into)
         }
+        Request::WhoAmI => whoami(state).await.map(|u| json!({ "user": u })),
         Request::GameDetails { slug } => {
             game_details(state, &slug).await.map(|d| json!({ "details": d }))
+        }
+        Request::GameImages { slug } => {
+            game_images(state, &slug).await.map(|i| json!({ "images": i }))
         }
         Request::Launch { slug, args, exe_override, cloud_saves } => cmd_launch(
             state, slug, args, exe_override, cloud_saves,
@@ -360,6 +371,121 @@ async fn status(state: &Arc<ServerState>) -> StatusDto {
         lsx_port: *maxima.lsx_port(),
         clients: state.clients.load(Ordering::SeqCst) as u64,
     }
+}
+
+async fn whoami(state: &Arc<ServerState>) -> Result<maxima_proto::types::UserDto> {
+    let maxima = state.maxima.lock().await;
+    let user = maxima.local_user().await?;
+    let player = user
+        .player()
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no local player"))?;
+    Ok(maxima_proto::types::UserDto {
+        id: user.id().to_string(),
+        name: player.display_name().to_string(),
+        avatar_url: player.avatar().as_ref().map(|a| a.medium().path().to_string()),
+    })
+}
+
+/// Fetch a game's hero / logo / background image URLs from the service layer.
+/// Mirrors the image selection the egui UI's `get_games::handle_images` did
+/// in-process; the UI now just downloads whichever URLs come back.
+async fn game_images(state: &Arc<ServerState>, slug: &str) -> Result<maxima_proto::types::GameImagesDto> {
+    use maxima::core::service_layer::{
+        ServiceGame, ServiceGameHubCollection, ServiceGameImagesRequestBuilder,
+        ServiceHeroBackgroundImageRequestBuilder, SERVICE_REQUEST_GAMEIMAGES,
+        SERVICE_REQUEST_GETHEROBACKGROUNDIMAGE,
+    };
+
+    // Same selection order get_games::handle_images used (the getters return
+    // `&Option<..>`, hence the explicit if-let chains rather than combinators).
+    fn pick_hero(images: &Option<ServiceGame>) -> Option<String> {
+        let key_art = match images {
+            Some(i) => i.key_art(),
+            None => return None,
+        };
+        let key_art = match key_art {
+            Some(k) => k,
+            None => return None,
+        };
+        if let Some(img) = key_art.aspect_10x3_image() {
+            return Some(img.path().clone());
+        }
+        if let Some(img) = key_art.aspect_2x1_image() {
+            return Some(img.path().clone());
+        }
+        if let Some(img) = key_art.aspect_16x9_image() {
+            return Some(img.path().clone());
+        }
+        None
+    }
+    fn pick_logo(images: &Option<ServiceGame>) -> Option<String> {
+        let logo_set = match images {
+            Some(i) => i.primary_logo(),
+            None => return None,
+        };
+        match logo_set {
+            Some(logo) => logo.largest_image().as_ref().map(|l| l.path().clone()),
+            None => None,
+        }
+    }
+    fn pick_bg(heroes: &Option<ServiceGameHubCollection>) -> Option<String> {
+        let hero = match heroes {
+            Some(h) => h.items().get(0),
+            None => return None,
+        };
+        let bg = match hero {
+            Some(bg) => bg.hero_background(),
+            None => return None,
+        };
+        if let Some(img) = bg.aspect_16x9_image() {
+            return Some(img.path().clone());
+        }
+        if let Some(img) = bg.aspect_2x1_image() {
+            return Some(img.path().clone());
+        }
+        if let Some(img) = bg.aspect_10x3_image() {
+            return Some(img.path().clone());
+        }
+        None
+    }
+
+    let (service_layer, locale) = {
+        let maxima = state.maxima.lock().await;
+        (maxima.service_layer().clone(), maxima.locale().short_str().to_owned())
+    };
+
+    let images: Option<ServiceGame> = service_layer
+        .request(
+            SERVICE_REQUEST_GAMEIMAGES,
+            ServiceGameImagesRequestBuilder::default()
+                .should_fetch_context_image(true)
+                .should_fetch_backdrop_images(true)
+                .game_slug(slug.to_owned())
+                .locale(locale.clone())
+                .build()?,
+        )
+        .await
+        .ok()
+        .flatten();
+
+    let heroes: Option<ServiceGameHubCollection> = service_layer
+        .request(
+            SERVICE_REQUEST_GETHEROBACKGROUNDIMAGE,
+            ServiceHeroBackgroundImageRequestBuilder::default()
+                .game_slug(slug.to_owned())
+                .locale(locale)
+                .build()?,
+        )
+        .await
+        .ok()
+        .flatten();
+
+    Ok(maxima_proto::types::GameImagesDto {
+        hero: pick_hero(&images),
+        logo: pick_logo(&images),
+        background: pick_bg(&heroes),
+    })
 }
 
 async fn game_details(state: &Arc<ServerState>, slug: &str) -> Result<GameDetailsDto> {

@@ -23,7 +23,13 @@ pub enum Request {
     Friends,
     Status,
     Shutdown,
+    /// The signed-in user (persona + id + avatar url).
+    WhoAmI,
     GameDetails {
+        slug: String,
+    },
+    /// Lazily fetch a game's image URLs (hero / logo / background).
+    GameImages {
         slug: String,
     },
     Launch {

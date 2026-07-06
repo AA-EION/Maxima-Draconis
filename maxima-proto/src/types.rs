@@ -19,6 +19,13 @@ pub struct GameDto {
     pub has_cloud_save: bool,
     #[serde(default)]
     pub extra_offers: Vec<ExtraOfferDto>,
+    /// Box-art / hero image URLs — so a UI's image loader can fetch them
+    /// without touching the service layer. `default` keeps older peers
+    /// deserializing.
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub hero_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -31,6 +38,26 @@ pub struct ExtraOfferDto {
 pub struct FriendDto {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+/// The signed-in user (persona + id + avatar), for a thin client that needs
+/// more than the persona string the `ready` notification carries.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct UserDto {
+    pub id: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+/// Per-game image URLs, fetched lazily (the server runs the service-layer
+/// image requests; the UI feeds these URLs to its own image loader).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GameImagesDto {
+    pub hero: Option<String>,
+    pub logo: Option<String>,
+    pub background: Option<String>,
 }
 
 /// Rich per-game detail (mirrors the egui UI's `GameDetails`).
