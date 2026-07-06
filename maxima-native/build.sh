@@ -42,6 +42,23 @@ swiftc -O -sdk "${SDK}" \
     "${SCRIPT_DIR}"/Sources/*.swift \
     -o "${APP}/Contents/MacOS/Maxima"
 
+echo "[1b/4] Generating AppIcon.icns from the Maxima logo..."
+LOGO="${PROJECT_ROOT}/maxima-resources/assets/logo.png"
+if command -v iconutil &>/dev/null && command -v sips &>/dev/null && [[ -f "$LOGO" ]]; then
+    ICONSET="${BUILD_DIR}/AppIcon.iconset"
+    rm -rf "$ICONSET"; mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z "$size" "$size" "$LOGO" --out "${ICONSET}/icon_${size}x${size}.png" >/dev/null
+        dbl=$((size * 2))
+        sips -z "$dbl" "$dbl" "$LOGO" --out "${ICONSET}/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "${APP}/Contents/Resources/AppIcon.icns"
+    rm -rf "$ICONSET"
+    echo "  + AppIcon.icns"
+else
+    echo "  - skipped (need iconutil + sips + $LOGO)"
+fi
+
 echo "[2/4] Writing Info.plist..."
 cat > "${APP}/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,6 +73,8 @@ cat > "${APP}/Contents/Info.plist" <<'PLIST'
     <string>com.armchairdevelopers.maxima.native</string>
     <key>CFBundleExecutable</key>
     <string>Maxima</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>

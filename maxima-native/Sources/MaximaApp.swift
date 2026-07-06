@@ -114,7 +114,6 @@ struct MaximaApp: App {
 enum SidebarItem: String, CaseIterable, Identifiable {
     case library = "Library"
     case downloads = "Downloads"
-    case friends = "Friends"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -123,7 +122,6 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         switch self {
         case .library: return "square.grid.2x2"
         case .downloads: return "arrow.down.circle"
-        case .friends: return "person.2"
         case .settings: return "gearshape"
         }
     }
@@ -154,11 +152,19 @@ struct ContentView: View {
                 connectionFooter
             }
         } detail: {
-            switch selection ?? .library {
-            case .library: LibraryView()
-            case .downloads: DownloadsView()
-            case .friends: FriendsView()
-            case .settings: SettingsView()
+            HStack(spacing: 0) {
+                Group {
+                    switch selection ?? .library {
+                    case .library: LibraryView()
+                    case .downloads: DownloadsView()
+                    case .settings: SettingsView()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                Divider()
+                // Persistent friends rail on the right.
+                FriendsSidebar()
             }
         }
         .navigationTitle("Maxima")
@@ -184,12 +190,6 @@ struct ContentView: View {
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(maximaOrange.opacity(0.25), in: .capsule)
-        case .friends where store.onlineFriendCount > 0:
-            Text("\(store.onlineFriendCount)")
-                .font(.caption2.weight(.semibold))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.green.opacity(0.22), in: .capsule)
         default:
             EmptyView()
         }
