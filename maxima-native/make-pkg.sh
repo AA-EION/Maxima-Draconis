@@ -35,27 +35,61 @@ cat > "${SCRIPTS}/postinstall" <<'POST'
 # service and the URL protocol handlers. Both steps are login-free (service
 # install with on-demand only writes config + syncs binaries; lsregister just
 # claims the schemes), so installing never opens a browser.
-set -e
+#
+# `set -u` (not -e): the symlink loop's `[ -f ] &&` idioms return non-zero when
+# a binary is absent, and we don't want that to abort the whole script.
+set -u
 RES="/Applications/Maxima.app/Contents/Resources"
+CLI="${RES}/maxima-cli"
 mkdir -p /usr/local/bin
 for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
-    [ -f "${RES}/${b}" ] && ln -sf "${RES}/${b}" "/usr/local/bin/${b}"
+    if [ -f "${RES}/${b}" ]; then
+        ln -sf "${RES}/${b}" "/usr/local/bin/${b}"
+    fi
 done
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 BOOTSTRAP_APP="${RES}/bundle/osx/MaximaBootstrap.app"
 
 CONSOLE_USER="$(stat -f%Su /dev/console)"
-if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -x "$CLI" ]; then
     CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    # Call the CLI by its real bundle path (the /usr/local/bin symlink may not
+    # be on the sandboxed script's PATH).
     launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
-        /usr/local/bin/maxima-cli service install --boot on-demand || true
+        "$CLI" service install --boot on-demand || true
     # Register qrc:// / link2ea:// / origin2:// (no login needed).
-    [ -d "$BOOTSTRAP_APP" ] && launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
-        "$LSREGISTER" -f "$BOOTSTRAP_APP" || true
+    if [ -d "$BOOTSTRAP_APP" ]; then
+        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
+            "$LSREGISTER" -f "$BOOTSTRAP_APP" || true
+    fi
 fi
 exit 0
 POST
+
+# Disable macOS "bundle relocation" — otherwise PackageKit installs on top of
+# an already-registered copy of Maxima.app (e.g. this build dir) instead of
+# /Applications. Force the fixed install path.
+cat > "${STAGE}/component.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <dict>
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsRelocatable</key>
+        <false/>
+        <key>BundleIsVersionChecked</key>
+        <false/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+        <key>RootRelativeBundlePath</key>
+        <string>Applications/Maxima.app</string>
+    </dict>
+</array>
+</plist>
+PLIST
 chmod +x "${SCRIPTS}/postinstall"
 
 echo "[1/2] pkgbuild…"
@@ -63,6 +97,7 @@ pkgbuild --root "$ROOT" \
     --identifier "$IDENT" \
     --version "$VERSION" \
     --scripts "$SCRIPTS" \
+    --component-plist "${STAGE}/component.plist" \
     --install-location / \
     "${BUILD_DIR}/Maxima-component.pkg"
 
