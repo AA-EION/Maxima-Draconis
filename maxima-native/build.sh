@@ -93,7 +93,7 @@ PLIST
 
 if $BUNDLE_BINARIES; then
     echo "[3/4] Bundling maxima binaries (when built)..."
-    for bin in maxima-cli maxima-server maxima-bootstrap; do
+    for bin in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
         if [[ -f "${RELEASE_DIR}/${bin}" ]]; then
             cp "${RELEASE_DIR}/${bin}" "${APP}/Contents/Resources/${bin}"
             echo "  + ${bin}"
