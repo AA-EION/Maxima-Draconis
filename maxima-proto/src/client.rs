@@ -112,18 +112,17 @@ impl MaximaClient {
         Ok(client)
     }
 
-    /// Connect, spawning `maxima-cli server` (at `cli_path`) detached and
-    /// waiting for it if nothing is listening yet.
+    /// Connect, spawning the `maxima-server` binary (at `server_path`)
+    /// detached and waiting for it if nothing is listening yet.
     pub async fn connect_or_spawn(
         port: u16,
-        cli_path: &std::path::Path,
+        server_path: &std::path::Path,
     ) -> Result<Arc<Self>, ClientError> {
         if let Ok(c) = Self::connect(port).await {
             return Ok(c);
         }
-        let mut cmd = tokio::process::Command::new(cli_path);
-        cmd.arg("server")
-            .stdin(std::process::Stdio::null())
+        let mut cmd = tokio::process::Command::new(server_path);
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]

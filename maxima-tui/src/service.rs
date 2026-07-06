@@ -62,10 +62,10 @@ impl BridgeThread {
         rx: Receiver<MaximaLibRequest>,
         tx: Sender<MaximaLibResponse>,
     ) -> Result<()> {
-        // Connect to the server, spawning `maxima-cli server` if it isn't up.
+        // Connect to the server, spawning `maxima-server` if it isn't up.
         let port = maxima_proto::server_port();
-        let cli = locate_cli();
-        let client: Arc<MaximaClient> = MaximaClient::connect_or_spawn(port, &cli).await?;
+        let server = locate_server();
+        let client: Arc<MaximaClient> = MaximaClient::connect_or_spawn(port, &server).await?;
 
         // The server's `ready` carries the signed-in persona.
         match client.await_ready().await {
@@ -123,12 +123,12 @@ impl BridgeThread {
     }
 }
 
-/// Locate `maxima-cli` next to this binary (installer / cargo layout).
-fn locate_cli() -> std::path::PathBuf {
+/// Locate `maxima-server` next to this binary (installer / cargo layout).
+fn locate_server() -> std::path::PathBuf {
     #[cfg(windows)]
-    const NAME: &str = "maxima-cli.exe";
+    const NAME: &str = "maxima-server.exe";
     #[cfg(not(windows))]
-    const NAME: &str = "maxima-cli";
+    const NAME: &str = "maxima-server";
 
     std::env::current_exe()
         .ok()

@@ -1,0 +1,24 @@
+[package]
+name = "maxima-server"
+version = "1.0.0"
+edition = "2021"
+
+# The Maxima server binary — the single process that holds the logged-in
+# session and does EVERYTHING (login, LSX, RTM, downloads, launch, install,
+# verify, …). Frontends (cli / tui / gui) talk to it ONLY over maxima-proto;
+# nothing interacts with it directly.
+
+[[bin]]
+name = "maxima-server"
+path = "src/main.rs"
+
+[dependencies]
+maxima-lib = { path = "../maxima-lib" }
+maxima-proto = { path = "../maxima-proto" }
+tokio = { version = "1.28.2", features = [ "full", "rt", "rt-multi-thread", "time", "net" ] }
+serde_json = "1.0.97"
+anyhow = "1.0.71"
+log = "0.4.19"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = [ "winuser", "shellapi", "libloaderapi", "windef", "minwindef", "wingdi" ] }

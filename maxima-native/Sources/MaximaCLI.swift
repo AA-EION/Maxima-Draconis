@@ -53,6 +53,29 @@ enum MaximaCLI {
         return nil
     }
 
+    /// Locate the `maxima-server` binary (the process that does everything).
+    /// Same resolution order as `locate()`, minus the user override.
+    static func locateServer() -> URL? {
+        let fm = FileManager.default
+        if let bundled = Bundle.main.url(forResource: "maxima-server", withExtension: nil),
+           fm.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+        let dev = Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("target/release/maxima-server")
+        if fm.isExecutableFile(atPath: dev.path) {
+            return dev
+        }
+        let usrLocal = "/usr/local/bin/maxima-server"
+        if fm.isExecutableFile(atPath: usrLocal) {
+            return URL(fileURLWithPath: usrLocal)
+        }
+        return nil
+    }
+
     private static func makeProcess(arguments: [String]) throws -> Process {
         guard let cli = locate() else { throw MaximaCLIError.cliNotFound }
         let p = Process()

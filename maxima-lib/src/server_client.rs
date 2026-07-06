@@ -30,13 +30,13 @@ pub fn is_running(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-/// Locate the `maxima-cli` binary: next to the current executable (installer /
-/// cargo layout) or on `PATH` as a last resort.
-fn locate_cli() -> Option<std::path::PathBuf> {
+/// Locate the `maxima-server` binary: next to the current executable
+/// (installer / cargo layout) or on `PATH` as a last resort.
+fn locate_server() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
-    const NAME: &str = "maxima-cli.exe";
+    const NAME: &str = "maxima-server.exe";
     #[cfg(not(windows))]
-    const NAME: &str = "maxima-cli";
+    const NAME: &str = "maxima-server";
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -51,7 +51,7 @@ fn locate_cli() -> Option<std::path::PathBuf> {
 }
 
 /// Ensure the Maxima server is running: if the control port doesn't answer,
-/// spawn `maxima-cli server` detached so it outlives this frontend. Returns
+/// spawn `maxima-server` detached so it outlives this frontend. Returns
 /// immediately after spawning (does not wait for the server to finish
 /// booting). Best-effort — errors are swallowed since the frontend can still
 /// run its own in-process session if the spawn fails.
@@ -60,11 +60,10 @@ pub fn ensure_running() {
     if is_running(port) {
         return;
     }
-    let Some(cli) = locate_cli() else { return };
+    let Some(server) = locate_server() else { return };
 
-    let mut cmd = std::process::Command::new(cli);
-    cmd.arg("server")
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(server);
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 

@@ -1,6 +1,4 @@
 mod server;
-#[cfg(windows)]
-mod tray;
 
 use clap::{Parser, Subcommand};
 
@@ -270,17 +268,9 @@ enum Mode {
         #[arg(long)]
         wine_prefix: Option<String>,
     },
-    /// The multi-client Maxima server: holds the logged-in session, LSX
-    /// server, /authorize endpoint and RTM presence, and serves many
-    /// concurrent clients over loopback TCP (default 127.0.0.1:13220,
-    /// override with MAXIMA_SERVER_PORT). Every client sees the same state —
-    /// launch a game from the CLI and a connected UI shows it. This is
-    /// upstream PR #23's "Maxima Server" architecture. Runs until
-    /// `server-stop`, the tray's Stop item, or a `shutdown` request.
-    /// Normally started automatically by a frontend (or at logon); run it
-    /// by hand for a headless machine.
-    Server,
     /// Stop a running Maxima server (sends `shutdown` to its control port).
+    /// The server itself is the separate `maxima-server` binary — the CLI
+    /// only talks to it.
     ServerStop,
     /// Report whether a Maxima server is running, and its session state.
     ServerStatus {
@@ -611,6 +601,44 @@ async fn startup(args: Args) -> Result<()> {
         _ => {}
     }
 
+    // Forward launch/install to a running server BEFORE any in-process setup,
+    // so a forwarded command does no redundant (and potentially conflicting)
+    // login / wine setup of its own — the CLI is a client. Only when no
+    // server is running does control fall through to the standalone
+    // in-process paths below (Draconis's contract). The specialized CEG-fix
+    // install flags always stay in-process.
+    let port = server::server_port();
+    match &args.mode {
+        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json })
+            if server::is_running(port).await =>
+        {
+            let mut a = game_args.clone();
+            a.extend(trailing_args.clone());
+            let req = maxima_proto::Request::Launch {
+                slug: slug.clone(),
+                args: a,
+                exe_override: game_path.clone(),
+                cloud_saves: true,
+            };
+            info!("Forwarding launch of '{}' to the Maxima server", slug);
+            return server::forward_streaming(port, req, &["game-stopped"], *json).await;
+        }
+        Some(Mode::Install { slug, path, build_id: None, replace_files, only_listed_files: false, json })
+            if replace_files.is_empty() && server::is_running(port).await =>
+        {
+            let req = maxima_proto::Request::Install { slug: slug.clone(), path: path.clone() };
+            info!("Forwarding install of '{}' to the Maxima server", slug);
+            return server::forward_streaming(
+                port,
+                req,
+                &["install-done", "install-error"],
+                *json,
+            )
+            .await;
+        }
+        _ => {}
+    }
+
     info!("Starting Maxima...");
 
     native_setup().await?;
@@ -674,27 +702,11 @@ async fn startup(args: Args) -> Result<()> {
             // Merge the explicit `--game-args` repetitions with the
             // post-`--` trailing args. `--game-args` first so order is
             // predictable for callers that mix both styles.
+            // Reached only when NO server is running (a running server is
+            // handled by the forward-first check at the top of startup).
+            // This is the standalone in-process path — Draconis's contract.
             let mut game_args = game_args;
             game_args.extend(trailing_args);
-
-            // If a Maxima server is already running, forward the launch to it
-            // so its session drives the game and every connected client
-            // (egui UI, tray) sees `game-started`/`game-stopped`. Only when a
-            // server is up — a bare `maxima-cli launch` with no server keeps
-            // the standalone in-process path below (Draconis's contract).
-            // `--login` (offline/manual) is never forwarded; it's a
-            // self-contained mode.
-            let port = server::server_port();
-            if login.is_none() && server::is_running(port).await {
-                let req = maxima_proto::Request::Launch {
-                    slug: slug.clone(),
-                    args: game_args.clone(),
-                    exe_override: game_path.clone(),
-                    cloud_saves: true,
-                };
-                info!("Forwarding launch of '{}' to the running Maxima server", slug);
-                return server::forward_streaming(port, req, &["game-stopped"], json).await;
-            }
 
             let offer_id = if login.is_none() {
                 let mut maxima = maxima_arc.lock().await;
@@ -865,30 +877,10 @@ async fn startup(args: Args) -> Result<()> {
             only_listed_files,
             json,
         } => {
-            // Forward a *plain* install to a running server so its download
-            // queue drives it and every client sees progress. The
-            // specialized CEG-fix flags (--replace-files / --only-listed-
-            // files / --build-id) stay in-process — the server API doesn't
-            // model surgical file replacement.
-            let port = server::server_port();
-            if replace_files.is_empty()
-                && !only_listed_files
-                && build_id.is_none()
-                && server::is_running(port).await
-            {
-                let req = maxima_proto::Request::Install {
-                    slug: slug.clone(),
-                    path: path.clone(),
-                };
-                info!("Forwarding install of '{}' to the running Maxima server", slug);
-                return server::forward_streaming(
-                    port,
-                    req,
-                    &["install-done", "install-error"],
-                    json,
-                )
-                .await;
-            }
+            // Reached only when NO server is running, or for the CEG-fix
+            // flags (--replace-files / --only-listed-files / --build-id) that
+            // stay in-process — a plain install against a running server is
+            // forwarded by the check at the top of startup.
 
             // macOS: select/create the per-game CrossOver bottle before the
             // install — the touchup steps (vcredist etc.) run through wine
@@ -967,7 +959,6 @@ async fn startup(args: Args) -> Result<()> {
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::BottleInfo { slug, json } => bottle_info(maxima_arc.clone(), &slug, json).await,
-        Mode::Server => server::run_server(maxima_arc.clone()).await,
         // ServerStop / ServerStatus are handled earlier (pure client, no
         // login); they never reach this match.
         Mode::ServerStop | Mode::ServerStatus { .. } => Ok(()),

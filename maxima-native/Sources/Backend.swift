@@ -179,12 +179,12 @@ actor Backend {
         return fd
     }
 
-    /// Spawn `maxima-cli server` detached so it outlives this app.
+    /// Spawn the `maxima-server` binary detached so it outlives this app.
     private func spawnServer() throws {
-        guard let cli = MaximaCLI.locate() else { throw BackendError.cliNotFound }
+        guard let server = MaximaCLI.locateServer() else { throw BackendError.cliNotFound }
         let p = Process()
-        p.executableURL = cli
-        p.arguments = ["server"]
+        p.executableURL = server
+        p.arguments = []
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
