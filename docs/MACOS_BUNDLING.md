@@ -7,6 +7,49 @@ Two questions this answers:
 2. **How does the server own a status-bar icon on all three OSes**, with a menu
    to open the UI or stop the server?
 
+## 0. The server is independent of every GUI
+
+The `maxima-server` process is **not owned by any frontend**. Closing the
+SwiftUI app (or the egui UI, or the CLI exiting) must never stop it. Two
+mechanisms guarantee this:
+
+- **When a frontend spawns it** (no service installed), it's spawned into its
+  **own session** (`posix_spawn` + `POSIX_SPAWN_SETSID` in Swift;
+  `setsid()` via `pre_exec` in the Rust paths). A plain `Process`/child stays
+  in the app's launchd job and macOS reaps it on quit — that was the "server
+  dies when I close the window" bug. SETSID detaches it.
+- **When the service is installed** (recommended), **launchd owns it** — no
+  frontend spawns it at all.
+
+## 0b. Boot policy — auto / on-demand / manual
+
+`maxima-cli service install --boot <policy>` registers the server with the OS
+and records the policy in `config.json` (read by every frontend). The SwiftUI
+Settings → *Background service* section is the GUI for the same thing.
+
+| Policy | What it does |
+|---|---|
+| `auto` | launchd LaunchAgent with `RunAtLoad` — the server starts at login and is always up. |
+| `on-demand` *(default)* | No autostart; a frontend or a game launch spawns the (detached) server when it opens, and it keeps running. |
+| `manual` | No autostart, no auto-spawn. The user starts it explicitly (Settings "Start Server", or `maxima-server`). |
+
+`maxima-cli service uninstall [--purge]` removes the autostart, the
+LaunchServices protocol claims, the installed binaries, and `config.json` —
+leaving **no trace** that could interfere with the official EA app. `--purge`
+also deletes cached auth tokens + logs. Game bottles are kept (remove them from
+CrossOver manually).
+
+## 0c. Why a classic LaunchAgent, not SMAppService
+
+`SMAppService` (macOS 13+) is the modern API, but it **requires a real
+Apple-issued signing identity** — ad-hoc / "Sign to Run Locally" signing
+[doesn't work with it](https://theevilbit.github.io/posts/smappservice/). Since
+this project is self-distributed without a paid cert, Maxima uses a **classic
+`launchd` LaunchAgent** in `~/Library/LaunchAgents/` instead: launchd imposes no
+signing requirement on user agents, so it works ad-hoc. The agent's
+`ProgramArguments` points at the binary in the stable App Support path (below) —
+not inside the `.app`, which is unstable under app-translocation.
+
 ## 1. Install location — `~/Library/Application Support/Maxima/bin/`
 
 The canonical, registerable copy of the native binaries lives at:
@@ -121,6 +164,35 @@ D-Bus spec — no GTK required. `maxima-server` implements it with the pure-Rust
   (uninstaller stops + removes it). The server draws its own tray.
 - **Linux** — [installer/autostart/maxima-server.service](../installer/autostart/maxima-server.service)
   (systemd *user* unit). Headless unless built with `linux-tray`.
+
+## 3b. Distribution + install / uninstall
+
+Two supported vehicles; both end with the same registered state:
+
+**DMG (drag-install) + first-run registration.** Ship `Maxima.app` in a DMG.
+The user drags it to /Applications and opens it; on first run the server
+self-syncs its binaries to the App Support path, and **Settings → Background
+service** lets them pick a boot policy (which registers the LaunchAgent). This
+needs no root. Uninstall: Settings → *Uninstall service*, then trash the app.
+
+**PKG (recommended for "registers everything").** `bash maxima-native/make-pkg.sh`
+builds `Maxima-Installer.pkg`, which:
+- installs `Maxima.app` into `/Applications` (a pkg-placed app is **not**
+  translocated, so its bundled binaries are at a stable path);
+- runs a **postinstall** that symlinks `maxima-cli` / `maxima-tui` into
+  `/usr/local/bin` (CLI + TUI on `PATH`) and runs
+  `maxima-cli service install --boot on-demand` **as the console user** to
+  register the server + protocol handlers.
+
+Uninstall from either vehicle is one command — it leaves no trace:
+
+```bash
+maxima-cli service uninstall            # agent + protocol claims + binaries + config
+maxima-cli service uninstall --purge    # also removes cached tokens + logs
+```
+
+`make-pkg.sh` also emits `uninstall.sh` alongside the pkg for users who removed
+the CLI first.
 
 ## 4. Logo placement summary
 
