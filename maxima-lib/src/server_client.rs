@@ -158,6 +158,13 @@ pub fn ensure_running() {
     if is_running(port) {
         return;
     }
+    // Respect the boot policy: under `Manual` the user starts the server
+    // themselves, so an opening frontend must not auto-spawn it. `Auto` /
+    // `OnDemand` may spawn (Auto's launchd should already have it up; this is
+    // a harmless fallback if it didn't).
+    if !crate::service::boot_policy().auto_spawn_on_open() {
+        return;
+    }
     let Some(server) = locate_server() else { return };
 
     let mut cmd = std::process::Command::new(server);

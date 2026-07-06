@@ -273,6 +273,15 @@ enum Mode {
         #[arg(long)]
         json: bool,
     },
+    /// Install / remove / inspect the Maxima background service (the
+    /// `maxima-server` process). Registers it with the OS and sets the boot
+    /// policy every frontend reads. Pure host operation — no login, no running
+    /// server needed (so it can install the very first time, or uninstall a
+    /// stopped one).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Register Maxima's URL protocol handlers with the host OS. On macOS
     /// this registers MaximaBootstrap.app (built by
     /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
@@ -294,6 +303,30 @@ enum Mode {
         slug: String,
 
         /// Emit a single JSON object on stdout instead of log lines.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Register the service + set its boot policy.
+    Install {
+        /// `auto` = start at login; `on-demand` = start when a frontend or a
+        /// game opens (default); `manual` = never auto-start.
+        #[arg(long, default_value = "on-demand")]
+        boot: String,
+    },
+    /// Unregister + delete everything (agent, protocol claims, binaries,
+    /// config), leaving no trace that could interfere with the EA launcher.
+    Uninstall {
+        /// Also delete cached auth tokens + logs.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Show the boot policy, whether autostart is installed, and whether the
+    /// server is currently running.
+    Status {
         #[arg(long)]
         json: bool,
     },
@@ -593,6 +626,7 @@ async fn startup(args: Args) -> Result<()> {
         Some(Mode::ServerStatus { json }) => {
             return server::print_status(server::server_port(), *json).await
         }
+        Some(Mode::Service { action }) => return run_service(action),
         _ => {}
     }
 
@@ -753,6 +787,48 @@ async fn startup(args: Args) -> Result<()> {
 }
 
 
+
+/// Handle `maxima-cli service …`. Pure host operation — registers/unregisters
+/// the background service with the OS and sets the boot policy. No login, no
+/// server connection.
+fn run_service(action: &ServiceAction) -> Result<()> {
+    use maxima::service::{self, BootPolicy};
+
+    match action {
+        ServiceAction::Install { boot } => {
+            let Some(policy) = BootPolicy::parse(boot) else {
+                bail!("invalid --boot '{}' (expected: auto | on-demand | manual)", boot);
+            };
+            service::install(policy).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!(
+                "Maxima service registered with boot policy '{}'.",
+                policy.as_str()
+            );
+            if policy == BootPolicy::Auto {
+                println!("It will start at login and is starting now.");
+            }
+        }
+        ServiceAction::Uninstall { purge } => {
+            service::uninstall(*purge).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!(
+                "Maxima service uninstalled{}. No autostart, protocol claims, or \
+                 binaries left behind.",
+                if *purge { " and purged (tokens + logs removed)" } else { "" }
+            );
+        }
+        ServiceAction::Status { json } => {
+            let st = service::status();
+            if *json {
+                println!("{}", serde_json::to_string(&st)?);
+            } else {
+                println!("boot policy:  {}", st.policy);
+                println!("autostart:    {}", if st.autostart_installed { "installed" } else { "not installed" });
+                println!("running:      {}", if st.running { "yes" } else { "no" });
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn run_interactive(maxima_arc: LockedMaxima) -> Result<()> {
     let launch_options = vec![
