@@ -1,3 +1,5 @@
+mod server;
+
 use clap::{Parser, Subcommand};
 
 use anyhow::{bail, Result};
@@ -18,7 +20,7 @@ use maxima::{
 };
 
 use maxima::{
-    content::{downloader::ZipDownloader, manager::QueuedGameBuilder, ContentService},
+    content::{manager::QueuedGameBuilder, ContentService},
     core::{
         auth::{
             context::AuthContext,
@@ -26,10 +28,8 @@ use maxima::{
             nucleus_auth_exchange, nucleus_token_exchange, TokenResponse,
         },
         clients::JUNO_PC_CLIENT_ID,
-        cloudsync::CloudSyncLockMode,
         launch::{self, LaunchMode, LaunchOptions},
         library::OwnedTitle,
-        manifest::{self, MANIFEST_RELATIVE_PATH},
         service_layer::{
             ServiceGetBasicPlayerRequestBuilder, ServiceGetLegacyCatalogDefsRequestBuilder,
             ServiceLegacyOffer, ServicePlayer, SERVICE_REQUEST_GETBASICPLAYER,
@@ -39,9 +39,6 @@ use maxima::{
     },
     ooa,
     rtm::client::BasicPresence,
-    steam::{
-        lookup_steam_game, resolve_steam_install_path, EA_OFFER_ID_PATTERN, STEAM_APP_ID_PATTERN,
-    },
     util::{
         log::init_logger_named, native::take_foreground_focus, registry::check_registry_validity,
     },
@@ -87,6 +84,15 @@ enum Mode {
         /// Merged with `game_args` before being forwarded to the game.
         #[arg(last = true)]
         trailing_args: Vec<String>,
+
+        /// Emit structured launch lifecycle events as JSONL on stdout
+        /// (log output suppressed): `{"event":"launched",...}` once the
+        /// game process is spawned, `{"event":"exited","elapsed_secs":…}`
+        /// when it stops, `{"event":"error","message":…}` on failure (plus
+        /// non-zero exit). For consumers like Draconis that drive launches
+        /// programmatically instead of scraping log lines.
+        #[arg(long)]
+        json: bool,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -115,8 +121,10 @@ enum Mode {
         /// Absolute path to install into. Will be created if missing. If
         /// it already contains a different game's files, behavior is
         /// `install_now`'s problem — Maxima doesn't try to dry-run.
+        /// On macOS this is optional: it defaults to `drive_c/Games/<slug>`
+        /// inside the game's auto-created CrossOver bottle.
         #[arg(long)]
-        path: String,
+        path: Option<String>,
 
         /// Specific build ID to install. Defaults to the live (latest)
         /// build advertised by the EA content service.
@@ -246,6 +254,81 @@ enum Mode {
         /// the game update your status normally.
         #[arg(long)]
         no_rtm: bool,
+
+        /// Wine prefix (CrossOver bottle path) to operate against. `serve`
+        /// has no game context to auto-pick a per-game bottle from, so
+        /// consumers that need `/authorize` to spawn games (Steam-installed
+        /// titles, link2ea flows) pass the bottle here. Equivalent to
+        /// setting MAXIMA_WINE_PREFIX. Unix-only; ignored on Windows.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+    },
+    /// Stop a running Maxima server (sends `shutdown` to its control port).
+    /// The server itself is the separate `maxima-server` binary — the CLI
+    /// only talks to it.
+    ServerStop,
+    /// Report whether a Maxima server is running, and its session state.
+    ServerStatus {
+        /// Emit a single JSON object instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install / remove / inspect the Maxima background service (the
+    /// `maxima-server` process). Registers it with the OS and sets the boot
+    /// policy every frontend reads. Pure host operation — no login, no running
+    /// server needed (so it can install the very first time, or uninstall a
+    /// stopped one).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Register Maxima's URL protocol handlers with the host OS. On macOS
+    /// this registers MaximaBootstrap.app (built by
+    /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
+    /// link2ea:// and origin2:// — required for OAuth login redirects
+    /// without Draconis's MaximaHelper, and for catching link2ea:// from
+    /// externally-launched games (routed out of the bottle via
+    /// winebrowser). On Linux this writes the maxima-*.desktop handlers.
+    /// No login required.
+    RegisterProtocols,
+    /// Report the wine prefix / CrossOver bottle and default install
+    /// location Maxima would use for a game — WITHOUT creating anything.
+    /// Lets consumers (Draconis) place per-title files (e.g. Northstar)
+    /// into the right game dir without re-deriving Maxima's bottle-naming
+    /// policy. `exists` flags tell whether the bottle / game dir are
+    /// actually present yet.
+    BottleInfo {
+        /// Slug, offer_id, or content_id — resolved to the canonical slug
+        /// the same way `launch` / `install` name their bottle.
+        slug: String,
+
+        /// Emit a single JSON object on stdout instead of log lines.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Register the service + set its boot policy.
+    Install {
+        /// `auto` = start at login; `on-demand` = start when a frontend or a
+        /// game opens (default); `manual` = never auto-start.
+        #[arg(long, default_value = "on-demand")]
+        boot: String,
+    },
+    /// Unregister + delete everything (agent, protocol claims, binaries,
+    /// config), leaving no trace that could interfere with the EA launcher.
+    Uninstall {
+        /// Also delete cached auth tokens + logs.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Show the boot policy, whether autostart is installed, and whether the
+    /// server is currently running.
+    Status {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -401,6 +484,9 @@ fn json_mode(args: &Args) -> bool {
         Some(Mode::ListGames { json: true })
             | Some(Mode::Install { json: true, .. })
             | Some(Mode::Verify { json: true, .. })
+            | Some(Mode::Launch { json: true, .. })
+            | Some(Mode::BottleInfo { json: true, .. })
+            | Some(Mode::ServerStatus { json: true })
     )
 }
 
@@ -532,6 +618,69 @@ async fn startup(args: Args) -> Result<()> {
     // exit hits the file sink and the panic hook is already installed by
     // the time the runtime is built.
 
+    // Pure client-side control commands talk to a *running* server and need
+    // no session of their own — short-circuit before any login / Maxima
+    // setup so `server-stop` doesn't itself try to authenticate.
+    match &args.mode {
+        Some(Mode::ServerStop) => return server::send_shutdown(server::server_port()).await,
+        Some(Mode::ServerStatus { json }) => {
+            return server::print_status(server::server_port(), *json).await
+        }
+        Some(Mode::Service { action }) => return run_service(action),
+        _ => {}
+    }
+
+    // The CLI is a pure client: every product command runs against the
+    // `maxima-server` (spawning it if it isn't up), so the CLI holds NO
+    // session of its own — no login, no LSX, no in-process download. Only the
+    // developer/diagnostic subcommands fall through to the legacy in-process
+    // path below. `launch --login` (manual/offline) is self-contained and
+    // also stays in-process.
+    let port = server::server_port();
+    match &args.mode {
+        Some(Mode::ListGames { json }) => return server::run_list_games(port, *json).await,
+        Some(Mode::LocateGame { path }) => return server::run_locate_game(port, path).await,
+        Some(Mode::BottleInfo { slug, json }) => {
+            return server::run_bottle_info(port, slug, *json).await
+        }
+        Some(Mode::RegisterProtocols) => return server::run_register_protocols(port).await,
+        Some(Mode::CloudSync { game_slug, write }) => {
+            return server::run_cloud_sync(port, game_slug, *write).await
+        }
+        Some(Mode::Verify { slug, path, repair, json }) => {
+            return server::run_verify(port, slug, Some(path.clone()), *repair, *json).await
+        }
+        Some(Mode::DownloadSpecificFile { offer_id, build_id, file }) => {
+            return server::run_download_file(port, offer_id, Some(build_id.clone()), file).await
+        }
+        Some(Mode::Install { slug, path, build_id, replace_files, only_listed_files, json }) => {
+            return server::run_install(
+                port,
+                slug,
+                path.clone(),
+                build_id.clone(),
+                replace_files.clone(),
+                *only_listed_files,
+                *json,
+            )
+            .await;
+        }
+        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json }) => {
+            server::ensure_server_running(port).await?;
+            let mut a = game_args.clone();
+            a.extend(trailing_args.clone());
+            let req = maxima_proto::Request::Launch {
+                slug: slug.clone(),
+                args: a,
+                exe_override: game_path.clone(),
+                cloud_saves: true,
+            };
+            info!("Forwarding launch of '{}' to the Maxima server", slug);
+            return server::forward_streaming(port, req, &["game-stopped"], *json).await;
+        }
+        _ => {}
+    }
+
     info!("Starting Maxima...");
 
     native_setup().await?;
@@ -541,7 +690,10 @@ async fn startup(args: Args) -> Result<()> {
     // storage and run with a dummy local user. `matches!` lets us
     // ignore the rest of the Launch fields cleanly — they don't
     // affect this decision.
-    let skip_login = matches!(args.mode, Some(Mode::Launch { login: Some(_), .. }));
+    let skip_login = matches!(
+        args.mode,
+        Some(Mode::Launch { login: Some(_), .. }) | Some(Mode::RegisterProtocols)
+    );
 
     let options = MaximaOptionsBuilder::default()
         .load_auth_storage(!skip_login)
@@ -581,173 +733,33 @@ async fn startup(args: Args) -> Result<()> {
 
     let mode = args.mode.unwrap();
     match mode {
+        // The only launch that reaches here is manual/offline login
+        // (`--login <content_id>`): it's self-contained (only the license
+        // server needs auth) and deliberately never touches the server. A
+        // normal `launch` is forwarded to maxima-server by the forward-first
+        // block above, before login.
         Mode::Launch {
             slug,
             game_path,
             game_args,
-            login,
+            login: Some(login),
             trailing_args,
+            json,
         } => {
-            // Merge the explicit `--game-args` repetitions with the
-            // post-`--` trailing args. `--game-args` first so order is
-            // predictable for callers that mix both styles.
             let mut game_args = game_args;
             game_args.extend(trailing_args);
-            let offer_id = if login.is_none() {
-                let mut maxima = maxima_arc.lock().await;
-
-                // First try standard slug
-                let mut found_offer_id = None;
-                if let Ok(Some(offer)) = maxima.mut_library().game_by_base_slug(&slug).await {
-                    found_offer_id = Some(offer.offer_id().clone());
-                }
-
-                // Then try base offer
-                if found_offer_id.is_none() {
-                    if let Ok(Some(offer)) = maxima.mut_library().game_by_base_offer(&slug).await {
-                        found_offer_id = Some(offer.offer_id().clone());
-                    }
-                }
-
-                // If still not found, do an exhaustive search across all properties
-                // (useful for Steam App IDs or content IDs)
-                if found_offer_id.is_none() {
-                    if let Ok(games) = maxima.mut_library().games().await {
-                        for game in games {
-                            let base = game.base_offer();
-                            if base.slug() == &slug
-                                || base.offer_id() == &slug
-                                || base.product().id() == &slug
-                                || base.product().origin_offer_id() == &slug
-                                || base.offer().content_id() == &slug
-                                || base.product().product().id() == &slug
-                            {
-                                found_offer_id = Some(base.offer_id().clone());
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(id) = found_offer_id {
-                    id
-                } else if EA_OFFER_ID_PATTERN.is_match(&slug) {
-                    // The EA library lookup failed (e.g. Steam-only owner whose TF2 is not
-                    // linked to their EA account), but the slug is already a well-formed EA
-                    // offer ID — pass it through and let EA's license server decide.
-                    warn!(
-                        "Offer '{}' not found in EA library; passing through directly. \
-                         If this fails, link your Steam account at https://www.ea.com",
-                        slug
-                    );
-                    slug.clone()
-                } else if STEAM_APP_ID_PATTERN.is_match(&slug) {
-                    // Slug is a Steam App ID. The exhaustive library lookup above
-                    // should have matched it via product.id / offer.content_id for
-                    // any user whose Steam and EA accounts are linked. If we got
-                    // here the accounts are not linked, so fall back to the static
-                    // STEAM_GAMES table — the EA license server only accepts
-                    // Origin offer IDs, not Steam IDs, so a passthrough would
-                    // just fail with a less helpful error.
-                    if let Some(game) = lookup_steam_game(&slug) {
-                        warn!(
-                            "Steam App ID '{}' not in EA library (Steam/EA accounts not linked?); \
-                             using hardcoded fallback offer ID '{}'. Link your accounts at \
-                             https://www.ea.com to remove this warning.",
-                            slug, game.origin_offer_id
-                        );
-                        game.origin_offer_id.to_string()
-                    } else {
-                        bail!(
-                            "Steam App ID '{}' is not in this user's EA library and has no \
-                             hardcoded fallback. Link your Steam and EA accounts at https://www.ea.com, \
-                             or open an issue if this is an EA-published game on Steam that should be supported.",
-                            slug
-                        );
-                    }
-                } else {
-                    bail!("No owned offer found for '{}'. If this is an EA offer ID, make sure your EA and Steam accounts are linked at https://www.ea.com", slug);
-                }
-            } else {
-                slug.clone()
-            };
-
-            // If the slug was a Steam App ID, the game is installed under
-            // Steam's library, not EA Desktop's. `launch::start_game` would
-            // bail with `NotInstalled` because EA's metadata doesn't know
-            // about the Steam install. Discover the actual location from
-            // Steam's registry + libraryfolders.vdf and pass it as an
-            // explicit game_path override.
-            let resolved_game_path = if game_path.is_none() && STEAM_APP_ID_PATTERN.is_match(&slug)
-            {
-                lookup_steam_game(&slug)
-                    .and_then(resolve_steam_install_path)
-                    .and_then(|p| p.to_str().map(|s| s.to_owned()))
-                    .map(|p| {
-                        info!("Discovered Steam install for app {}: {}", slug, p);
-                        p
-                    })
-                    .or_else(|| {
-                        warn!(
-                            "Could not auto-discover Steam install path for app {}. \
-                             If this game is installed in a non-standard location, \
-                             pass --game-path manually.",
-                            slug
-                        );
-                        None
-                    })
-            } else {
-                game_path
-            };
-
-            // Steam-Play detection: if the original slug was a numeric
-            // Steam App ID, surface it via `LaunchOptions.steam_app_id`.
-            // `launch::start_game` uses that to set SteamAppId/SteamGameId
-            // env vars on the spawned game — see the LaunchOptions doc
-            // comment. Per-game launch args (-noOriginStartup, -multiple,
-            // etc.) are the caller's responsibility: pass via --game-args
-            // or MAXIMA_LAUNCH_ARGS.
-            let steam_app_id = STEAM_APP_ID_PATTERN.is_match(&slug).then(|| slug.clone());
-
-            start_game(
-                &offer_id,
-                resolved_game_path,
-                game_args,
-                login,
-                steam_app_id,
-                maxima_arc.clone(),
-            )
-            .await
+            // offer_id must be a content id in this mode; pass the slug through.
+            start_game(&slug, game_path, game_args, Some(login), None, maxima_arc.clone(), json)
+                .await
         }
-        Mode::ListGames { json } => list_games(maxima_arc.clone(), json).await,
-        Mode::LocateGame { path } => locate_game(maxima_arc.clone(), &path).await,
-        Mode::Install {
-            slug,
-            path,
-            build_id,
-            replace_files,
-            only_listed_files,
-            json,
+        Mode::Serve {
+            no_rtm,
+            wine_prefix,
         } => {
-            install_game(
-                maxima_arc.clone(),
-                &slug,
-                &path,
-                build_id.as_deref(),
-                &replace_files,
-                only_listed_files,
-                json,
-            )
-            .await
-        }
-        Mode::Verify {
-            slug,
-            path,
-            repair,
-            json,
-        } => verify_game(maxima_arc.clone(), &slug, &path, repair, json).await,
-        Mode::CloudSync { game_slug, write } => {
-            do_cloud_sync(maxima_arc.clone(), &game_slug, write).await
+            if let Some(prefix) = wine_prefix {
+                std::env::set_var("MAXIMA_WINE_PREFIX", prefix);
+            }
+            serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::AccountInfo => print_account_info(maxima_arc.clone()).await,
         Mode::CreateAuthCode { client_id } => {
@@ -762,14 +774,59 @@ async fn startup(args: Args) -> Result<()> {
         Mode::GetLegacyCatalogDef { offer_id } => {
             get_legacy_catalog_def(maxima_arc.clone(), &offer_id).await
         }
-        Mode::DownloadSpecificFile {
-            offer_id,
-            build_id,
-            file,
-        } => download_specific_file(maxima_arc.clone(), &offer_id, &build_id, &file).await,
-        Mode::Serve { no_rtm } => serve_lsx(maxima_arc.clone(), no_rtm).await,
+        // Every product/control command (list-games, install, verify,
+        // cloud-sync, download-specific-file, bottle-info, locate-game,
+        // register-protocols, server-stop/-status, and `launch` without
+        // --login) is handled before this point — the forward-first block
+        // forwards it to maxima-server, or an early return handles it. None
+        // reach the post-login match.
+        _ => unreachable!("handled before login (forward-first / early return)"),
     }?;
 
+    Ok(())
+}
+
+
+
+/// Handle `maxima-cli service …`. Pure host operation — registers/unregisters
+/// the background service with the OS and sets the boot policy. No login, no
+/// server connection.
+fn run_service(action: &ServiceAction) -> Result<()> {
+    use maxima::server_client::{self as service, BootPolicy};
+
+    match action {
+        ServiceAction::Install { boot } => {
+            let Some(policy) = BootPolicy::parse(boot) else {
+                bail!("invalid --boot '{}' (expected: auto | on-demand | manual)", boot);
+            };
+            service::install(policy).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!(
+                "Maxima service registered with boot policy '{}'.",
+                policy.as_str()
+            );
+            if policy == BootPolicy::Auto {
+                println!("It will start at login and is starting now.");
+            }
+        }
+        ServiceAction::Uninstall { purge } => {
+            service::uninstall(*purge).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!(
+                "Maxima service uninstalled{}. No autostart, protocol claims, or \
+                 binaries left behind.",
+                if *purge { " and purged (tokens + logs removed)" } else { "" }
+            );
+        }
+        ServiceAction::Status { json } => {
+            let st = service::status();
+            if *json {
+                println!("{}", serde_json::to_string(&st)?);
+            } else {
+                println!("boot policy:  {}", st.policy);
+                println!("autostart:    {}", if st.autostart_installed { "installed" } else { "not installed" });
+                println!("running:      {}", if st.running { "yes" } else { "no" });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -791,7 +848,7 @@ async fn run_interactive(maxima_arc: LockedMaxima) -> Result<()> {
         "Launch Game" => interactive_start_game(maxima_arc.clone()).await?,
         "Install Game" => interactive_install_game(maxima_arc.clone()).await?,
         "List Builds" => generate_download_links(maxima_arc.clone()).await?,
-        "List Games" => list_games(maxima_arc.clone(), false).await?,
+        "List Games" => list_games(maxima_arc.clone()).await?,
         "Account Info" => print_account_info(maxima_arc.clone()).await?,
         _ => bail!("Something went wrong."),
     }
@@ -822,7 +879,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone()).await?;
+    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone(), false).await?;
 
     Ok(())
 }
@@ -915,54 +972,6 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         elapsed_time.subsec_millis()
     );
 
-    Ok(())
-}
-
-async fn download_specific_file(
-    maxima_arc: LockedMaxima,
-    offer: &str,
-    build_id: &str,
-    file: &str,
-) -> Result<()> {
-    let maxima = maxima_arc.lock().await;
-
-    let content_service = ContentService::new(maxima.auth_storage().clone());
-    let builds = content_service.available_builds(offer).await?;
-    let build = builds.build(build_id);
-    if build.is_none() {
-        bail!("Couldn't find the game build {}", build_id);
-    }
-
-    let build = build.unwrap();
-    info!("Downloading file from game build {}", build.to_string());
-
-    let url = content_service
-        .download_url(offer, Some(&build.build_id()))
-        .await?;
-
-    debug!("URL: {}", url.url());
-
-    let downloader = ZipDownloader::new("test-game", &url.url(), "C:/DownloadTest").await?;
-    let num_of_entries = downloader.manifest().entries().len();
-    info!("Entries: {}", num_of_entries);
-
-    let entry = downloader
-        .manifest()
-        .entries()
-        .iter()
-        .find(|x| x.name() == file);
-    if entry.is_none() {
-        bail!("Couldn't find the file {}", file);
-    }
-
-    let ele = entry.unwrap();
-    downloader.download_single_file(ele, None).await.unwrap();
-
-    info!(
-        "Downloaded file {} from game build {}",
-        file,
-        build.to_string()
-    );
     Ok(())
 }
 
@@ -1189,105 +1198,10 @@ async fn get_legacy_catalog_def(maxima_arc: LockedMaxima, offer_id: &str) -> Res
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-struct GameJson {
-    slug: String,
-    name: String,
-    offer_id: String,
-    content_id: String,
-    display_name: String,
-    installed: bool,
-    install_path: Option<String>,
-    version: Option<String>,
-    has_cloud_save: bool,
-    extra_offers: Vec<ExtraOfferJson>,
-}
-
-#[derive(serde::Serialize)]
-struct ExtraOfferJson {
-    offer_id: String,
-    display_name: String,
-}
-
-async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
+async fn list_games(maxima_arc: LockedMaxima) -> Result<()> {
     let mut maxima = maxima_arc.lock().await;
+
     let titles = maxima.mut_library().games().await?;
-
-    if json {
-        // Machine-readable mode: one JSON array, no log noise. main() already
-        // muted stdout logging via `set_stdout_suppressed(true)` for this
-        // subcommand; everything that follows goes directly to stdout via
-        // `println!`.
-        let mut out: Vec<GameJson> = Vec::with_capacity(titles.len());
-        for title in titles {
-            let base = title.base_offer();
-            let installed = base.is_installed().await;
-            // `execute_path` and `installed_version` both read the local
-            // manifest, which can be absent for externally-installed copies
-            // (Steam, manually-placed). Swallow those errors — Draconis
-            // can still see `installed: true` even when version is unknown,
-            // and `installed: false` is enough to drive the install flow.
-            // Errors are logged at `debug!` so the file sink still has them
-            // for diagnosing why a path/version came back null, without
-            // breaking the JSON document on stdout.
-            let install_path = if installed {
-                match base.execute_path(false).await {
-                    Ok(p) => Some(p.display().to_string()),
-                    Err(e) => {
-                        debug!(
-                            "execute_path for {} failed: {}",
-                            base.offer_id(),
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let version = if installed {
-                match base.installed_version().await {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        debug!(
-                            "installed_version for {} failed: {}",
-                            base.offer_id(),
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let extras = title
-                .extra_offers()
-                .iter()
-                .map(|g| ExtraOfferJson {
-                    offer_id: g.offer_id().clone(),
-                    display_name: g.offer().display_name().to_string(),
-                })
-                .collect();
-
-            out.push(GameJson {
-                slug: base.slug().clone(),
-                name: title.name().to_string(),
-                offer_id: base.offer_id().clone(),
-                content_id: base.offer().content_id().to_string(),
-                display_name: base.offer().display_name().to_string(),
-                installed,
-                install_path,
-                version,
-                has_cloud_save: base.offer().has_cloud_save(),
-                extra_offers: extras,
-            });
-        }
-
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-
     info!("Owned games:");
     for title in titles {
         info!(
@@ -1315,690 +1229,6 @@ async fn list_games(maxima_arc: LockedMaxima, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Non-interactive install driver. Mirrors `interactive_install_game` but
-/// takes all parameters as CLI flags so Draconis / shell scripts can drive
-/// downloads without an inquire-prompted TTY. In JSON mode emits one
-/// JSON document per line on stdout — `{"event":"progress","percent":N}`
-/// once per second, then `{"event":"done",…}` on success or
-/// `{"event":"error",…}` on failure. Logger stdout is already suppressed
-/// by `main()` when `--json` is set.
-async fn install_game(
-    maxima_arc: LockedMaxima,
-    slug: &str,
-    path: &str,
-    build_id_override: Option<&str>,
-    replace_files: &[String],
-    only_listed_files: bool,
-    json: bool,
-) -> Result<()> {
-    use std::io::Write;
-
-    let emit_error = |msg: &str| {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"event": "error", "message": msg})
-            );
-            let _ = std::io::stdout().flush();
-        }
-    };
-
-    let install_path = PathBuf::from(path);
-    if !install_path.is_absolute() {
-        let msg = format!("--path must be absolute, got '{}'", path);
-        emit_error(&msg);
-        bail!(msg);
-    }
-
-    // Pre-install replace step. The downloader's `initial_state` check
-    // marks entries `Fresh` when missing (re-downloads) and `Complete`
-    // when their on-disk size matches the manifest (skips). For files
-    // that are content-different-but-same-size (the Steam CEG case),
-    // we need to delete them up front so the downloader's size check
-    // sees them as missing. Path-traversal segments are rejected so a
-    // bad `--replace-files` argument can't escape the install dir.
-    for relative in replace_files {
-        if relative.is_empty() {
-            continue;
-        }
-        if relative
-            .split(['/', '\\'])
-            .any(|segment| segment == ".." || segment.is_empty())
-            || PathBuf::from(relative).is_absolute()
-        {
-            let msg = format!(
-                "--replace-files entries must be relative paths without '..' segments, got '{}'",
-                relative
-            );
-            emit_error(&msg);
-            bail!(msg);
-        }
-
-        let target = install_path.join(relative);
-        match std::fs::metadata(&target) {
-            Ok(meta) if meta.is_file() => {
-                if !json {
-                    info!("Deleting {} (replace-files)", target.display());
-                }
-                if let Err(e) = std::fs::remove_file(&target) {
-                    let msg = format!("failed to delete {}: {}", target.display(), e);
-                    emit_error(&msg);
-                    bail!(msg);
-                }
-            }
-            Ok(_) => {
-                // Directory or symlink — skip, not what this flag is for.
-                if !json {
-                    warn!(
-                        "Skipping {} from --replace-files (not a regular file)",
-                        target.display()
-                    );
-                }
-            }
-            Err(_) => {
-                // Already missing — that's fine, the downloader will fetch it.
-                if !json {
-                    debug!("--replace-files: {} already absent", target.display());
-                }
-            }
-        }
-    }
-
-    // Resolve slug → offer_id. Same chain as `Mode::Launch` minus the
-    // unlinked-Steam passthrough fallbacks (those only let you launch an
-    // already-installed copy; for install we genuinely need the offer in
-    // the user's EA library).
-    let offer_id = {
-        let mut maxima = maxima_arc.lock().await;
-        let mut found: Option<String> = None;
-        if let Ok(Some(offer)) = maxima.mut_library().game_by_base_slug(slug).await {
-            found = Some(offer.offer_id().clone());
-        }
-        if found.is_none() {
-            if let Ok(Some(offer)) = maxima.mut_library().game_by_base_offer(slug).await {
-                found = Some(offer.offer_id().clone());
-            }
-        }
-        if found.is_none() {
-            if let Ok(games) = maxima.mut_library().games().await {
-                for game in games {
-                    let base = game.base_offer();
-                    if base.slug() == slug
-                        || base.offer_id() == slug
-                        || base.product().id() == slug
-                        || base.product().origin_offer_id() == slug
-                        || base.offer().content_id() == slug
-                        || base.product().product().id() == slug
-                    {
-                        found = Some(base.offer_id().clone());
-                        break;
-                    }
-                }
-            }
-        }
-        match found {
-            Some(id) => id,
-            None => {
-                let msg = format!(
-                    "No owned offer found for '{}'. Link your Steam/EA accounts at https://www.ea.com if you bought the game from a third-party store.",
-                    slug
-                );
-                emit_error(&msg);
-                bail!(msg);
-            }
-        }
-    };
-
-    // Pick the build to install: explicit override, else the live build.
-    let build_id = {
-        let mut maxima = maxima_arc.lock().await;
-        let builds = maxima
-            .content_manager()
-            .service()
-            .available_builds(&offer_id)
-            .await?;
-        let chosen = match build_id_override {
-            Some(bid) => builds.build(bid).ok_or_else(|| {
-                anyhow::anyhow!("build_id '{}' not found for offer '{}'", bid, offer_id)
-            })?,
-            None => builds.live_build().ok_or_else(|| {
-                anyhow::anyhow!("No live build available for offer '{}'", offer_id)
-            })?,
-        };
-        let id = chosen.build_id().to_owned();
-        if !json {
-            info!(
-                "Installing build {} of {} into {}",
-                chosen.to_string(),
-                offer_id,
-                install_path.display()
-            );
-        }
-        id
-    };
-
-    // Strict replace path: download only the entries listed in
-    // `--replace-files`, never run `install_now`. Empirically the full
-    // install path re-downloads ~50% of the TF2 manifest against a Steam
-    // install because legitimate size differences across distribution
-    // channels make many files fail the size-only entry-state check.
-    // For the CEG-fix use case we only need to refresh a handful of
-    // CEG-touched binaries, so we bypass install_now entirely and pull
-    // each listed file directly from the build's zip manifest via
-    // `ZipDownloader::download_single_file` — the same primitive
-    // `Mode::DownloadSpecificFile` already uses.
-    if only_listed_files {
-        // Release the maxima_arc lock BEFORE the async `download_url` HTTP
-        // call so concurrent LSX / RTM / serve operations on the same
-        // Maxima instance aren't blocked while EA's CDN responds.
-        let auth_storage = {
-            let maxima = maxima_arc.lock().await;
-            maxima.auth_storage().clone()
-        };
-        let content_service = ContentService::new(auth_storage);
-        let url = content_service
-            .download_url(&offer_id, Some(&build_id))
-            .await?;
-
-        // Use the offer_id as the downloader's id so concurrent strict
-        // installs of different games don't collide in any temp/state
-        // that ZipDownloader keys by id.
-        let downloader =
-            ZipDownloader::new(&offer_id, url.url(), install_path.clone()).await?;
-        let entries = downloader.manifest().entries();
-
-        // Empty entries in `replace_files` are skipped by the delete loop;
-        // mirror that here so an empty string doesn't bail the whole flow
-        // on a manifest lookup miss, and so per-file progress counts stay
-        // accurate.
-        let total = replace_files.iter().filter(|s| !s.is_empty()).count();
-        let start_time = Instant::now();
-
-        for (idx, relative) in replace_files
-            .iter()
-            .filter(|s| !s.is_empty())
-            .enumerate()
-        {
-            let normalized = relative.replace('\\', "/");
-            // Common case: zip entries use forward slashes, so the
-            // case-insensitive compare against the unmodified name
-            // succeeds without allocating. Fall back to a normalized
-            // compare only when the entry path actually contains
-            // backslashes — saves an allocation per entry per file on
-            // manifests with tens of thousands of entries.
-            let entry = entries.iter().find(|e| {
-                let n = e.name();
-                if n.eq_ignore_ascii_case(&normalized) {
-                    return true;
-                }
-                if n.contains('\\') {
-                    return n.replace('\\', "/").eq_ignore_ascii_case(&normalized);
-                }
-                false
-            });
-            let entry = match entry {
-                Some(e) => e,
-                None => {
-                    let msg = format!(
-                        "file '{}' not found in build {} manifest",
-                        relative, build_id
-                    );
-                    emit_error(&msg);
-                    bail!(msg);
-                }
-            };
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "progress",
-                        "current_file": relative,
-                        "files_done": idx,
-                        "total_files": total,
-                    })
-                );
-                let _ = std::io::stdout().flush();
-            } else {
-                info!("Downloading {} ({}/{})", relative, idx + 1, total);
-            }
-
-            if let Err(e) = downloader.download_single_file(entry, None).await {
-                let msg = format!("download of '{}' failed: {}", relative, e);
-                emit_error(&msg);
-                return Err(e.into());
-            }
-        }
-
-        let elapsed = start_time.elapsed();
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "done",
-                    "elapsed_secs": elapsed.as_secs_f64(),
-                    "offer_id": offer_id,
-                    "build_id": build_id,
-                    "path": install_path.display().to_string(),
-                    "files_replaced": replace_files,
-                })
-            );
-            let _ = std::io::stdout().flush();
-        } else {
-            info!(
-                "Replaced {} file(s) in {}.{}s — {}",
-                total,
-                elapsed.as_secs(),
-                elapsed.subsec_millis(),
-                install_path.display()
-            );
-        }
-
-        return Ok(());
-    }
-
-    let game = QueuedGameBuilder::default()
-        .offer_id(offer_id.clone())
-        .build_id(build_id.clone())
-        .path(install_path.clone())
-        .build()?;
-
-    let start_time = Instant::now();
-    {
-        let mut maxima = maxima_arc.lock().await;
-        if let Err(e) = maxima.content_manager().install_now(game).await {
-            let msg = format!("install_now failed: {}", e);
-            emit_error(&msg);
-            return Err(e.into());
-        }
-    }
-
-    // Progress loop: poll every second, tick the content manager, emit a
-    // progress line. When `current()` goes None the download is done.
-    loop {
-        let (percent, still_downloading) = {
-            let mut maxima = maxima_arc.lock().await;
-            for _event in maxima.consume_pending_events() {
-                // Drained but not surfaced — the current ContentManager API
-                // doesn't emit structured download-error events we could
-                // forward as `event: error` lines. Mid-install failures fall
-                // through to `install_now`'s error return (caught above).
-            }
-            maxima.update().await;
-            match maxima.content_manager().current() {
-                Some(d) => (d.percentage_done(), true),
-                None => (100.0, false),
-            }
-        };
-
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "progress",
-                    "percent": percent,
-                    "build_id": build_id,
-                })
-            );
-            let _ = std::io::stdout().flush();
-        } else {
-            info!("Downloading: {}%/100%", percent);
-        }
-
-        if !still_downloading {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-
-    let elapsed = start_time.elapsed();
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "done",
-                "elapsed_secs": elapsed.as_secs_f64(),
-                "offer_id": offer_id,
-                "build_id": build_id,
-                "path": install_path.display().to_string(),
-            })
-        );
-        let _ = std::io::stdout().flush();
-    } else {
-        info!(
-            "Install complete in {}.{}s — {}",
-            elapsed.as_secs(),
-            elapsed.subsec_millis(),
-            install_path.display()
-        );
-    }
-
-    Ok(())
-}
-
-/// Walk the build manifest for `slug` and report which on-disk files
-/// don't match the expected `uncompressed_size`. With `repair = true`,
-/// feed the broken list into `install_game(--replace-files
-/// --only-listed-files)` for a surgical re-fetch.
-///
-/// Why size-only (for now):
-///   * EA's manifest stores a `crc32` field but the value upstream
-///     Maxima computes from on-disk bytes never matches what's in the
-///     manifest. The hash-check code was commented out by upstream
-///     with the note "We must be calculating the hash incorrectly or
-///     something." Until that's deduced, hash verification would
-///     false-positive on every entry. Size-only catches:
-///       - missing files (file doesn't exist)
-///       - truncated files (size < expected)
-///       - over-sized files (size > expected)
-///     It misses:
-///       - same-size content corruption (e.g. the v0.12.1 decoder-
-///         poisoning bug, now fixed in v0.12.2). Users in that
-///         pre-fix bottle state can target the known-bad file via
-///         `install --replace-files <name> --only-listed-files`
-///         directly.
-async fn verify_game(
-    maxima_arc: LockedMaxima,
-    slug: &str,
-    path: &str,
-    repair: bool,
-    json: bool,
-) -> Result<()> {
-    use std::io::Write;
-    use tokio::fs;
-
-    let start_ts = std::time::Instant::now();
-    let emit_error = |msg: &str| {
-        if json {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                serde_json::json!({"event": "error", "message": msg})
-            );
-            let _ = std::io::stdout().flush();
-        }
-    };
-
-    let install_path = PathBuf::from(path);
-    if !install_path.is_absolute() {
-        let msg = format!("--path must be absolute, got '{}'", path);
-        emit_error(&msg);
-        bail!(msg);
-    }
-    if !fs::try_exists(&install_path).await.unwrap_or(false) {
-        let msg = format!("install path '{}' doesn't exist", install_path.display());
-        emit_error(&msg);
-        bail!(msg);
-    }
-
-    // Slug → offer_id resolution. Same chain as `install_game` minus
-    // the unlinked-Steam passthrough fallbacks: for verify we genuinely
-    // need the manifest, so we must hit the EA library.
-    let offer_id = {
-        let mut maxima = maxima_arc.lock().await;
-        let mut found: Option<String> = None;
-        if let Ok(Some(offer)) = maxima.mut_library().game_by_base_slug(slug).await {
-            found = Some(offer.offer_id().clone());
-        }
-        if found.is_none() {
-            if let Ok(Some(offer)) = maxima.mut_library().game_by_base_offer(slug).await {
-                found = Some(offer.offer_id().clone());
-            }
-        }
-        if found.is_none() {
-            if let Ok(games) = maxima.mut_library().games().await {
-                for game in games {
-                    let base = game.base_offer();
-                    if base.slug() == slug
-                        || base.offer_id() == slug
-                        || base.product().id() == slug
-                        || base.product().origin_offer_id() == slug
-                        || base.offer().content_id() == slug
-                        || base.product().product().id() == slug
-                    {
-                        found = Some(base.offer_id().clone());
-                        break;
-                    }
-                }
-            }
-        }
-        match found {
-            Some(id) => id,
-            None => {
-                let msg = format!("No owned offer found for '{}'", slug);
-                emit_error(&msg);
-                bail!(msg);
-            }
-        }
-    };
-
-    // Resolve the live build + fetch the manifest. We don't need a
-    // `QueuedGame` or `add_install` — just the metadata, which the
-    // `ZipDownloader::new` constructor pulls down as a side effect.
-    let (manifest_url, build_id) = {
-        let maxima = maxima_arc.lock().await;
-        let content_service = ContentService::new(maxima.auth_storage().clone());
-        let builds = content_service.available_builds(&offer_id).await?;
-        let build = match builds.live_build() {
-            Some(b) => b,
-            None => {
-                let msg = format!("No live build for offer '{}'", offer_id);
-                emit_error(&msg);
-                bail!(msg);
-            }
-        };
-        let build_id = build.build_id().to_owned();
-        let url = content_service
-            .download_url(&offer_id, Some(&build_id))
-            .await?;
-        (url.url().to_owned(), build_id)
-    };
-
-    let downloader = ZipDownloader::new(&offer_id, &manifest_url, &install_path).await?;
-    let entries = downloader.manifest().entries();
-    let total = entries.len();
-
-    if !json {
-        info!(
-            "Verifying {} files for '{}' (build {})",
-            total, offer_id, build_id
-        );
-    }
-
-    // Walk entries, compare sizes. Progress emitted every ~5% of total
-    // (or every 100 files for smaller manifests) so JSON consumers
-    // get a steady cadence without flooding.
-    let mut broken: Vec<String> = Vec::new();
-    let progress_every = std::cmp::max(total / 20, 100);
-    for (i, entry) in entries.iter().enumerate() {
-        // Skip directory entries (manifest sometimes lists trailing-
-        // slash names) and zero-byte entries (uncompressed_size == 0).
-        let name = entry.name();
-        if name.ends_with('/') || *entry.uncompressed_size() == 0 {
-            continue;
-        }
-        let file_path = install_path.join(name);
-        let expected = *entry.uncompressed_size();
-        let actual = match fs::metadata(&file_path).await {
-            Ok(meta) => meta.len() as i64,
-            Err(_) => -1, // missing
-        };
-        if actual != expected {
-            if !json {
-                if actual < 0 {
-                    warn!("Missing: {}", name);
-                } else {
-                    warn!("Size mismatch: {} (got {}, expected {})", name, actual, expected);
-                }
-            }
-            broken.push(name.clone());
-        }
-        if json && (i + 1) % progress_every == 0 {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                serde_json::json!({
-                    "event": "progress",
-                    "phase": "verify",
-                    "files_checked": i + 1,
-                    "total_files": total,
-                })
-            );
-            let _ = std::io::stdout().flush();
-        }
-    }
-
-    if json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::json!({
-                "event": "verify_done",
-                "ok": total - broken.len(),
-                "broken": &broken,
-                "total": total,
-            })
-        );
-        let _ = std::io::stdout().flush();
-    } else {
-        info!(
-            "Verify done — {}/{} ok, {} broken",
-            total - broken.len(),
-            total,
-            broken.len()
-        );
-    }
-
-    // If nothing's broken, we're done (success either way).
-    if broken.is_empty() {
-        if json {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                serde_json::json!({
-                    "event": "done",
-                    "verified": total,
-                    "broken": 0,
-                    "repaired": 0,
-                    "elapsed_secs": start_ts.elapsed().as_secs_f64(),
-                })
-            );
-            let _ = std::io::stdout().flush();
-        }
-        return Ok(());
-    }
-
-    // --repair: feed broken into the existing install --replace-files
-    // --only-listed-files pipeline. `install_game` emits its own
-    // JSONL events when invoked with `json = true`, so the consumer
-    // sees a continuous stream across the verify → repair handoff.
-    if repair {
-        if !json {
-            info!("Repairing {} broken file(s)…", broken.len());
-        }
-        // Re-emit a transition event so JSON consumers can switch
-        // their UI phase without parsing install_game's events
-        // ambiguously (install_game uses `"phase":"download"` /
-        // `"current_file"` of its own).
-        if json {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                serde_json::json!({
-                    "event": "progress",
-                    "phase": "repair",
-                    "files_done": 0,
-                    "total_files": broken.len(),
-                })
-            );
-            let _ = std::io::stdout().flush();
-        }
-
-        install_game(
-            maxima_arc.clone(),
-            slug,
-            path,
-            None,           // live build — same one we just verified against
-            &broken,        // replace_files = list of broken
-            true,           // only_listed_files
-            json,
-        )
-        .await?;
-
-        if json {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                serde_json::json!({
-                    "event": "done",
-                    "verified": total,
-                    "broken": broken.len(),
-                    "repaired": broken.len(),
-                    "elapsed_secs": start_ts.elapsed().as_secs_f64(),
-                })
-            );
-            let _ = std::io::stdout().flush();
-        }
-    } else if json {
-        // No --repair: end with a `done` event but flagging broken
-        // count so the consumer can decide whether to follow up with
-        // an explicit repair invocation.
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::json!({
-                "event": "done",
-                "verified": total,
-                "broken": broken.len(),
-                "repaired": 0,
-                "elapsed_secs": start_ts.elapsed().as_secs_f64(),
-            })
-        );
-        let _ = std::io::stdout().flush();
-    }
-
-    Ok(())
-}
-
-async fn locate_game(maxima_arc: LockedMaxima, path: &str) -> Result<()> {
-    let path = PathBuf::from(path);
-    let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-    manifest.run_touchup(&path).await?;
-    info!("Installed!");
-    Ok(())
-}
-
-async fn do_cloud_sync(maxima_arc: LockedMaxima, game_slug: &str, write: bool) -> Result<()> {
-    let mut maxima = maxima_arc.lock().await;
-    let offer = maxima
-        .mut_library()
-        .game_by_base_slug(game_slug)
-        .await?
-        .unwrap()
-        .clone();
-
-    info!("Got offer");
-
-    let lock = maxima
-        .cloud_sync()
-        .obtain_lock(
-            &offer,
-            if write {
-                CloudSyncLockMode::Write
-            } else {
-                CloudSyncLockMode::Read
-            },
-        )
-        .await?;
-    let res = lock.sync_files().await;
-    lock.release().await?;
-    res?;
-
-    info!("Done");
-
-    Ok(())
-}
-
 async fn start_game(
     offer_id: &str,
     game_path_override: Option<String>,
@@ -2006,6 +1236,53 @@ async fn start_game(
     login: Option<String>,
     steam_app_id: Option<String>,
     maxima_arc: LockedMaxima,
+    json: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    let start_ts = Instant::now();
+    let result = start_game_inner(
+        offer_id,
+        game_path_override,
+        game_args,
+        login,
+        steam_app_id,
+        maxima_arc,
+        json,
+    )
+    .await;
+
+    if json {
+        match &result {
+            Ok(()) => println!(
+                "{}",
+                serde_json::json!({
+                    "event": "exited",
+                    "elapsed_secs": start_ts.elapsed().as_secs_f64(),
+                })
+            ),
+            Err(err) => println!(
+                "{}",
+                serde_json::json!({
+                    "event": "error",
+                    "message": err.to_string(),
+                })
+            ),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    result
+}
+
+async fn start_game_inner(
+    offer_id: &str,
+    game_path_override: Option<String>,
+    game_args: Vec<String>,
+    login: Option<String>,
+    steam_app_id: Option<String>,
+    maxima_arc: LockedMaxima,
+    json: bool,
 ) -> Result<()> {
     {
         let mut maxima = maxima_arc.lock().await;
@@ -2046,6 +1323,19 @@ async fn start_game(
             launch_options,
         )
         .await?;
+    }
+
+    if json {
+        use std::io::Write;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "launched",
+                "offer_id": offer_id,
+                "wine_prefix": std::env::var("MAXIMA_WINE_PREFIX").ok(),
+            })
+        );
+        let _ = std::io::stdout().flush();
     }
 
     loop {

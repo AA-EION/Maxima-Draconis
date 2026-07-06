@@ -35,6 +35,13 @@ pub async fn start_game_request(
     };
 
     drop(maxima);
+
+    // macOS: select/create the per-game CrossOver bottle before anything
+    // touches wine — license dir, regedit and the spawned game all resolve
+    // the prefix via wine_prefix_dir().
+    #[cfg(target_os = "macos")]
+    maxima::unix::crossover::ensure_game_bottle(&game_info.slug).await?;
+
     launch::start_game(
         maxima_arc.clone(),
         LaunchMode::Online(game_info.offer),

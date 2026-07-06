@@ -107,3 +107,10 @@ pub fn check_desktop_icon() -> Result<(), DesktopError> {
 pub fn check_desktop_icon() -> Result<(), DesktopError> {
     Ok(())
 }
+
+// macOS: no xdg desktop entries; app discovery is LaunchServices' job
+// (an .app bundle, once packaged). Same no-op contract as Windows.
+#[cfg(target_os = "macos")]
+pub fn check_desktop_icon() -> Result<(), DesktopError> {
+    Ok(())
+}

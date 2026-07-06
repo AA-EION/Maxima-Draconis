@@ -72,7 +72,218 @@ struct Versions {
 
 /// Returns internal prtoton pfx path
 pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
+    // Override to target an existing prefix — on macOS this is how a
+    // CrossOver bottle is selected, e.g.
+    // MAXIMA_WINE_PREFIX="$HOME/Library/Application Support/CrossOver/Bottles/Titanfall 2"
+    if let Ok(prefix) = env::var("MAXIMA_WINE_PREFIX") {
+        return Ok(PathBuf::from(prefix));
+    }
     Ok(maxima_dir()?.join("wine/prefix"))
+}
+
+/// CrossOver's wine loader on macOS — used as the default wine command
+/// when present and MAXIMA_WINE_COMMAND isn't set.
+#[cfg(target_os = "macos")]
+pub const CROSSOVER_WINE: &str =
+    "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine";
+
+/// CrossOver's launch helper. Games/installers are handed off through this
+/// instead of running `wine` as our descendant: cxstart makes the launch
+/// behave exactly like double-clicking the exe inside CrossOver's UI, with
+/// CrossOver owning the process tree. Running wine directly works from a
+/// shell but freezes the game's renderer (blank window right after LSX
+/// GetAllGameInfo) when Maxima itself is a `.app`-launched GUI — the same
+/// failure Draconis solved by delegating to cxstart. Env vars still
+/// propagate into the Windows environment through cxstart (verified).
+#[cfg(target_os = "macos")]
+pub const CROSSOVER_CXSTART: &str =
+    "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxstart";
+
+/// posix_spawn with the exact attribute set Draconis's CleanSpawn uses for
+/// its (working) game launches from a `.app`: `POSIX_SPAWN_CLOEXEC_DEFAULT`
+/// + `POSIX_SPAWN_SETSID` + `responsibility_spawnattrs_setdisclaim`, with
+/// /dev/null stdio. The disclaim must be applied at THIS hop: the game
+/// inherits its "responsible process" from cxstart, and disclaiming only an
+/// upstream headless process leaves the game attributed to something with
+/// no GUI check-in — wine's display driver then starves waiting on
+/// WindowServer events (frozen blank window, main thread parked in
+/// mach_msg). Returns the child pid.
+#[cfg(target_os = "macos")]
+fn spawn_disclaimed(
+    exe: &str,
+    args: &[std::ffi::OsString],
+) -> Result<libc::pid_t, NativeError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    // Not exported by the libc crate for apple targets; value from <spawn.h>.
+    const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
+
+    let c_exe = CString::new(exe).map_err(|_| NativeError::Stringify)?;
+    let mut c_args: Vec<CString> = vec![c_exe.clone()];
+    for arg in args {
+        c_args.push(CString::new(arg.as_bytes()).map_err(|_| NativeError::Stringify)?);
+    }
+    let mut argv: Vec<*mut libc::c_char> =
+        c_args.iter().map(|c| c.as_ptr() as *mut _).collect();
+    argv.push(std::ptr::null_mut());
+
+    let env_strings: Vec<CString> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let mut pair = key.into_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(value.as_bytes());
+            CString::new(pair).ok()
+        })
+        .collect();
+    let mut envp: Vec<*mut libc::c_char> =
+        env_strings.iter().map(|c| c.as_ptr() as *mut _).collect();
+    envp.push(std::ptr::null_mut());
+
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return Err(NativeError::Io(std::io::Error::last_os_error()));
+        }
+        libc::posix_spawnattr_setflags(
+            &mut attr,
+            (libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short) | POSIX_SPAWN_SETSID,
+        );
+
+        // Private but stable since 10.14; resolved dynamically so a future
+        // macOS removing it degrades gracefully. Same call Draconis makes.
+        let disclaim_sym = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_spawnattrs_setdisclaim".as_ptr(),
+        );
+        if !disclaim_sym.is_null() {
+            let disclaim: extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int =
+                std::mem::transmute(disclaim_sym);
+            disclaim(&mut attr, 1);
+        }
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&mut actions);
+        let devnull = c"/dev/null".as_ptr();
+        libc::posix_spawn_file_actions_addopen(&mut actions, 0, devnull, libc::O_RDONLY, 0);
+        libc::posix_spawn_file_actions_addopen(&mut actions, 1, devnull, libc::O_WRONLY, 0);
+        libc::posix_spawn_file_actions_adddup2(&mut actions, 1, 2);
+
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_exe.as_ptr(),
+            &actions,
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+
+        if rc != 0 {
+            return Err(NativeError::Io(std::io::Error::from_raw_os_error(rc)));
+        }
+        Ok(pid)
+    }
+}
+
+/// Run a Windows exe via cxstart. cxstart exits right after the handoff, so
+/// wait-for-exit semantics are emulated by polling for the exe's process:
+/// grace period for it to appear (CrossOver cold start), then wait until
+/// it's gone.
+#[cfg(target_os = "macos")]
+async fn run_via_cxstart(
+    prefix: &std::path::Path,
+    exe: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+) -> Result<String, NativeError> {
+    let bottle = prefix
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    info!(
+        "Launching {:?} via cxstart (bottle '{}', disclaimed spawn)",
+        exe, bottle
+    );
+
+    let mut cx_args: Vec<std::ffi::OsString> =
+        vec!["--bottle".into(), bottle.clone().into(), exe.clone()];
+    cx_args.extend(args);
+
+    let pid = spawn_disclaimed(CROSSOVER_CXSTART, &cx_args)?;
+
+    // Reap cxstart itself (it exits once the handoff is done).
+    let cx_status = tokio::task::spawn_blocking(move || {
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        status
+    })
+    .await
+    .unwrap_or(0);
+    if cx_status != 0 {
+        warn!("cxstart exited with raw status {}", cx_status);
+    }
+
+    let needle = std::path::Path::new(&exe)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if needle.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Detect the game via `pgrep -f`, NOT sysinfo: on macOS sysinfo can't
+    // read the command line of wine's (Rosetta-hosted) processes, so a
+    // sysinfo scan never sees the game and the poll below always ran out its
+    // full timeout. `pgrep -f <basename>` matches the game (`C:\…\Titanfall2
+    // .exe`) and its winewrapper — which exit together — and nothing else
+    // (the bootstrap's argv is an opaque base64 blob). It returns exit 0
+    // when a match exists, 1 when none.
+    // ponytail: two concurrent launches of the SAME exe alias here — a
+    // degenerate case (you can't run one game twice), left simple.
+    // Absolute path: the bootstrap (and a launchd-started server) can have a
+    // minimal PATH that doesn't include /usr/bin, so `Command::new("pgrep")`
+    // would fail to spawn and report the game as never-running.
+    let mut appeared = false;
+    let mut gone_checks = 0u32;
+    for tick in 0u32.. {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // tokio::process (not std) so the poll doesn't block a Tokio worker
+        // while pgrep runs. -i: case-insensitive (proc is "Titanfall2.exe").
+        let running = tokio::process::Command::new("/usr/bin/pgrep")
+            .arg("-if")
+            .arg(&needle)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if running {
+            if !appeared {
+                info!("{} is running (cxstart handoff complete)", needle);
+            }
+            appeared = true;
+            gone_checks = 0;
+        } else if appeared {
+            gone_checks += 1;
+            if gone_checks >= 2 {
+                info!("{} exited", needle);
+                break;
+            }
+        } else if tick > 30 {
+            warn!(
+                "{} never appeared after cxstart handoff (waited ~60s); treating launch as done",
+                needle
+            );
+            break;
+        }
+    }
+
+    Ok(String::new())
 }
 
 pub fn proton_dir() -> Result<PathBuf, NativeError> {
@@ -246,13 +457,40 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let eac_path = eac_dir()?;
     let umu_bin = umu_bin()?;
 
-    let wine_path =
-        env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| umu_bin.to_string_lossy().to_string());
+    // macOS + auto-detected CrossOver + fire-and-monitor commands (games,
+    // installers): hand off through cxstart — see run_via_cxstart. A
+    // user-set MAXIMA_WINE_COMMAND opts out (their engine, their rules);
+    // output-capturing calls (regedit parses, version checks) keep the
+    // direct wine invocation, which is fine for non-rendering processes.
+    #[cfg(target_os = "macos")]
+    if !want_output
+        && env::var("MAXIMA_WINE_COMMAND").is_err()
+        && std::path::Path::new(CROSSOVER_CXSTART).exists()
+    {
+        let exe: std::ffi::OsString = arg.as_ref().to_owned();
+        let arg_vec: Vec<std::ffi::OsString> = args
+            .map(|list| {
+                list.into_iter()
+                    .map(|a| a.as_ref().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = command_type; // cxstart has no verb concept
+        return run_via_cxstart(&proton_prefix_path, exe, arg_vec).await;
+    }
+
+    let wine_path = env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| {
+        #[cfg(target_os = "macos")]
+        if std::path::Path::new(CROSSOVER_WINE).exists() {
+            return CROSSOVER_WINE.to_string();
+        }
+        umu_bin.to_string_lossy().to_string()
+    });
 
     // Create command with all necessary wine env variables
     let mut binding = Command::new(wine_path.clone());
     let mut child = binding
-        .env("WINEPREFIX", proton_prefix_path)
+        .env("WINEPREFIX", &proton_prefix_path)
         .env("GAMEID", "umu-0")
         .env("PROTON_VERB", &command_type.to_string())
         .env("PROTONPATH", proton_path)
@@ -269,6 +507,14 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             "WINEDLLOVERRIDES",
             "CryptBase,wsock32,bcrypt,dxgi,d3d11,d3d12,d3d12core=n,b;winemenubuilder.exe=d",
         );
+    }
+
+    // CrossOver's wine wrapper selects bottles by name (CX_BOTTLE); derive it
+    // from the prefix dir so WINEPREFIX and CX_BOTTLE agree. Harmless for
+    // non-CrossOver wine, which ignores the variable.
+    #[cfg(target_os = "macos")]
+    if let Some(bottle) = proton_prefix_path.file_name().and_then(|n| n.to_str()) {
+        child = child.env("CX_BOTTLE", bottle);
     }
 
     if let Some(arguments) = args {
@@ -302,7 +548,20 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         }
         status = output.status;
     } else {
-        status = child.spawn()?.wait().await?;
+        // No output wanted → give wine null stdio instead of inheriting.
+        // Inherited descriptors from a GUI frontend (JSONL pipes, app fds)
+        // reach the game and confuse wine's macOS driver (TF2 freezes after
+        // LSX GetAllGameInfo — see launch.rs bootstrap spawn note), and
+        // wine's fixme spam would otherwise pollute a parent's stdout
+        // protocol. Wine's own logs (CX_LOG / maxima log files) keep the
+        // diagnostics.
+        status = child
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?
+            .wait()
+            .await?;
     };
 
     if !status.success() {
@@ -518,6 +777,19 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\EA Desktop",
             &[("InstallSuccessful", "true")],
         ),
+        // The key Origin-era titles actually read: real Origin is a 32-bit
+        // app, so on 64-bit Windows its install info lives at the BARE
+        // Wow6432Node\Origin (no Electronic Arts\ prefix). TF2 shows
+        // "Failed to initialize Origin: The Origin installation couldn't be
+        // found [a0020008]" without it. Same key the NSIS installer writes
+        // (installer/maxima-setup.nsi, SetRegView 64) for the in-bottle flow.
+        (
+            "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Origin",
+            &[
+                ("InstallSuccessful", "true"),
+                ("ClientPath", "C:/Windows/System32/conhost.exe"),
+            ],
+        ),
         (
             "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\Origin",
             &[
@@ -533,6 +805,31 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             let value = value.replace("\\", "\\\\");
             reg_content.push_str(&format!("\"{}\"=\"{}\"\n\n", name, value));
         }
+    }
+
+    // macOS: route Maxima's URL protocols OUT of the bottle to the host.
+    // Fresh (native-mode) bottles have no in-bottle maxima-bootstrap.exe;
+    // registering winebrowser.exe for the schemes makes wine hand the URL
+    // to the host's `open`, where LaunchServices resolves it to the
+    // registered MaximaBootstrap.app (see registry::set_up_registry). This
+    // is how an externally-launched game's link2ea:// reaches the host
+    // auth server / maxima-cli. Linux keeps upstream's flow untouched.
+    #[cfg(target_os = "macos")]
+    for (protocol, name) in [
+        ("link2ea", "Maxima Launcher"),
+        ("origin2", "Maxima Launcher"),
+        ("qrc", "Maxima Protocol"),
+    ] {
+        reg_content.push_str(&format!("[HKEY_CLASSES_ROOT\\{}]\n", protocol));
+        reg_content.push_str(&format!("@=\"URL:{}\"\n", name));
+        reg_content.push_str("\"URL Protocol\"=\"\"\n\n");
+        reg_content.push_str(&format!(
+            "[HKEY_CLASSES_ROOT\\{}\\shell\\open\\command]\n",
+            protocol
+        ));
+        reg_content.push_str(
+            "@=\"C:\\\\windows\\\\system32\\\\winebrowser.exe \\\"%1\\\"\"\n\n",
+        );
     }
 
     let path = maxima_dir()?.join("temp").join("wine.reg");

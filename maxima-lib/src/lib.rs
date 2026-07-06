@@ -10,11 +10,15 @@ pub mod core;
 pub mod lsx;
 pub mod ooa;
 pub mod rtm;
+pub mod server_client;
 pub mod steam;
 pub mod util;
 
 #[cfg(unix)]
 pub mod unix;
 
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!("Only x86_64 is supported at the moment");
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "macos")
+)))]
+compile_error!("Only x86_64 (all platforms) and aarch64 macOS are supported at the moment");

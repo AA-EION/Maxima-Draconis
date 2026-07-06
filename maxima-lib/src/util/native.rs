@@ -122,6 +122,11 @@ pub enum NativeError {
     Pid(String),
     #[error("could not find PID pattern")]
     PidPattern,
+    #[error(
+        "CrossOver not found at /Applications/CrossOver.app — install CrossOver, \
+         or set MAXIMA_WINE_COMMAND and MAXIMA_WINE_PREFIX to use a different wine"
+    )]
+    CrossOverMissing,
 
     // Windows
     #[error("failed to elevate `{0}`")]
