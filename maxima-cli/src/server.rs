@@ -213,6 +213,13 @@ pub async fn run_bottle_info(port: u16, slug: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_locate_game(port: u16, path: &str) -> Result<()> {
+    let client = connect_ensuring(port).await?;
+    client.locate_game(path).await?;
+    info!("Installed!");
+    Ok(())
+}
+
 pub async fn run_register_protocols(port: u16) -> Result<()> {
     let client = connect_ensuring(port).await?;
     client.register_protocols().await?;
