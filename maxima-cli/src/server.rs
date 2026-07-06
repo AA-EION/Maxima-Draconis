@@ -80,6 +80,13 @@ pub fn locate_server_binary() -> std::path::PathBuf {
             }
         }
     }
+    // The stable App Support copy (macOS) — see docs/MACOS_BUNDLING.md.
+    if let Some(dir) = maxima::server_client::app_support_bin_dir() {
+        let p = dir.join(NAME);
+        if p.is_file() {
+            return p;
+        }
+    }
     std::path::PathBuf::from(NAME)
 }
 

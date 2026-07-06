@@ -46,6 +46,12 @@ enum MaximaCLI {
         if fm.isExecutableFile(atPath: dev.path) {
             return dev
         }
+        // Stable App Support copy — see docs/MACOS_BUNDLING.md.
+        let appSupport = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Maxima/bin/maxima-cli")
+        if fm.isExecutableFile(atPath: appSupport.path) {
+            return appSupport
+        }
         let usrLocal = "/usr/local/bin/maxima-cli"
         if fm.isExecutableFile(atPath: usrLocal) {
             return URL(fileURLWithPath: usrLocal)
@@ -68,6 +74,12 @@ enum MaximaCLI {
             .appendingPathComponent("target/release/maxima-server")
         if fm.isExecutableFile(atPath: dev.path) {
             return dev
+        }
+        // Stable App Support copy — see docs/MACOS_BUNDLING.md.
+        let appSupport = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Maxima/bin/maxima-server")
+        if fm.isExecutableFile(atPath: appSupport.path) {
+            return appSupport
         }
         let usrLocal = "/usr/local/bin/maxima-server"
         if fm.isExecutableFile(atPath: usrLocal) {

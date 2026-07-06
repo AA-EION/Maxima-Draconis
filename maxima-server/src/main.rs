@@ -36,6 +36,11 @@ fn main() {
 async fn run() -> Result<()> {
     info!("Starting Maxima server...");
 
+    // Sync our sibling binaries into the stable App Support dir (macOS) so
+    // launchd / game-spawned bootstrap / every frontend can find us at the
+    // well-known path. No-op elsewhere and when already running from it.
+    maxima::server_client::ensure_app_support_install();
+
     // Host-side wine registry setup (best effort; unix only — Windows service
     // handles its own setup).
     #[cfg(not(windows))]

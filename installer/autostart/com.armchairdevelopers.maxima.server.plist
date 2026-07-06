@@ -1,22 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  macOS launchd agent: runs `maxima-cli server` at login.
+  macOS launchd agent: runs `maxima-server` at login.
 
-  Install (per-user, no sudo):
-    1. Edit the ProgramArguments path below to your maxima-cli location.
-    2. cp installer/autostart/com.armchairdevelopers.maxima.server.plist \
-         ~/Library/LaunchAgents/
-    3. launchctl load ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+  ProgramArguments points at the STABLE install path
+  (~/Library/Application Support/Maxima/bin/maxima-server), NOT inside a .app
+  bundle — a quarantined/translocated .app runs from a randomized read-only
+  path, which would break this reference. Maxima.app (or an installer) syncs
+  the binaries into that dir on first run; the server also self-syncs on
+  startup. See docs/MACOS_BUNDLING.md.
+
+  Install (per-user, no sudo) — the $HOME in the path must be expanded first:
+    sed "s|\$HOME|$HOME|g" \
+      installer/autostart/com.armchairdevelopers.maxima.server.plist \
+      > ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+    launchctl bootstrap gui/$UID \
+      ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
 
   Stop / uninstall:
-    launchctl unload ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+    launchctl bootout gui/$UID/com.armchairdevelopers.maxima.server
     rm ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
 
-  The server exposes a menu-bar item only when Maxima.app is open; the
-  launchd-run server itself is headless (macOS status items need a GUI app).
-  RunAtLoad + KeepAlive.SuccessfulExit=false restarts it if it crashes but
-  respects a clean `maxima-cli server-stop`.
+  On start the server spawns the macOS menu-bar host (Maxima.app --menubar),
+  so the status-bar icon is present from login without a window flashing up.
+  If Maxima.app isn't installed, the server runs headless (use
+  `maxima-cli server-status`). RunAtLoad + KeepAlive.SuccessfulExit=false
+  restarts it on crash but respects a clean `maxima-cli server-stop`.
 -->
 <plist version="1.0">
 <dict>
@@ -24,8 +33,7 @@
     <string>com.armchairdevelopers.maxima.server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/maxima-cli</string>
-        <string>server</string>
+        <string>$HOME/Library/Application Support/Maxima/bin/maxima-server</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
