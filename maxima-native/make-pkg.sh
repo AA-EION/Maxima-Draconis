@@ -30,8 +30,11 @@ cp -R "$APP" "${ROOT}/Applications/"
 
 cat > "${SCRIPTS}/postinstall" <<'POST'
 #!/bin/bash
-# Runs as root. Symlink the binaries onto PATH and register the service as the
-# console user (the launchd agent is per-user, not root).
+# Runs as root. Symlink the binaries onto PATH, then — as the console user, the
+# owner of the per-user launchd + LaunchServices databases — register the
+# service and the URL protocol handlers. Both steps are login-free (service
+# install with on-demand only writes config + syncs binaries; lsregister just
+# claims the schemes), so installing never opens a browser.
 set -e
 RES="/Applications/Maxima.app/Contents/Resources"
 mkdir -p /usr/local/bin
@@ -39,11 +42,17 @@ for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
     [ -f "${RES}/${b}" ] && ln -sf "${RES}/${b}" "/usr/local/bin/${b}"
 done
 
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+BOOTSTRAP_APP="${RES}/bundle/osx/MaximaBootstrap.app"
+
 CONSOLE_USER="$(stat -f%Su /dev/console)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
     CONSOLE_UID="$(id -u "$CONSOLE_USER")"
     launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
         /usr/local/bin/maxima-cli service install --boot on-demand || true
+    # Register qrc:// / link2ea:// / origin2:// (no login needed).
+    [ -d "$BOOTSTRAP_APP" ] && launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
+        "$LSREGISTER" -f "$BOOTSTRAP_APP" || true
 fi
 exit 0
 POST
