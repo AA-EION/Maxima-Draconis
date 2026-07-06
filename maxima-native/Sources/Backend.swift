@@ -75,7 +75,9 @@ actor Backend {
 
         let fd = try Self.connect()
         let readHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        writeHandle = FileHandle(fileDescriptor: dup(fd), closeOnDealloc: false)
+        // closeOnDealloc: true so the dup'd fd is closed when writeHandle is
+        // released (handleDisconnect sets it to nil) — otherwise it leaks.
+        writeHandle = FileHandle(fileDescriptor: dup(fd), closeOnDealloc: true)
 
         let (stream, continuation) = AsyncStream.makeStream(of: [String: Any].self)
         eventContinuation = continuation
@@ -212,6 +214,9 @@ actor Backend {
         guard let server = MaximaCLI.locateServer() else { throw BackendError.cliNotFound }
         let path = server.path
 
+        // NB: `posix_spawn_file_actions_t` is `UnsafeMutableRawPointer` (non-
+        // optional) on Darwin, and `_init` takes `UnsafeMutablePointer<…?>`, so
+        // this MUST be declared optional — it is not a redundant double-optional.
         var fileActions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fileActions)
         defer { posix_spawn_file_actions_destroy(&fileActions) }

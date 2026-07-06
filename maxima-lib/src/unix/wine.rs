@@ -247,22 +247,22 @@ async fn run_via_cxstart(
     // Absolute path: the bootstrap (and a launchd-started server) can have a
     // minimal PATH that doesn't include /usr/bin, so `Command::new("pgrep")`
     // would fail to spawn and report the game as never-running.
-    let running = |needle: &str| -> bool {
-        std::process::Command::new("/usr/bin/pgrep")
-            .arg("-if") // -i: case-insensitive (proc is "Titanfall2.exe")
-            .arg(needle)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-
     let mut appeared = false;
     let mut gone_checks = 0u32;
     for tick in 0u32.. {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if running(&needle) {
+        // tokio::process (not std) so the poll doesn't block a Tokio worker
+        // while pgrep runs. -i: case-insensitive (proc is "Titanfall2.exe").
+        let running = tokio::process::Command::new("/usr/bin/pgrep")
+            .arg("-if")
+            .arg(&needle)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if running {
             if !appeared {
                 info!("{} is running (cxstart handoff complete)", needle);
             }

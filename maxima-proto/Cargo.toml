@@ -17,3 +17,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time", "process"] }
 thiserror = "1"
 log = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+# setsid() to fully detach the spawned server (connect_or_spawn).
+libc = "0.2"

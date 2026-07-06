@@ -128,7 +128,15 @@ impl MaximaClient {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
-        cmd.process_group(0); // detach so the server outlives this client
+        unsafe {
+            // setsid (new session) fully detaches so the server outlives this
+            // client — process_group alone lets a launchd/terminal session
+            // leader reap it. Matches the spawn in maxima-cli / maxima-lib.
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         let _ = cmd.spawn()?;
         for _ in 0..120 {
             tokio::time::sleep(Duration::from_millis(500)).await;
