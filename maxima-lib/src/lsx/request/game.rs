@@ -93,12 +93,16 @@ pub async fn handle_all_game_info_request(
         None => (None, None, None, None),
     };
 
-    let display_name = display_name.or(challenge_title).unwrap_or_default();
-    let installed_version = installed_version
-        .or_else(|| challenge_version.clone())
+    // The values the game reported about itself in the challenge win: they
+    // are what it expects echoed back, and echoing them is the behaviour
+    // validated end-to-end. Library data only fills in what the game omitted.
+    let display_name = challenge_title.or(display_name).unwrap_or_default();
+    let installed_version = challenge_version
+        .clone()
+        .or(installed_version)
         .unwrap_or_default();
-    let available_version = available_version
-        .or(challenge_version)
+    let available_version = challenge_version
+        .or(available_version)
         .unwrap_or_default();
 
     make_lsx_handler_response!(Response, GetAllGameInfoResponse, {
@@ -116,6 +120,6 @@ pub async fn handle_all_game_info_request(
         attr_FreeTrial: false,
         attr_InstalledLanguage: "en_US".to_string(),
         attr_FullGameReleaseDate: release_date.unwrap_or_else(|| UNKNOWN_RELEASE_DATE.to_string()),
-        attr_SystemTime: "2023-06-22T04:00:00".to_string()
+        attr_SystemTime: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
     })
 }
