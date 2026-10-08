@@ -165,6 +165,9 @@ pub struct LocalizedInterfaceSettings {
     pub header: String,
     /// Label for a combo box to select the frontend's language
     pub language: String,
+    /// Label for a checkbox to enable animated game background videos
+    #[cfg_attr(not(feature = "bg-videos"), allow(dead_code))]
+    pub videos: String,
 }
 
 #[derive(Deserialize)]

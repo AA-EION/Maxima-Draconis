@@ -405,6 +405,9 @@ pub struct MaximaEguiApp {
     app_bg_renderer: Option<AppBgRenderer>,
     /// Image cache
     img_cache: UIImageCache,
+    /// Animated game backgrounds (off unless enabled in settings)
+    #[cfg(feature = "bg-videos")]
+    bg_video: renderers::bg_video::BgVideo,
     /// Translations
     locale: TranslationManager,
     /// If a core thread has crashed and made the UI unstable
@@ -472,6 +475,10 @@ pub struct FrontendSettings {
     /// keeps settings persisted by older builds deserializable.
     #[serde(default)]
     wine_command: String,
+    /// Play animated game backgrounds. Only has an effect in builds with the
+    /// `bg-videos` feature; off by default to save CPU/battery.
+    #[serde(default)]
+    videos: bool,
 }
 
 impl FrontendSettings {
@@ -483,6 +490,7 @@ impl FrontendSettings {
             game_settings: HashMap::new(),
             performance_settings: FrontendPerformanceSettings::new(),
             wine_command: String::new(),
+            videos: false,
         }
     }
 }
@@ -630,6 +638,8 @@ impl MaximaEguiApp {
             game_view_bg_renderer: GameViewBgRenderer::new(cc),
             app_bg_renderer: AppBgRenderer::new(cc),
             img_cache,
+            #[cfg(feature = "bg-videos")]
+            bg_video: Default::default(),
             locale: TranslationManager::new(&settings.language),
             critical_error: None,
             nonfatal_errors: Vec::new(),
@@ -1202,7 +1212,38 @@ impl eframe::App for MaximaEguiApp {
             frame,
             "Maxima",
             |ui| {
-                if let Some(render) = &self.app_bg_renderer {
+                // The video is plain egui painting, so it works with any renderer
+                // (the glow-only background below is absent under wgpu).
+                #[cfg(feature = "bg-videos")]
+                let video_drawn = {
+                    let has_game_img = self.backend_state == BackendStallState::BingChilling
+                        && self.games.len() > 0;
+                    let gaming = self.page_view == PageType::Games && has_game_img;
+                    if has_game_img && self.game_sel.is_empty() {
+                        if let Some(key) = self.games.keys().next() {
+                            self.game_sel = key.clone()
+                        }
+                    }
+                    let how_game: f32 = ctx
+                        .animate_bool(egui::Id::new("MainAppBackgroundGamePageFadeBool"), gaming);
+                    let mut fullrect = ui.available_rect_before_wrap().clone();
+                    fullrect.min -= APP_MARGIN;
+                    fullrect.max += APP_MARGIN;
+                    has_game_img
+                        && self.bg_video.draw(
+                            ui,
+                            fullrect,
+                            &self.game_sel,
+                            self.settings.videos,
+                            gaming,
+                            how_game,
+                            &self.backend.backend_commander,
+                        )
+                };
+                #[cfg(not(feature = "bg-videos"))]
+                let video_drawn = false;
+
+                if let Some(render) = self.app_bg_renderer.as_ref().filter(|_| !video_drawn) {
                     let mut fullrect = ui.available_rect_before_wrap().clone();
                     fullrect.min -= APP_MARGIN;
                     fullrect.max += APP_MARGIN;

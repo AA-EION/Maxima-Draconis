@@ -1,6 +1,8 @@
 use egui::Context;
 use log::{error, info, warn};
 
+#[cfg(feature = "bg-videos")]
+use crate::bridge::get_games::get_game_bg_video_request;
 use crate::{
     bridge::{
         game_details::game_details_request, get_friends::get_friends_request,
@@ -81,6 +83,9 @@ pub enum MaximaLibRequest {
     GetGamesRequest,
     GetFriendsRequest,
     GetGameDetailsRequest(String),
+    /// Look up the background video URL for a game slug (`bg-videos` feature).
+    #[cfg(feature = "bg-videos")]
+    GetGameBgVideoRequest(String),
     StartGameRequest(GameInfo, Option<GameSettings>),
     InstallGameRequest(String, PathBuf),
     LocateGameRequest(String),
@@ -101,6 +106,9 @@ pub enum MaximaLibResponse {
     GameInfoResponse(InteractThreadGameListResponse),
     FriendInfoResponse(InteractThreadFriendListResponse),
     GameDetailsResponse(InteractThreadGameDetailsResponse),
+    /// Slug and its background video URL, if the game has one (`bg-videos` feature).
+    #[cfg(feature = "bg-videos")]
+    GameBgVideoResponse(String, Option<String>),
     LocateGameResponse(InteractThreadLocateGameResponse),
     // Alerts, rather than responses:
     CriticalError(Box<BackendError>),
@@ -458,6 +466,14 @@ impl BridgeThread {
                     let maxima = maxima_arc.clone();
                     let context = ctx.clone();
                     async move { game_details_request(maxima, slug.clone(), channel, &context).await }.await
+                }
+                #[cfg(feature = "bg-videos")]
+                MaximaLibRequest::GetGameBgVideoRequest(slug) => {
+                    let channel = backend_responder.clone();
+                    let maxima = maxima_arc.clone();
+                    let context = ctx.clone();
+                    async move { get_game_bg_video_request(maxima, slug, channel, &context).await }
+                        .await
                 }
                 MaximaLibRequest::LocateGameRequest(path) => {
                     #[cfg(unix)]
