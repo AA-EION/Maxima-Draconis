@@ -28,6 +28,10 @@ pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result
 
     let mut stdin_reader = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdin_line = String::new();
+    // A detached server (or any process spawned with a null stdin) reads EOF
+    // immediately and forever; without this guard the select! spins at 100%
+    // CPU for the whole time the user spends in the browser.
+    let mut stdin_open = true;
 
     loop {
         tokio::select! {
@@ -62,8 +66,11 @@ pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result
                     return Err(AuthError::NoAuthCode.into());
                 }
             }
-            read_res = stdin_reader.read_line(&mut stdin_line) => {
-                let _ = read_res?;
+            read_res = stdin_reader.read_line(&mut stdin_line), if stdin_open => {
+                if read_res? == 0 {
+                    stdin_open = false;
+                    continue;
+                }
                 let line = stdin_line.trim();
 
                 // Try parsing as URL first

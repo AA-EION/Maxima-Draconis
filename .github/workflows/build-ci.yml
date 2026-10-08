@@ -62,7 +62,7 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         # X11/xkbcommon libs are only needed by maxima-ui (not built here).
-        sudo apt-get install -y musl-tools
+        sudo apt-get install -y musl-tools libdbus-1-dev pkg-config
         rustup target add x86_64-unknown-linux-musl
 
     - uses: Swatinem/rust-cache@v2
@@ -101,6 +101,7 @@ jobs:
           target/release/maxima-service.exe
           target/release/maxima-bootstrap.exe
           target/release/maxima-cli.exe
+          target/release/maxima-server.exe
           target/release/maxima-tui.exe
           target/release/maxima.exe
 
@@ -136,6 +137,7 @@ jobs:
         ls -l target/x86_64-unknown-linux-musl/release
         chmod +x target/x86_64-unknown-linux-musl/release/maxima-bootstrap
         chmod +x target/x86_64-unknown-linux-musl/release/maxima-cli
+        chmod +x target/x86_64-unknown-linux-musl/release/maxima-server
 
     - uses: actions/upload-artifact@v4
       if: runner.os == 'Linux'
@@ -144,6 +146,7 @@ jobs:
         path: |
           target/x86_64-unknown-linux-musl/release/maxima-bootstrap
           target/x86_64-unknown-linux-musl/release/maxima-cli
+          target/x86_64-unknown-linux-musl/release/maxima-server
 
     # ── macOS: validate MaximaHelper.app build ─────────────────────────────
     # This mirrors what release.yml does so PRs that break the helper get
@@ -177,3 +180,88 @@ jobs:
       with:
         name: maxima-helper-zip
         path: dist/MaximaHelper.zip
+
+  # ── macOS native (Apple Silicon) ─────────────────────────────────────────
+  # The native-mode binaries (maxima-cli / maxima-server / maxima-bootstrap /
+  # maxima-tui), MaximaBootstrap.app and the SwiftUI Maxima.app. The matrix
+  # job above only builds MaximaHelper on macOS, so without this nothing
+  # compiles the `cfg(target_os = "macos")` Rust paths before a release.
+  macos-native:
+    name: macOS native (arm64)
+    runs-on: macos-26
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      run: brew install protobuf
+
+    - name: Install Rust nightly
+      # rust-toolchain.toml pins nightly; rustup picks it up on first use.
+      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: macOS-native-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Build native binaries
+      run: |
+        cargo build --release \
+          -p maxima-cli -p maxima-server -p maxima-bootstrap -p maxima-tui
+
+    - name: Unit tests (maxima-proto)
+      run: cargo test --release -p maxima-proto
+
+    - name: Assemble MaximaBootstrap.app + Maxima.app
+      run: |
+        bash maxima-bootstrap/build-app.sh
+        bash maxima-native/build.sh
+
+    - name: Smoke-test the native CLI
+      # No login is available on CI, so only exercise commands that are pure
+      # host operations: argument parsing and the server probe.
+      run: |
+        set -e
+        ./target/release/maxima-cli --help >/dev/null
+        out="$(./target/release/maxima-cli server-status --json)"
+        echo "$out"
+        echo "$out" | grep -q '"running":false'
+        test -x maxima-native/build/Maxima.app/Contents/MacOS/Maxima
+        test -x maxima-native/build/Maxima.app/Contents/Resources/maxima-server
+        test -d maxima-native/build/Maxima.app/Contents/Resources/bundle/osx/MaximaBootstrap.app
+        codesign --verify --deep maxima-native/build/Maxima.app
+        echo "✓ native macOS build looks healthy"
+
+  # ── MaximaSetup.exe under Wine on macOS ──────────────────────────────────
+  # The in-bottle mode Draconis uses: install MaximaSetup.exe into a fresh
+  # Wine prefix on a macOS runner, then check the installed layout and that
+  # the thin-client CLI really spawns maxima-server.exe. Intel runner so the
+  # x86_64 Windows binaries run without Rosetta.
+  wine-smoke:
+    name: MaximaSetup.exe under Wine (macOS)
+    needs: build
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: maxima-installer-win64
+        path: dist
+
+    - name: Install Wine
+      run: |
+        brew install --cask wine-stable
+        xattr -dr com.apple.quarantine "/Applications/Wine Stable.app" || true
+        echo "/Applications/Wine Stable.app/Contents/Resources/wine/bin" >> "$GITHUB_PATH"
+
+    - name: Install + verify Maxima in a fresh prefix
+      env:
+        WINEPREFIX: ${{ runner.temp }}/maxima-prefix
+        WINEDEBUG: -all
+        WINEDLLOVERRIDES: "mscoree,mshtml="
+      run: bash installer/wine-smoke.sh dist/MaximaSetup.exe

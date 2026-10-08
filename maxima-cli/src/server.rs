@@ -94,15 +94,34 @@ pub async fn ensure_server_running(port: u16) -> Result<()> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
-    cmd.spawn()?;
-    for _ in 0..120 {
+    let mut child = cmd.spawn()?;
+    // The server binds its control port only after login, and a first-run
+    // login waits on the user in the browser — so keep waiting as long as the
+    // spawned server is alive, up to SERVER_LOGIN_TIMEOUT.
+    let deadline = std::time::Instant::now() + SERVER_LOGIN_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if is_running(port).await {
             return Ok(());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            if is_running(port).await {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "maxima-server exited ({}) before it started serving — login failed or \
+                 was cancelled; see the maxima-server log",
+                status
+            );
+        }
     }
-    anyhow::bail!("server did not come up within 60s")
+    anyhow::bail!(
+        "server did not come up within {}s (still waiting for login?)",
+        SERVER_LOGIN_TIMEOUT.as_secs()
+    )
 }
+
+const SERVER_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Forward a launch/install to the running server and stream its events to
 /// stdout until a terminal event arrives. `json_out` passes raw event lines

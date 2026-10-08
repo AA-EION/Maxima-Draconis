@@ -217,6 +217,9 @@ Section "Maxima Core" SEC_CORE
     File "${BIN_DIR}\maxima-bootstrap.exe"
     File "${BIN_DIR}\maxima-cli.exe"
     File "${BIN_DIR}\maxima-service.exe"
+    ; The CLI is a thin client of maxima-server and spawns it on demand, so
+    ; the server must ship alongside it or every CLI command fails.
+    File "${BIN_DIR}\maxima-server.exe"
 
     ; Optional binaries (may not exist in all builds)
     File /nonfatal "${BIN_DIR}\maxima-tui.exe"
@@ -295,7 +298,19 @@ Section "Maxima Core" SEC_CORE
     ; the per-user Run key starts it at logon so every frontend and any
     ; link2ea:// launch finds it already running. Per-user (HKCU) so it doesn't
     ; need the session's desktop as SYSTEM.
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MaximaServer" '"$INSTDIR\maxima-cli.exe" server'
+    ;
+    ; Skipped under Wine: wineboot replays the Run key every time the bottle
+    ; boots, so the server would be started by whatever host process happened
+    ; to boot the bottle. On macOS that parent's App Nap / responsibility state
+    ; then cascades onto every game the server launches (the GUI-launch freeze
+    ; Draconis works around with a disclaimed spawn). In a bottle the CLI
+    ; spawns the server on demand from the consumer's disclaimed context.
+    IfFileExists "$WINDIR\system32\wineboot.exe" skip_server_autostart
+    ClearErrors
+    EnumRegKey $0 HKCU "Software\Wine" 0
+    IfErrors 0 skip_server_autostart
+        WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MaximaServer" '"$INSTDIR\maxima-server.exe"'
+    skip_server_autostart:
 
     ; ---- Start Menu Shortcuts ----
     CreateDirectory "$SMPROGRAMS\Maxima"
@@ -387,6 +402,7 @@ Section "Uninstall"
     Delete "$INSTDIR\maxima-bootstrap.exe"
     Delete "$INSTDIR\maxima-cli.exe"
     Delete "$INSTDIR\maxima-service.exe"
+    Delete "$INSTDIR\maxima-server.exe"
     Delete "$INSTDIR\maxima-tui.exe"
     Delete "$INSTDIR\maxima.exe"
     Delete "$INSTDIR\uninstall.exe"
