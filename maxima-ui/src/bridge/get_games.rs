@@ -4,7 +4,7 @@ use crate::{
     GameDetailsWrapper, GameInfo, GameVersionInfo,
 };
 use egui::Context;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use maxima::{
     core::{
         service_layer::{
@@ -207,10 +207,13 @@ pub async fn get_games_request(
 
         let downloads = game.base_offer().offer().downloads();
         let opt = if downloads.len() == 1 {
-            &downloads[0]
+            downloads.first()
         } else {
-            downloads.iter().find(|item| item.download_type() == "LIVE").unwrap()
+            downloads.iter().find(|item| item.download_type() == "LIVE")
         };
+        if opt.is_none() {
+            warn!("No LIVE download found for {}; showing it without version info", &slug);
+        }
 
         let version = if let Ok(version) = game.base_offer().installed_version().await {
             version
@@ -225,8 +228,10 @@ pub async fn get_games_request(
             details: GameDetailsWrapper::Unloaded,
             version: GameVersionInfo {
                 installed: version,
-                latest: opt.version().to_owned(),
-                mandatory: opt.treat_updates_as_mandatory().clone(),
+                latest: opt
+                    .map(|opt| opt.version().to_owned())
+                    .unwrap_or_else(|| "Unknown".to_owned()),
+                mandatory: opt.map_or(false, |opt| *opt.treat_updates_as_mandatory()),
             },
             dlc: game.extra_offers().clone(),
             installed: game.base_offer().is_installed().await,

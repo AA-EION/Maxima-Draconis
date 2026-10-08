@@ -33,7 +33,7 @@ impl<K: Eq + Hash + Sync + Send + 'static> DynamicCache<K> {
     {
         match self.cache.get(key) {
             None => None,
-            Some(cached) => Some((*cached.downcast::<T>().unwrap()).clone()),
+            Some(cached) => cached.downcast::<T>().ok().map(|value| (*value).clone()),
         }
     }
 }

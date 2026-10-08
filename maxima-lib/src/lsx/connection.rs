@@ -408,7 +408,10 @@ impl Connection {
                 LSXMessageType::Request(msg) => {
                     Connection::process_request_message(&state, msg).await
                 }
-                LSXMessageType::Response(_) => unimplemented!(),
+                LSXMessageType::Response(_) => {
+                    warn!("Ignoring unexpected LSX response message from the game");
+                    Ok(None)
+                }
             };
 
             let reply: Option<LSXMessageType> = match reply {

@@ -327,25 +327,23 @@ impl ServiceLayerClient {
         );
 
         let result = serde_json::from_str::<Value>(text.as_str())?;
-        let errors = result.get("errors");
-        if let Some(errors) = errors {
-            let errors = errors.as_array().unwrap();
-            let error = if let Value::Object(o) = &errors[0] {
-                o
-            } else {
-                return Err(ServiceLayerError::GraphQL {
-                    operation: operation.operation.to_string(),
-                    error: None,
-                });
+        // `errors` may be null, empty, or not an array at all; none of that may panic.
+        let first_error = match result.get("errors") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(errors)) if errors.is_empty() => None,
+            Some(Value::Array(errors)) => Some(errors[0].clone()),
+            Some(other) => Some(other.clone()),
+        };
+        if let Some(error) = first_error {
+            let message = match &error {
+                Value::Object(o) => o.get("message").map(|m| m.to_string()),
+                Value::Null => None,
+                other => Some(other.to_string()),
             };
 
             return Err(ServiceLayerError::GraphQL {
                 operation: operation.operation.to_string(),
-                error: if let Some(error) = error.get("message") {
-                    Some(error.to_string())
-                } else {
-                    None
-                },
+                error: message,
             });
         }
 

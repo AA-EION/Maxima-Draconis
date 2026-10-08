@@ -235,7 +235,10 @@ impl RtmClient {
         }).await?;
 
         for ele in res.connected_sessions {
-            let platform = PlatformV1::try_from(ele.platform)?;
+            let Ok(platform) = PlatformV1::try_from(ele.platform) else {
+                warn!("Ignoring RTM session with unknown platform {}", ele.platform);
+                continue;
+            };
             if platform != PlatformV1::Pc {
                 continue;
             }
