@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: runs `maxima-server` at login.
+
+  ProgramArguments points at the STABLE install path
+  (~/Library/Application Support/Maxima/bin/maxima-server), NOT inside a .app
+  bundle — a quarantined/translocated .app runs from a randomized read-only
+  path, which would break this reference. Maxima.app (or an installer) syncs
+  the binaries into that dir on first run; the server also self-syncs on
+  startup. See docs/MACOS_BUNDLING.md.
+
+  Install (per-user, no sudo) — the $HOME in the path must be expanded first:
+    sed "s|\$HOME|$HOME|g" \
+      installer/autostart/com.armchairdevelopers.maxima.server.plist \
+      > ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+    launchctl bootstrap gui/$UID \
+      ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+
+  Stop / uninstall:
+    launchctl bootout gui/$UID/com.armchairdevelopers.maxima.server
+    rm ~/Library/LaunchAgents/com.armchairdevelopers.maxima.server.plist
+
+  On start the server spawns the macOS menu-bar host (Maxima.app --menubar),
+  so the status-bar icon is present from login without a window flashing up.
+  If Maxima.app isn't installed, the server runs headless (use
+  `maxima-cli server-status`). RunAtLoad + KeepAlive.SuccessfulExit=false
+  restarts it on crash but respects a clean `maxima-cli server-stop`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.armchairdevelopers.maxima.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$HOME/Library/Application Support/Maxima/bin/maxima-server</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/maxima-server.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/maxima-server.err.log</string>
+</dict>
+</plist>

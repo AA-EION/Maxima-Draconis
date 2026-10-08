@@ -345,6 +345,38 @@ impl GameLibrary {
             .map(|x| &x.base_offer))
     }
 
+    /// Resolve whatever a caller has (slug, offer id, Steam App ID, content
+    /// id…) to the library's canonical base slug where possible. Falls back
+    /// to the input when the library doesn't know it (not logged in,
+    /// unlinked accounts). Used to key per-game state (e.g. CrossOver
+    /// bottle names) consistently across input forms.
+    pub async fn canonical_slug(&mut self, typed: &str) -> String {
+        if let Ok(Some(offer)) = self.game_by_base_slug(typed).await {
+            return offer.slug().clone();
+        }
+        if let Ok(Some(offer)) = self.game_by_base_offer(typed).await {
+            return offer.slug().clone();
+        }
+        // Exhaustive scan — same property set maxima-cli's launch
+        // resolution matches against.
+        let typed_s = typed.to_string();
+        if let Ok(games) = self.games().await {
+            for game in games {
+                let base = game.base_offer();
+                if base.slug() == &typed_s
+                    || base.offer_id() == &typed_s
+                    || base.product().id() == &typed_s
+                    || base.product().origin_offer_id() == &typed_s
+                    || base.offer().content_id() == &typed_s
+                    || base.product().product().id() == &typed_s
+                {
+                    return base.slug().clone();
+                }
+            }
+        }
+        typed_s
+    }
+
     async fn update_if_needed(&mut self) -> Result<(), LibraryError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

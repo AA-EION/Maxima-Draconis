@@ -14,15 +14,20 @@ const PRIME_10K: u32 = 104729;
 const PRIME_20K: u32 = 224737;
 const PRIME_30K: u32 = 350377;
 
+/// Returns an empty string for anything that isn't valid ciphertext: a
+/// garbled LSX packet must not take down the connection task. (upstream #70)
 pub fn simple_decrypt(data: &[u8], key: &[u8; 16]) -> String {
-    let data = get_array(str::from_utf8(data).unwrap());
+    let Ok(text) = str::from_utf8(data) else {
+        return String::new();
+    };
+    let data = get_array(text);
 
     let key = GenericArray::from_slice(key);
-    let result = Aes128EcbDec::new(key)
-        .decrypt_padded_vec_mut::<Pkcs7>(&data)
-        .unwrap();
+    let Ok(result) = Aes128EcbDec::new(key).decrypt_padded_vec_mut::<Pkcs7>(&data) else {
+        return String::new();
+    };
 
-    String::from_utf8(result).unwrap()
+    String::from_utf8(result).unwrap_or_default()
 }
 
 pub fn simple_encrypt(data: &[u8], key: &[u8; 16]) -> String {

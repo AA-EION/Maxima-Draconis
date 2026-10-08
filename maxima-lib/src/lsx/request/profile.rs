@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::core::service_layer::{
     ServiceFriends, ServiceGetMyFriendsRequestBuilder, ServiceLayerError,
@@ -120,19 +120,27 @@ pub async fn handle_set_presence_request(
         return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
     }
 
-    let offer = playing.offer().as_ref().unwrap().offer();
+    let Some(owned_offer) = playing.offer().as_ref() else {
+        return make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() });
+    };
+    let offer = owned_offer.offer();
     let offer_id = offer.offer_id().to_owned();
     let name = offer.display_name().to_owned();
 
     if let Some(presence) = request.attr_RichPresence {
-        maxima
+        // Presence is cosmetic: don't hand the game an error (and risk it
+        // tearing down the LSX session) when RTM is unavailable.
+        if let Err(err) = maxima
             .rtm()
             .set_presence(
                 BasicPresence::Online,
                 &format!("{}: {}", name, presence),
                 &offer_id,
             )
-            .await?;
+            .await
+        {
+            warn!("Failed to update RTM presence: {}", err);
+        }
     }
 
     make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() })

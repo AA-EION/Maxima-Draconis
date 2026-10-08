@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 maxima-lib = { path = "../maxima-lib" }
+maxima-proto = { path = "../maxima-proto" }
 clap = { version = "4.3.5", features = [ "derive" ] }
 tokio = { version = "1.28.2", features = [ "full", "rt", "rt-multi-thread", "time", "net" ] }
 serde = { version = "1.0.164", features = [ "derive" ] }

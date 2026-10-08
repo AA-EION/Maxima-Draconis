@@ -45,6 +45,8 @@ pub enum EntryError {
     Decode,
     #[error("invalid signature `{0:#10x}` (expected `{sig:#10x}`)", sig = ZIP_FILE_HEADER_SIGNATURE)]
     Signature(u32),
+    #[error("unsafe entry name `{0}` (absolute path, drive prefix or `..` component)")]
+    PathTraversal(String),
 }
 
 #[derive(Error, Debug)]
@@ -95,7 +97,24 @@ fn signature_scan_rev(data: &[u8], signature: u32) -> Option<usize> {
     None
 }
 
-#[derive(Default, Clone, Debug, PartialEq)]
+/// Entry names are joined onto the install directory, so they must stay inside it.
+/// Both separators are normalized on every host: a name that is harmless on Unix
+/// (`..\x`) is still a traversal when the same manifest is installed under Wine.
+fn validate_entry_name(name: &str) -> Result<(), EntryError> {
+    let normalized = name.replace('\\', "/");
+    let unsafe_name = normalized.starts_with('/')
+        || normalized
+            .split('/')
+            .any(|component| component == ".." || component.contains(':'));
+
+    if unsafe_name {
+        return Err(EntryError::PathTraversal(name.to_string()));
+    }
+
+    Ok(())
+}
+
+#[derive(Default, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CompressionType {
     #[default]
     None = 0,
@@ -111,7 +130,7 @@ impl CompressionType {
     }
 }
 
-#[derive(Default, Debug, Clone, Getters)]
+#[derive(Default, Debug, Clone, Getters, serde::Serialize, serde::Deserialize)]
 pub struct ZipFileEntry {
     name: String,
     crc32: u32,
@@ -170,6 +189,7 @@ impl ZipFileEntry {
                 Err(_) => return Err(EntryError::Decode),
             }
         };
+        validate_entry_name(&entry.name)?;
         entry.extra_field = data.read_bytes(extra_field_len as usize)?;
 
         if let Ok(data) = entry.extra_field(0x01) {
@@ -224,9 +244,20 @@ impl ZipFileEntry {
     }
 }
 
-#[derive(Default, Getters)]
+#[derive(Default, Getters, serde::Serialize, serde::Deserialize)]
 pub struct ZipFile {
     entries: Vec<ZipFileEntry>,
+}
+
+/// On-disk cache location for a fetched manifest. Keyed by the URL *path*
+/// only — the `sauth` query token rotates per session while the path
+/// uniquely (and immutably) names the build artifact.
+fn manifest_cache_path(url: &str) -> Option<std::path::PathBuf> {
+    let path_part = url.split('?').next().unwrap_or(url);
+    let hash = crate::util::hash::hash_fnv1a(path_part.as_bytes());
+    crate::util::native::maxima_dir()
+        .ok()
+        .map(|d| d.join("cache/manifests").join(format!("{hash:016x}.json")))
 }
 
 #[derive(Default)]
@@ -297,9 +328,86 @@ impl EndOfCentralDirectory {
 
 impl ZipFile {
     pub async fn fetch(url: &str) -> Result<Self, ZipError> {
-        let client = Client::new();
+        // Disk cache first: fetching the central directory from EA's CDN is
+        // the flakiest step of an install on slow routes, and the artifact
+        // is immutable per build — pay for it once.
+        let cache_path = manifest_cache_path(url);
+        if let Some(p) = &cache_path {
+            if let Ok(bytes) = tokio::fs::read(p).await {
+                if let Ok(zip) = serde_json::from_slice::<ZipFile>(&bytes) {
+                    log::info!(
+                        "Using cached build manifest ({} entries) from {}",
+                        zip.entries.len(),
+                        p.display()
+                    );
+                    return Ok(zip);
+                }
+                // Corrupt/stale cache — fall through to a network fetch,
+                // which overwrites it on success.
+            }
+        }
 
-        let response = client.head(url).send().await?;
+        // Bounded connect, then STREAMED bodies with a progress-based stall
+        // guard — same semantics as the file downloader. A total per-request
+        // cap (tried first: 120s) kept expiring on real-world slow-but-alive
+        // CDN routes, while dead connections still need killing fast. Kill
+        // only on "no data for STALL_TIMEOUT", tolerate any transfer speed.
+        const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const ATTEMPTS: u32 = 4;
+
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?;
+
+        fn stall(what: &str) -> ZipError {
+            ZipError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("manifest fetch stalled ({what})"),
+            ))
+        }
+
+        // Retry with backoff — EA's CDN route drops/stalls transiently, and
+        // failing the whole install queue over one flaky request just makes
+        // the user rerun by hand.
+        async fn with_retry<T, F, Fut>(what: &str, f: F) -> Result<T, ZipError>
+        where
+            F: Fn() -> Fut,
+            Fut: std::future::Future<Output = Result<T, ZipError>>,
+        {
+            let mut last_err = None;
+            for attempt in 0..ATTEMPTS {
+                match f().await {
+                    Ok(v) => return Ok(v),
+                    Err(err) => {
+                        log::warn!(
+                            "manifest {} attempt {}/{} failed: {}",
+                            what,
+                            attempt + 1,
+                            ATTEMPTS,
+                            err
+                        );
+                        last_err = Some(err);
+                        if attempt + 1 < ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                2u64 << attempt,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            Err(last_err.expect("at least one attempt"))
+        }
+
+        let response = with_retry("HEAD", || async {
+            Ok(
+                tokio::time::timeout(HEADER_TIMEOUT, client.head(url).send())
+                    .await
+                    .map_err(|_| stall("HEAD: no response"))??,
+            )
+        })
+        .await?;
         let content_length = response
             .headers()
             .get("content-length")
@@ -322,12 +430,28 @@ impl ZipFile {
             let end_offset = start_offset + read;
 
             let range_header = format!("bytes={}-{}", start_offset, end_offset - 1);
-            let response = client
-                .get(url)
-                .header("range", &range_header)
-                .send()
-                .await?;
-            let this_data = response.bytes().await?.to_vec();
+            let this_data = with_retry("range read", || async {
+                let mut response = tokio::time::timeout(
+                    HEADER_TIMEOUT,
+                    client.get(url).header("range", &range_header).send(),
+                )
+                .await
+                .map_err(|_| stall("no response headers"))??;
+
+                // Stream the body; abort only when no bytes arrive for
+                // STALL_TIMEOUT (any transfer speed is acceptable).
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    match tokio::time::timeout(STALL_TIMEOUT, response.chunk()).await {
+                        Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
+                        Ok(Ok(None)) => break,
+                        Ok(Err(err)) => return Err(err.into()),
+                        Err(_) => return Err(stall("no data mid-body")),
+                    }
+                }
+                Ok(buf)
+            })
+            .await?;
             data = [this_data, data].concat();
 
             offset = zip.load(&mut ByteBuffer::from_vec(data.clone()), content_length)?;
@@ -336,6 +460,20 @@ impl ZipFile {
                     attempted: offset,
                     max: content_length,
                 });
+            }
+        }
+
+        // Best-effort cache write — a failure here costs a re-fetch next
+        // time, nothing more.
+        if let Some(p) = &cache_path {
+            if let Ok(bytes) = serde_json::to_vec(&zip) {
+                if let Some(parent) = p.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match tokio::fs::write(p, bytes).await {
+                    Ok(()) => log::info!("Cached build manifest at {}", p.display()),
+                    Err(err) => warn!("Could not cache manifest: {}", err),
+                }
             }
         }
 
@@ -448,5 +586,27 @@ impl ZipFile {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_relative_names() {
+        for name in ["a/b.txt", "bin\\x64\\x.dll", "dir/", "file.txt", "a/..b/c"] {
+            assert!(validate_entry_name(name).is_ok(), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_names() {
+        for name in ["../x", "a/../../x", "a\\..\\x", "/etc/x", "C:\\x", "C:/x", "\\\\server\\x"] {
+            assert!(
+                matches!(validate_entry_name(name), Err(EntryError::PathTraversal(_))),
+                "{name} should be rejected"
+            );
+        }
     }
 }

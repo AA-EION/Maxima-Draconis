@@ -104,6 +104,7 @@ jobs:
           name: maxima-binaries-win64
           path: |
             target/release/maxima-cli.exe
+            target/release/maxima-server.exe
             target/release/maxima-bootstrap.exe
             target/release/maxima-service.exe
             target/release/maxima-tui.exe
@@ -146,7 +147,7 @@ jobs:
             | File | Description |
             |------|-------------|
             | `MaximaHelper.zip` | macOS background agent — unzip and place `MaximaHelper.app` in a stable folder, then run `MaximaHelper/build.sh` to register the `qrc://` scheme |
-            | `MaximaSetup.exe` | Windows installer — run inside your CrossOver bottle to install Maxima and register protocol handlers |
+            | `MaximaSetup.exe` | Windows installer — run inside your CrossOver bottle to install Maxima (`maxima-cli`, `maxima-server`, `maxima-bootstrap`, UI/TUI) and register protocol handlers |
 
             See [README](https://github.com/AA-EION/Maxima-Draconis#setup-on-macos) for setup instructions.
           draft: false

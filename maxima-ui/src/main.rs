@@ -155,6 +155,12 @@ fn main() {
     install_panic_hook();
     init_logger();
 
+    // Bring the Maxima server up if it isn't already (and wasn't started at
+    // logon), so its tray / menu-bar and any other clients are available.
+    // Best-effort; this UI keeps running its own in-process session and its
+    // start_lsx defers to the server's LSX when the port is already bound.
+    maxima::server_client::ensure_running();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -461,6 +467,11 @@ pub struct FrontendSettings {
     ignore_ood_games: bool,
     game_settings: HashMap<String, GameSettings>,
     performance_settings: FrontendPerformanceSettings,
+    /// Custom wine command for unix targets (maps to MAXIMA_WINE_COMMAND).
+    /// Empty = auto: CrossOver's loader on macOS, umu on Linux. `default`
+    /// keeps settings persisted by older builds deserializable.
+    #[serde(default)]
+    wine_command: String,
 }
 
 impl FrontendSettings {
@@ -471,6 +482,7 @@ impl FrontendSettings {
             ignore_ood_games: false,
             game_settings: HashMap::new(),
             performance_settings: FrontendPerformanceSettings::new(),
+            wine_command: String::new(),
         }
     }
 }
@@ -568,6 +580,15 @@ impl MaximaEguiApp {
         } else {
             FrontendSettings::new()
         };
+
+        // Wine engine override from persisted settings (macOS/Linux).
+        // Explicit env from the launching shell still wins.
+        #[cfg(unix)]
+        if !settings.wine_command.is_empty()
+            && std::env::var("MAXIMA_WINE_COMMAND").is_err()
+        {
+            std::env::set_var("MAXIMA_WINE_COMMAND", &settings.wine_command);
+        }
 
         let (img_cache, remote_provider_channel) = UIImageCache::new(cc.egui_ctx.clone());
 

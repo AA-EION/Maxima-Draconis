@@ -1,0 +1,36 @@
+# Linux systemd USER unit: runs `maxima-cli server` for headless / desktop use.
+#
+# Install (per-user, no sudo):
+#   1. Edit ExecStart below to your maxima-cli path if it isn't on PATH.
+#   2. mkdir -p ~/.config/systemd/user
+#      cp installer/autostart/maxima-server.service ~/.config/systemd/user/
+#   3. systemctl --user daemon-reload
+#      systemctl --user enable --now maxima-server.service
+#
+# On a headless server, also enable lingering so it starts without a login:
+#   sudo loginctl enable-linger "$USER"
+#
+# Control:
+#   systemctl --user status  maxima-server      # or: maxima-cli server-status
+#   systemctl --user stop    maxima-server      # or: maxima-cli server-stop
+#   systemctl --user disable maxima-server
+#
+# The server is headless on Linux (no tray dependency pulled in); drive it
+# with the CLI: `maxima-cli launch <slug>` forwards to this server, and
+# `maxima-cli server-status` / `server-stop` control it.
+
+[Unit]
+Description=Maxima server (EA launcher backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=maxima-cli server
+# Clean `maxima-cli server-stop` exits 0 and must NOT trigger a restart;
+# restart only on failure.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

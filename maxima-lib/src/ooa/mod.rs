@@ -49,7 +49,8 @@ pub struct License {
     pub xmlns: String,
     #[serde(skip_serializing, skip_deserializing)]
     pub signature: String,
-    pub cipher_key: String,
+    /// Absent in some older titles' licenses (e.g. Bad Company 2).
+    pub cipher_key: Option<String>,
     pub machine_hash: String,
     pub content_id: String,
     pub user_id: String,

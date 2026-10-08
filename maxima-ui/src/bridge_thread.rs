@@ -261,12 +261,16 @@ impl BridgeThread {
                     info!("Installing service...");
                     backend_responder.send(MaximaLibResponse::ServiceNeedsStarting)?;
                     'wait_for_user_to_authorize: loop {
-                        let request = backend_cmd_listener.try_recv();
-                        if request.is_err() {
-                            continue;
-                        }
+                        let request = match backend_cmd_listener.try_recv() {
+                            Ok(request) => request,
+                            Err(TryRecvError::Empty) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                continue;
+                            }
+                            Err(TryRecvError::Disconnected) => return Ok(()),
+                        };
 
-                        match request.unwrap() {
+                        match request {
                             MaximaLibRequest::StartService => {
                                 register_service_user()?;
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -309,10 +313,14 @@ impl BridgeThread {
         if !logged_in {
             backend_responder.send(MaximaLibResponse::LoginCacheEmpty)?;
             'outer: loop {
-                let request = backend_cmd_listener.try_recv();
-                if request.is_err() {
-                    continue;
-                }
+                let request = match backend_cmd_listener.try_recv() {
+                    Ok(request) => Ok::<_, TryRecvError>(request),
+                    Err(TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                };
 
                 match request? {
                     MaximaLibRequest::LoginRequestOauth => {
@@ -500,6 +508,16 @@ impl BridgeThread {
                 }
                 MaximaLibRequest::InstallGameRequest(offer, path) => {
                     let mut maxima = maxima_arc.lock().await;
+
+                    // macOS: pick/create the per-game CrossOver bottle before
+                    // the install — the touchup steps run through wine and
+                    // resolve the prefix via wine_prefix_dir().
+                    #[cfg(target_os = "macos")]
+                    {
+                        let slug = maxima.mut_library().canonical_slug(&offer).await;
+                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
+                    }
+
                     let builds =
                         maxima.content_manager().service().available_builds(&offer).await?;
                     let build = if let Some(build) = builds.live_build() {
@@ -563,6 +581,12 @@ impl BridgeThread {
                             "AutoInstallSlug: resolved '{}' -> {}",
                             slug, offer_id
                         );
+
+                        // macOS: per-game bottle before install (touchup
+                        // runs through wine). The input slug is already the
+                        // base slug game_by_base_slug matched on.
+                        #[cfg(target_os = "macos")]
+                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
 
                         // 2. Pick the live build (network call —
                         //    `available_builds` hits EA's CDN).

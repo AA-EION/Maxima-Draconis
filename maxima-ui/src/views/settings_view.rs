@@ -46,4 +46,46 @@ pub fn settings_view(app: &mut MaximaEguiApp, ui: &mut Ui) {
         &mut app.settings.performance_settings.disable_blur,
         &localization.performance.disable_blur,
     );
+
+    // Wine engine (unix targets only): which wine runs the games. Empty =
+    // auto-detect (CrossOver's loader on macOS, umu on Linux). Applied live
+    // via MAXIMA_WINE_COMMAND — the same knob the CLI honors.
+    #[cfg(unix)]
+    {
+        ui.heading("");
+        ui.heading("Wine engine");
+        ui.separator();
+        ui.label("Custom wine command — leave empty for auto-detection");
+        let response = ui.add_sized(
+            vec2(ui.available_width(), 30.0),
+            egui::TextEdit::singleline(&mut app.settings.wine_command)
+                .hint_text("auto")
+                .vertical_align(egui::Align::Center),
+        );
+        if response.changed() {
+            if app.settings.wine_command.is_empty() {
+                std::env::remove_var("MAXIMA_WINE_COMMAND");
+            } else {
+                std::env::set_var("MAXIMA_WINE_COMMAND", &app.settings.wine_command);
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let auto = std::path::Path::new(maxima::unix::wine::CROSSOVER_WINE).exists();
+            ui.label(format!(
+                "Auto-detected engine: {}",
+                if auto {
+                    "CrossOver"
+                } else {
+                    "none — install CrossOver or set a custom command above"
+                }
+            ));
+            if let Ok(dir) = maxima::unix::crossover::bottles_dir() {
+                ui.label(format!("CrossOver bottles folder: {}", dir.display()));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        ui.label("Auto-detected engine: umu (managed by Maxima)");
+    }
 }
