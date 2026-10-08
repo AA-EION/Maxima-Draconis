@@ -172,8 +172,9 @@ impl PreDiPManifest {
 
     #[cfg(windows)]
     pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
-        use crate::util::{native::NativeError, registry::cleanup_interrupted_burn_installs};
-        use tokio::process::Command;
+        use crate::util::{
+            elevation, native::NativeError, registry::cleanup_interrupted_burn_installs,
+        };
 
         if self.executable.file_path.trim().is_empty() {
             return Ok(());
@@ -186,14 +187,9 @@ impl PreDiPManifest {
         let args = collect_touchup_args(&self.executable.parameters, install_path)?;
         let path = install_path.join(remove_leading_slash(&self.executable.file_path));
 
-        let mut binding = Command::new(path);
-        let child = binding.args(args);
-
-        let status = child.spawn()?.wait().await?;
-        if !status.success() {
-            return Err(ManifestError::Native(NativeError::Command(
-                status.code().unwrap_or(0),
-            )));
+        let code = elevation::run_and_wait(&path, &args).await?;
+        if code != 0 {
+            return Err(ManifestError::Native(NativeError::Command(code)));
         }
 
         Ok(())

@@ -1,3 +1,4 @@
+pub mod elevation;
 pub mod github;
 pub mod hash;
 pub mod log;

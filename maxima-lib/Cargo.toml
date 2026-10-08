@@ -91,6 +91,11 @@ winapi = { version = "0.3.9", features = [
     "iphlpapi",
     "tcpmib",
     "winsvc",
+    "shellapi",
+    "processthreadsapi",
+    "errhandlingapi",
+    "winbase",
+    "winuser",
     "impl-default"
 ] }
 winreg = "0.51.0"
