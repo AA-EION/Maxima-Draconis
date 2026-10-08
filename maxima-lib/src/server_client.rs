@@ -60,17 +60,17 @@ pub fn is_running(port: u16) -> bool {
 }
 
 /// The stable, registerable install dir for Maxima's native binaries on macOS:
-/// `~/Library/Application Support/Maxima/bin`. Every caller that needs to find
-/// or spawn `maxima-server` — launchd, game-spawned bootstrap, and every
-/// frontend — agrees on this path. It's stable across app moves/updates and
-/// app-translocation (a quarantined `.app` runs from a randomized read-only
-/// path, so a path *inside the bundle* would be unstable). See
-/// docs/MACOS_BUNDLING.md. `None` on non-macOS.
+/// `<data dir>/bin`, i.e.
+/// `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin`. Every
+/// caller that needs to find or spawn `maxima-server` — launchd, game-spawned
+/// bootstrap, and every frontend — agrees on this path. It's stable across app
+/// moves/updates and app-translocation (a quarantined `.app` runs from a
+/// randomized read-only path, so a path *inside the bundle* would be
+/// unstable). See docs/MACOS_BUNDLING.md. `None` on non-macOS.
 pub fn app_support_bin_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/Maxima/bin"))
+        crate::util::native::maxima_data_path().ok().map(|d| d.join("bin"))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -264,24 +264,10 @@ struct Config {
     boot_policy: Option<BootPolicy>,
 }
 
-/// The Maxima config directory (holds `config.json`). Same location Swift/egui
-/// read for the boot policy.
+/// The Maxima config directory (holds `config.json`): the shared data dir on
+/// every OS. Same location Swift/egui read for the boot policy.
 pub fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Maxima"))
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Maxima"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|c| c.join("maxima"))
-    }
+    crate::util::native::maxima_data_path().ok()
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -348,7 +334,7 @@ pub fn install(policy: BootPolicy) -> BoxResult<()> {
 /// Remove **everything** — the autostart registration, the protocol handler
 /// registration, the installed binaries, and the config — so no trace is left
 /// that could interfere with the official EA launcher. With `purge`, also
-/// removes cached auth tokens and logs (`maxima_dir`). Game bottles are left
+/// removes cached auth tokens, caches and logs (the data, cache and log dirs). Game bottles are left
 /// alone (they're large and separate); remove them from CrossOver manually.
 pub fn uninstall(purge: bool) -> BoxResult<()> {
     // Stop a running server first (best-effort).
@@ -360,11 +346,17 @@ pub fn uninstall(purge: bool) -> BoxResult<()> {
         let _ = std::fs::remove_file(path);
     }
     if purge {
-        if let Ok(dir) = crate::util::native::maxima_dir() {
+        if let Ok(dir) = crate::util::native::maxima_data_path() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Ok(dir) = crate::util::native::maxima_cache_path() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Ok(dir) = crate::util::native::maxima_logs_path() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
-    log::info!("Maxima server uninstalled{}", if purge { " (purged tokens + logs)" } else { "" });
+    log::info!("Maxima server uninstalled{}", if purge { " (purged tokens, caches + logs)" } else { "" });
     Ok(())
 }
 

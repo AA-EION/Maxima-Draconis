@@ -24,7 +24,7 @@ use xz2::read::XzDecoder;
 
 use crate::util::{
     github::{fetch_github_release, fetch_github_releases, github_download_asset, GithubRelease},
-    native::{maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
+    native::{maxima_cache_dir, maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
     registry::RegistryError,
 };
 
@@ -588,7 +588,7 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
         None => return Err(NativeError::Wine(WineError::Fetch)),
     };
 
-    let dir = maxima_dir()?.join("downloads");
+    let dir = maxima_cache_dir()?.join("downloads");
     create_dir_all(&dir)?;
 
     let path = dir.join(&asset.name);
@@ -721,7 +721,7 @@ pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
         }
     }
 
-    let reg_path = maxima_dir()?.join("temp").join("burn_cleanup.reg");
+    let reg_path = maxima_cache_dir()?.join("burn_cleanup.reg");
     tokio::fs::create_dir_all(reg_path.safe_parent()?).await?;
     tokio::fs::write(&reg_path, reg.as_bytes()).await?;
 
@@ -835,7 +835,7 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         );
     }
 
-    let path = maxima_dir()?.join("temp").join("wine.reg");
+    let path = maxima_cache_dir()?.join("wine.reg");
     tokio::fs::create_dir_all(path.safe_parent()?).await?;
 
     {

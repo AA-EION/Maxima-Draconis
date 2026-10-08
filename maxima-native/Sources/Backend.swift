@@ -45,7 +45,7 @@ actor Backend {
     /// "Start Server" action).
     nonisolated static func bootPolicy() -> String {
         let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Maxima/config.json")
+            .appendingPathComponent("Library/Application Support/com.ArmchairDevelopers.Maxima/config.json")
         guard let data = try? Data(contentsOf: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let p = obj["boot_policy"] as? String

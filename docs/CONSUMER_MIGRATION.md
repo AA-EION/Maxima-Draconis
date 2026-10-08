@@ -60,7 +60,7 @@ runtime model in ways a good consumer accounts for:
 The in-bottle mode (MaximaSetup.exe inside the CrossOver bottle + MaximaHelper.app
 on the host) still ships and still works — **you do not have to migrate**. To use
 the native host-side server, install these on the host at a **stable path**
-(recommended `~/Library/Application Support/Maxima/bin/`, see
+(recommended `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`, see
 [MACOS_BUNDLING.md](MACOS_BUNDLING.md) for the rationale — app-translocation makes
 `.app`-internal paths unstable):
 
@@ -105,7 +105,7 @@ public API. Consumers target the stable `maxima-cli --json` surface.
 - [ ] No parser changes — the `--json` shapes are identical. Verify against the
       existing `list-games` / `install` / `launch` / `bottle-info` handling.
 - [ ] (Native mode) Fetch + install `maxima-server`, `maxima-cli`,
-      `maxima-bootstrap`, `MaximaBootstrap.app` into `~/Library/Application Support/Maxima/bin/`.
+      `maxima-bootstrap`, `MaximaBootstrap.app` into `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`.
 - [ ] (Native mode) Optionally install + `launchctl load` the launchd agent for
       autostart + persistent status icon.
 - [ ] Keep MaximaHelper.app for `qrc://` (unchanged; coexists with MaximaBootstrap.app).

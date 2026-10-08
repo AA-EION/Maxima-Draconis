@@ -238,27 +238,80 @@ pub fn module_path() -> Result<PathBuf, NativeError> {
     Ok(env::current_exe()?)
 }
 
-#[cfg(not(unix))]
-pub fn maxima_dir() -> Result<PathBuf, NativeError> {
-    use directories::ProjectDirs;
+/// Reverse-DNS pieces handed to `ProjectDirs`. Every frontend (CLI, server, TUI,
+/// egui UI) resolves its on-disk locations from these, so they all share one
+/// data dir and one cache dir on every OS.
+pub const APP_QUALIFIER: &str = "com";
+pub const APP_ORGANIZATION: &str = "ArmchairDevelopers";
+pub const APP_NAME: &str = "Maxima";
+/// `com.ArmchairDevelopers.Maxima` — also used as the egui window app id and
+/// `.desktop` file stem so desktop environments match the window to its entry.
+pub const APP_ID: &str = "com.ArmchairDevelopers.Maxima";
 
-    let dirs = ProjectDirs::from("com", "ArmchairDevelopers", "Maxima");
-    let path = dirs.unwrap().data_dir().to_path_buf();
+fn project_dirs() -> Result<directories::ProjectDirs, NativeError> {
+    directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME).ok_or_else(|| {
+        NativeError::MissingEnvironmentVariable(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" }.to_string(),
+        )
+    })
+}
+
+/// Persistent data directory, without creating it: auth tokens, `config.json`,
+/// wine/umu runtimes, the download queue, installed helper binaries.
+///
+/// | OS      | Path                                                              |
+/// |---------|-------------------------------------------------------------------|
+/// | Linux   | `$XDG_DATA_HOME/maxima` (`~/.local/share/maxima`)                 |
+/// | macOS   | `~/Library/Application Support/com.ArmchairDevelopers.Maxima`     |
+/// | Windows | `%APPDATA%\ArmchairDevelopers\Maxima\data`                       |
+pub fn maxima_data_path() -> Result<PathBuf, NativeError> {
+    Ok(project_dirs()?.data_dir().to_path_buf())
+}
+
+/// Disposable cache directory, without creating it: manifest cache, avatar and
+/// UI image caches, in-flight download resume state, downloaded archives and
+/// temp files. Safe for the OS (or the user) to delete at any time.
+///
+/// | OS      | Path                                                              |
+/// |---------|-------------------------------------------------------------------|
+/// | Linux   | `$XDG_CACHE_HOME/maxima` (`~/.cache/maxima`)                      |
+/// | macOS   | `~/Library/Caches/com.ArmchairDevelopers.Maxima`                  |
+/// | Windows | `%LOCALAPPDATA%\ArmchairDevelopers\Maxima\cache`                 |
+pub fn maxima_cache_path() -> Result<PathBuf, NativeError> {
+    Ok(project_dirs()?.cache_dir().to_path_buf())
+}
+
+/// Log directory, without creating it. Windows keeps the long-documented
+/// `%LOCALAPPDATA%\Maxima\Logs` (consumers inspect it inside CrossOver
+/// bottles); elsewhere logs live under the data dir.
+pub fn maxima_logs_path() -> Result<PathBuf, NativeError> {
+    #[cfg(windows)]
+    {
+        env::var_os("LOCALAPPDATA")
+            .or_else(|| env::var_os("APPDATA"))
+            .map(|p| PathBuf::from(p).join("Maxima").join("Logs"))
+            .ok_or_else(|| NativeError::MissingEnvironmentVariable("LOCALAPPDATA".to_string()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(maxima_data_path()?.join("logs"))
+    }
+}
+
+pub fn maxima_dir() -> Result<PathBuf, NativeError> {
+    let path = maxima_data_path()?;
     create_dir_all(&path)?;
     Ok(path)
 }
 
-#[cfg(unix)]
-pub fn maxima_dir() -> Result<PathBuf, NativeError> {
-    let home = if let Ok(home) = env::var("XDG_DATA_HOME") {
-        home
-    } else if let Ok(home) = env::var("HOME") {
-        format!("{}/.local/share", home)
-    } else {
-        return Err(NativeError::MissingEnvironmentVariable("HOME".to_string()));
-    };
+pub fn maxima_cache_dir() -> Result<PathBuf, NativeError> {
+    let path = maxima_cache_path()?;
+    create_dir_all(&path)?;
+    Ok(path)
+}
 
-    let path = PathBuf::from(format!("{}/maxima", home));
+pub fn maxima_logs_dir() -> Result<PathBuf, NativeError> {
+    let path = maxima_logs_path()?;
     create_dir_all(&path)?;
     Ok(path)
 }
@@ -271,4 +324,92 @@ pub fn platform_path<P: AsRef<Path>>(path: P) -> PathBuf {
 #[cfg(windows)]
 pub fn platform_path<P: AsRef<Path>>(path: P) -> PathBuf {
     PathBuf::from(path.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_path(var: &str) -> Option<PathBuf> {
+        env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+    }
+
+    fn home() -> Option<PathBuf> {
+        env_path("HOME")
+    }
+
+    #[test]
+    fn data_path_matches_platform_convention() {
+        #[cfg(target_os = "linux")]
+        {
+            let base = env_path("XDG_DATA_HOME")
+                .filter(|p| p.is_absolute())
+                .or_else(|| home().map(|h| h.join(".local/share")));
+            if let Some(base) = base {
+                assert_eq!(maxima_data_path().unwrap(), base.join("maxima"));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(h) = home() {
+            assert_eq!(
+                maxima_data_path().unwrap(),
+                h.join("Library/Application Support/com.ArmchairDevelopers.Maxima")
+            );
+        }
+        #[cfg(windows)]
+        if let Some(a) = env_path("APPDATA") {
+            assert_eq!(
+                maxima_data_path().unwrap(),
+                a.join("ArmchairDevelopers").join("Maxima").join("data")
+            );
+        }
+    }
+
+    #[test]
+    fn cache_path_matches_platform_convention() {
+        #[cfg(target_os = "linux")]
+        {
+            let base = env_path("XDG_CACHE_HOME")
+                .filter(|p| p.is_absolute())
+                .or_else(|| home().map(|h| h.join(".cache")));
+            if let Some(base) = base {
+                assert_eq!(maxima_cache_path().unwrap(), base.join("maxima"));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(h) = home() {
+            assert_eq!(
+                maxima_cache_path().unwrap(),
+                h.join("Library/Caches/com.ArmchairDevelopers.Maxima")
+            );
+        }
+        #[cfg(windows)]
+        if let Some(a) = env_path("LOCALAPPDATA") {
+            assert_eq!(
+                maxima_cache_path().unwrap(),
+                a.join("ArmchairDevelopers").join("Maxima").join("cache")
+            );
+        }
+    }
+
+    #[test]
+    fn data_and_cache_are_distinct_and_logs_are_not_in_cache() {
+        let (Ok(data), Ok(cache), Ok(logs)) =
+            (maxima_data_path(), maxima_cache_path(), maxima_logs_path())
+        else {
+            return;
+        };
+        assert_ne!(data, cache);
+        assert!(!logs.starts_with(&cache));
+        #[cfg(not(windows))]
+        assert_eq!(logs, data.join("logs"));
+    }
+
+    #[test]
+    fn app_id_is_the_reverse_dns_of_the_project_dirs_triple() {
+        assert_eq!(
+            APP_ID,
+            format!("{APP_QUALIFIER}.{APP_ORGANIZATION}.{APP_NAME}")
+        );
+    }
 }

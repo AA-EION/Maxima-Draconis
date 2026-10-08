@@ -50,12 +50,30 @@ signing requirement on user agents, so it works ad-hoc. The agent's
 `ProgramArguments` points at the binary in the stable App Support path (below) —
 not inside the `.app`, which is unstable under app-translocation.
 
-## 1. Install location — `~/Library/Application Support/Maxima/bin/`
+## 0d. On-disk layout (data vs cache vs logs)
+
+Every Maxima component resolves its directories from one
+`ProjectDirs::from("com", "ArmchairDevelopers", "Maxima")` (see
+`maxima_lib::util::native`), so the CLI, server, TUI and egui UI share them.
+There is deliberately **no migration** from older locations (re-login once).
+
+| What | Linux | macOS | Windows |
+|---|---|---|---|
+| Data (tokens, `config.json`, wine/umu, download queue, `bin/`) | `~/.local/share/maxima` | `~/Library/Application Support/com.ArmchairDevelopers.Maxima` | `%APPDATA%\ArmchairDevelopers\Maxima\data` |
+| Cache (manifests, avatars, UI images, `.eazstate`, downloads, temp `.reg`) | `~/.cache/maxima` | `~/Library/Caches/com.ArmchairDevelopers.Maxima` | `%LOCALAPPDATA%\ArmchairDevelopers\Maxima\cache` |
+| Logs | `<data>/logs` | `<data>/logs` | `%LOCALAPPDATA%\Maxima\Logs` (unchanged; consumers read it inside bottles) |
+
+Before this layout, Linux/macOS data lived in `$XDG_DATA_HOME/maxima` (macOS
+used `~/.local/share/maxima`), the macOS config/binaries in
+`~/Library/Application Support/Maxima`, and the cache under `<data>/cache`,
+`<data>/temp`, `<data>/downloads`.
+
+## 1. Install location — `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`
 
 The canonical, registerable copy of the native binaries lives at:
 
 ```
-~/Library/Application Support/Maxima/bin/
+~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/
     maxima-server
     maxima-cli
     maxima-bootstrap
@@ -84,7 +102,7 @@ The canonical, registerable copy of the native binaries lives at:
 
 1. Sibling of the current executable (installer / cargo `target/release` layout).
 2. Bundled `Contents/Resources` (when running from inside `Maxima.app`).
-3. **`~/Library/Application Support/Maxima/bin/`** (the stable registered copy).
+3. **`~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`** (the stable registered copy).
 4. `PATH`.
 
 `maxima-server` self-installs its sibling binaries into (3) on startup (best
