@@ -235,6 +235,37 @@ jobs:
         codesign --verify --deep maxima-native/build/Maxima.app
         echo "✓ native macOS build looks healthy"
 
+  # ── maxima-ui animated backgrounds (opt-in `bg-videos` feature) ────────────
+  # The default build needs no FFmpeg. This job only compiles the feature on
+  # macOS so the FFmpeg-backed player (maxima-ui/src/renderers/media_player.rs)
+  # can't rot unnoticed. ffmpeg-next tracks the FFmpeg major.minor, so the
+  # version pinned in maxima-ui/Cargo.toml (~7.1) is paired with ffmpeg@7,
+  # which Homebrew keeps keg-only (hence the PKG_CONFIG_PATH).
+  ui-bg-videos:
+    name: ui-bg-videos (macOS)
+    runs-on: macos-26
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install FFmpeg, pkgconf and protoc
+      run: brew install ffmpeg@7 pkgconf protobuf
+
+    - name: Install Rust nightly
+      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: macOS-ui-bg-videos-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Check maxima-ui with bg-videos
+      run: |
+        export PKG_CONFIG_PATH="$(brew --prefix ffmpeg@7)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        cargo check -p maxima-ui --features bg-videos
+
   # ── MaximaSetup.exe under Wine on macOS ──────────────────────────────────
   # The in-bottle mode Draconis uses: install MaximaSetup.exe into a fresh
   # Wine prefix on a macOS runner, then check the installed layout and that

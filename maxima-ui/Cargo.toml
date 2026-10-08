@@ -27,6 +27,18 @@ sys-locale = "0.3.1"
 humansize = { version = "2.0.0", features = ["no_alloc"] }
 fuzzy-matcher = "*"
 thiserror = "2.0.12"
+# Only the pieces the background-video player needs (libavcodec, libavformat,
+# libavutil, libswscale) -- no avdevice/avfilter/swresample. Optional: see the
+# `bg-videos` feature.
+ffmpeg-next = { version = "~7.1", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+
+[features]
+default = []
+# Animated game background videos, decoded with FFmpeg. Off by default so the
+# default build (and the Windows installer CI) needs no FFmpeg libraries.
+# Building with it requires FFmpeg 7.1 development libraries (pkg-config),
+# libclang (bindgen) and, on macOS, `brew install ffmpeg@7 pkgconf`.
+bg-videos = ["dep:ffmpeg-next"]
 
 [target.'cfg(windows)'.dependencies]
 is_elevated = "0.1.2"

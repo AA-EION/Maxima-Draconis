@@ -83,6 +83,8 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                     GameInfoResponse(res) => {
                         app.games.insert(res.game.slug.clone(), res.game);
                     }
+                    #[cfg(feature = "bg-videos")]
+                    GameBgVideoResponse(slug, url) => app.bg_video.set_url(slug, url),
                     GameDetailsResponse(res) => {
                         let response = res.response;
 

@@ -19,6 +19,9 @@ pub fn settings_view(app: &mut MaximaEguiApp, ui: &mut Ui) {
         );
     });
 
+    #[cfg(feature = "bg-videos")]
+    ui.checkbox(&mut app.settings.videos, &localization.interface.videos);
+
     ui.heading("");
     ui.heading(&localization.game_installation.header);
     ui.separator();

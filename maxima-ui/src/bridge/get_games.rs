@@ -282,3 +282,50 @@ pub async fn get_games_request(
     }
     Ok(())
 }
+
+/// Look up a game's animated background video URL. Never fails the bridge: any
+/// problem is logged and reported as "no video" so the UI keeps its static background.
+#[cfg(feature = "bg-videos")]
+pub async fn get_game_bg_video_request(
+    maxima_arc: LockedMaxima,
+    slug: String,
+    channel: Sender<MaximaLibResponse>,
+    ctx: &Context,
+) -> Result<(), BackendError> {
+    let (service_layer, locale) = {
+        let maxima = maxima_arc.lock().await;
+        (maxima.service_layer().clone(), maxima.locale().short_str().to_owned())
+    };
+
+    let request = ServiceHeroBackgroundImageRequestBuilder::default()
+        .game_slug(slug.clone())
+        .locale(locale)
+        .build();
+    let hubs: Option<ServiceGameHubCollection> = match request {
+        Ok(request) => {
+            match service_layer.request(SERVICE_REQUEST_GETHEROBACKGROUNDIMAGE, request).await {
+                Ok(hubs) => hubs,
+                Err(err) => {
+                    debug!("background video lookup for {} failed: {}", &slug, err);
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            debug!("could not build background video request for {}: {}", &slug, err);
+            None
+        }
+    };
+
+    let url = hubs
+        .as_ref()
+        .and_then(|hubs| hubs.items().get(0))
+        .and_then(|hub| hub.background_video().as_ref())
+        .and_then(|video| video.url().clone())
+        // only network video: the URL comes from a remote service
+        .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
+
+    let _ = channel.send(MaximaLibResponse::GameBgVideoResponse(slug, url));
+    egui::Context::request_repaint(ctx);
+    Ok(())
+}

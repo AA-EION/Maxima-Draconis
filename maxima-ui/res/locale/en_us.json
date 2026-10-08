@@ -90,7 +90,8 @@
     "settings_view": {
         "interface" : {
             "header": "Interface",
-            "language": "Language"
+            "language": "Language",
+            "videos": "Background videos"
         },
         "game_installation" : {
             "header": "Game Installation",
