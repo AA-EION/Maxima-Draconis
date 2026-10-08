@@ -113,13 +113,13 @@ pub(crate) fn write_zlib_state(buf: &mut BytesMut, stream: &mut mz_stream) {
 
     if !state_ref.window.is_null() {
         let window_size = 1 << state_ref.wbits;
-        let mut window_buffer = vec![0; window_size];
+        let mut window_buffer = vec![0 as c_char; window_size];
         unsafe {
             ptr::copy_nonoverlapping(state_ref.window, window_buffer.as_mut_ptr(), window_size);
         }
 
         for byte in window_buffer {
-            buf.put_i8(byte);
+            buf.put_u8(byte as u8);
         }
     }
 
@@ -181,7 +181,7 @@ pub(crate) fn restore_zlib_state(buf: &mut Bytes, stream: &mut mz_stream) {
 
         let streamp = stream as z_streamp;
         state_ref.window =
-            unsafe { (stream.zalloc)(streamp as *mut c_void, 1, window_size) } as *mut i8;
+            unsafe { (stream.zalloc)(streamp as *mut c_void, 1, window_size) } as *mut c_char;
 
         for i in 0..window_size {
             let byte = buf.get_u8();
