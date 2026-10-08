@@ -31,6 +31,9 @@ pub const RTM_TCP_HOST: &str = "rtm.tnt-ea.com:9000";
 // and connects to the WS host from the javascript frontend
 pub const RTM_WS_HOST: &str = "wss://rtm.tnt-ea.com:8095/websocket";
 
+/// Upper bound for a single incoming frame; real RTM frames are a few KiB.
+const MAX_FRAME_SIZE: i32 = 16 * 1024 * 1024;
+
 pub struct RtmRequest {
     id: String,
     payload: communication_v1::Body,
@@ -128,34 +131,47 @@ impl RtmConnectionManager {
                         },
                         Ok(_) => {
                             loop {
-                                if bytes.len() < 4 {
-                                    break;
-                                }
-
                                 if expected_size == -1 {
+                                    if bytes.len() < 4 {
+                                        break;
+                                    }
+
                                     expected_size = bytes.get_i32();
-                                }
 
-                                if bytes.len() < expected_size as usize {
-                                    break;
-                                }
-
-                                let buf = bytes.clone().freeze().slice(0..expected_size as usize);
-                                let msg = Communication::decode(buf)?;
-                                let id = &msg.v1.as_ref().ok_or(RtmError::NoBody)?.request_id;
-
-                                if let Some(tx) =
-                                    pending_responses.remove(id)
-                                {
-                                    tx.send(msg).unwrap();
-                                } else if id.is_empty() {
-                                    if let Some(body) = &msg.v1.as_ref().ok_or(RtmError::NoBody)?.body {
-                                        update_presence_tx.send(body.clone()).await?;
+                                    // A bogus length prefix would otherwise make us
+                                    // buffer unbounded data (or wrap to a huge usize).
+                                    if !(0..=MAX_FRAME_SIZE).contains(&expected_size) {
+                                        error!("RTM frame size {} is out of range, closing connection", expected_size);
+                                        return Err(Box::new(RtmError::Io(io::Error::new(
+                                            ErrorKind::InvalidData,
+                                            "RTM frame size out of range",
+                                        ))));
                                     }
                                 }
 
-                                bytes.advance(expected_size as usize);
+                                let frame_len = expected_size as usize;
+                                if bytes.len() < frame_len {
+                                    break;
+                                }
+
+                                let buf = bytes.split_to(frame_len).freeze();
                                 expected_size = -1;
+
+                                let msg = Communication::decode(buf)?;
+                                let Some(v1) = msg.v1.as_ref() else {
+                                    warn!("Ignoring RTM message without a body");
+                                    continue;
+                                };
+                                let id = v1.request_id.clone();
+
+                                if let Some(tx) = pending_responses.remove(&id) {
+                                    // The requester may have given up waiting; that's fine.
+                                    let _ = tx.send(msg);
+                                } else if id.is_empty() {
+                                    if let Some(body) = &v1.body {
+                                        update_presence_tx.send(body.clone()).await?;
+                                    }
+                                }
                             }
                         },
                         Err(e) => {
