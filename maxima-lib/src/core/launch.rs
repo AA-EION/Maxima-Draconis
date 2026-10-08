@@ -485,7 +485,7 @@ pub async fn start_game(
         )
         .env("EALaunchEnv", "production")
         .env("EALaunchOfflineMode", "false")
-        .env("EALsxPort", maxima.lsx_port.to_string())
+        .env("EALsxPort", maxima.effective_lsx_port().to_string())
         .env(
             "EARtPLaunchCode",
             simple_crypto::rtp_handshake().to_string(),

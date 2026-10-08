@@ -42,7 +42,10 @@ use derive_getters::Getters;
 use log::{error, info, warn};
 use strum_macros::IntoStaticStr;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU16, Ordering},
+    Arc,
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -93,8 +96,11 @@ pub struct Maxima {
     playing: Option<ActiveGameContext>,
 
     lsx_port: u16,
+    #[getter(skip)]
+    lsx_bound_port: Arc<AtomicU16>,
     lsx_event_callback: Option<MaximaLSXEventCallback>,
-    lsx_connections: u16,
+    #[getter(skip)]
+    lsx_connections: Arc<AtomicU16>,
 
     cloud_sync: CloudSyncClient,
 
@@ -209,8 +215,9 @@ impl Maxima {
             library: GameLibrary::new(auth_storage.clone()).await,
             playing: None,
             lsx_port,
+            lsx_bound_port: Arc::new(AtomicU16::new(0)),
             lsx_event_callback: None,
-            lsx_connections: 0,
+            lsx_connections: Arc::new(AtomicU16::new(0)),
             cloud_sync: CloudSyncClient::new(auth_storage.clone()),
             content_manager: ContentManager::new(auth_storage.clone(), false).await?,
             rtm: RtmClient::new(auth_storage),
@@ -290,13 +297,26 @@ impl Maxima {
             }
         }
 
+        // Bind before spawning so the listener is accepting by the time this
+        // returns and the port we actually got is recorded for
+        // `effective_lsx_port` (relevant once `MAXIMA_LSX_PORT=0` is used to
+        // get an OS-assigned port). A failed bind stays non-fatal, as it
+        // always was: the game's traffic then lands on whoever owns the port.
+        let listener = match lsx::service::bind(lsx_port).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!("Error starting LSX server: {}", e);
+                return Ok(());
+            }
+        };
+        self.lsx_bound_port.store(listener.port(), Ordering::Release);
+
         tokio::spawn(async move {
-            if let Err(e) = lsx::service::start_server(lsx_port, maxima).await {
+            if let Err(e) = listener.serve(maxima).await {
                 error!("Error starting LSX server: {}", e);
             }
         });
 
-        tokio::task::yield_now().await;
         Ok(())
     }
 
@@ -508,8 +528,30 @@ impl Maxima {
         self.lsx_port = port;
     }
 
-    pub(super) fn set_lsx_connections(&mut self, connections: u16) {
-        self.lsx_connections = connections;
+    /// The port our own LSX listener is bound to, if `start_lsx` bound one.
+    /// `None` when it was never started or deferred to an LSX server that was
+    /// already listening.
+    pub fn lsx_bound_port(&self) -> Option<u16> {
+        match self.lsx_bound_port.load(Ordering::Acquire) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    /// The port games should be told to connect to (`EALsxPort`): the port
+    /// our listener actually bound, else the configured one.
+    pub fn effective_lsx_port(&self) -> u16 {
+        self.lsx_bound_port().unwrap_or(self.lsx_port)
+    }
+
+    /// Shared counter of live LSX connections; the LSX server owns the
+    /// increments and decrements.
+    pub(crate) fn lsx_connection_counter(&self) -> Arc<AtomicU16> {
+        self.lsx_connections.clone()
+    }
+
+    pub fn lsx_connection_count(&self) -> u16 {
+        self.lsx_connections.load(Ordering::Acquire)
     }
 
     pub fn set_player_started(&mut self) {
@@ -535,7 +577,7 @@ impl Maxima {
     }
 
     async fn update_playing_status(&mut self) {
-        if self.lsx_connections > 0 || self.playing.is_none() {
+        if self.lsx_connection_count() > 0 || self.playing.is_none() {
             return;
         }
 
