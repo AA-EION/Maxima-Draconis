@@ -255,9 +255,9 @@ pub struct ZipFile {
 fn manifest_cache_path(url: &str) -> Option<std::path::PathBuf> {
     let path_part = url.split('?').next().unwrap_or(url);
     let hash = crate::util::hash::hash_fnv1a(path_part.as_bytes());
-    crate::util::native::maxima_dir()
+    crate::util::native::maxima_cache_dir()
         .ok()
-        .map(|d| d.join("cache/manifests").join(format!("{hash:016x}.json")))
+        .map(|d| d.join("manifests").join(format!("{hash:016x}.json")))
 }
 
 #[derive(Default)]

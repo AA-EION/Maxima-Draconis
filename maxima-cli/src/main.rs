@@ -424,29 +424,14 @@ fn ensure_console_attached() {}
 /// disappear silently — exactly the failure mode that made the v0.2.1
 /// "nothing shows" bug so hard to diagnose.
 ///
-/// File location matches the rest of the file logging:
+/// File location matches the rest of the file logging
+/// (see `maxima::util::native::maxima_logs_path`):
 ///   - Windows: %LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log
-///   - Unix:    $XDG_DATA_HOME/maxima/logs/maxima-cli.panic.log (or ~/.local/share/...)
+///   - Unix:    <data dir>/logs/maxima-cli.panic.log
 fn install_panic_hook() {
-    let log_path: Option<std::path::PathBuf> = {
-        #[cfg(windows)]
-        {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("APPDATA"))
-                .map(std::path::PathBuf::from)
-                .map(|p| p.join("Maxima").join("Logs").join("maxima-cli.panic.log"))
-        }
-        #[cfg(unix)]
-        {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
-                })
-                .map(|p| p.join("maxima").join("logs").join("maxima-cli.panic.log"))
-        }
-    };
+    let log_path: Option<std::path::PathBuf> = maxima::util::native::maxima_logs_path()
+        .ok()
+        .map(|d| d.join("maxima-cli.panic.log"));
 
     std::panic::set_hook(Box::new(move |info| {
         // Best-effort: never let the panic hook itself panic.
@@ -818,7 +803,7 @@ fn run_service(action: &ServiceAction) -> Result<()> {
             println!(
                 "Maxima service uninstalled{}. No autostart, protocol claims, or \
                  binaries left behind.",
-                if *purge { " and purged (tokens + logs removed)" } else { "" }
+                if *purge { " and purged (tokens, caches + logs removed)" } else { "" }
             );
         }
         ServiceAction::Status { json } => {
