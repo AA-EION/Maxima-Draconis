@@ -376,6 +376,17 @@ impl<'a> EntryDownloadRequest<'a> {
             }
         };
 
+        // A CDN error (403/404/416, ...) carries an XML/HTML body. Never stream
+        // that into the game file and report success.
+        if !data.status().is_success() {
+            error!(
+                "Failed to download ({}): HTTP {}",
+                self.entry.name(),
+                data.status()
+            );
+            return Err(DownloaderError::Http(data.status()));
+        }
+
         let stream = data.bytes_stream();
         let counting_stream = ByteCountingStream::new(stream, self.callback.as_ref());
         let stream = counting_stream.into_async_read();

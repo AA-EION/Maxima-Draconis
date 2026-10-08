@@ -45,6 +45,8 @@ pub enum EntryError {
     Decode,
     #[error("invalid signature `{0:#10x}` (expected `{sig:#10x}`)", sig = ZIP_FILE_HEADER_SIGNATURE)]
     Signature(u32),
+    #[error("unsafe entry name `{0}` (absolute path, drive prefix or `..` component)")]
+    PathTraversal(String),
 }
 
 #[derive(Error, Debug)]
@@ -93,6 +95,23 @@ fn signature_scan_rev(data: &[u8], signature: u32) -> Option<usize> {
     }
 
     None
+}
+
+/// Entry names are joined onto the install directory, so they must stay inside it.
+/// Both separators are normalized on every host: a name that is harmless on Unix
+/// (`..\x`) is still a traversal when the same manifest is installed under Wine.
+fn validate_entry_name(name: &str) -> Result<(), EntryError> {
+    let normalized = name.replace('\\', "/");
+    let unsafe_name = normalized.starts_with('/')
+        || normalized
+            .split('/')
+            .any(|component| component == ".." || component.contains(':'));
+
+    if unsafe_name {
+        return Err(EntryError::PathTraversal(name.to_string()));
+    }
+
+    Ok(())
 }
 
 #[derive(Default, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -170,6 +189,7 @@ impl ZipFileEntry {
                 Err(_) => return Err(EntryError::Decode),
             }
         };
+        validate_entry_name(&entry.name)?;
         entry.extra_field = data.read_bytes(extra_field_len as usize)?;
 
         if let Ok(data) = entry.extra_field(0x01) {
@@ -566,5 +586,27 @@ impl ZipFile {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_relative_names() {
+        for name in ["a/b.txt", "bin\\x64\\x.dll", "dir/", "file.txt", "a/..b/c"] {
+            assert!(validate_entry_name(name).is_ok(), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_names() {
+        for name in ["../x", "a/../../x", "a\\..\\x", "/etc/x", "C:\\x", "C:/x", "\\\\server\\x"] {
+            assert!(
+                matches!(validate_entry_name(name), Err(EntryError::PathTraversal(_))),
+                "{name} should be rejected"
+            );
+        }
     }
 }
