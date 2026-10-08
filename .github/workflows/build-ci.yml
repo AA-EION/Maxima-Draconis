@@ -254,10 +254,19 @@ jobs:
         path: dist
 
     - name: Install Wine
+      # Homebrew disabled the wine-* casks on 2026-09-01 (they fail its
+      # Gatekeeper check), so take the same Gcenx build the cask used to
+      # wrap, pinned. curl sets no quarantine xattr, so it runs as-is.
+      env:
+        WINE_VERSION: "11.17"
       run: |
-        brew install --cask wine-stable
-        xattr -dr com.apple.quarantine "/Applications/Wine Stable.app" || true
-        echo "/Applications/Wine Stable.app/Contents/Resources/wine/bin" >> "$GITHUB_PATH"
+        curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
+          "https://github.com/Gcenx/macOS_Wine_builds/releases/download/${WINE_VERSION}/wine-devel-${WINE_VERSION}-osx64.tar.xz"
+        tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$RUNNER_TEMP"
+        bin="$(find "$RUNNER_TEMP" -maxdepth 5 -type d -path '*/Contents/Resources/wine/bin' | head -n1)"
+        test -n "$bin"
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/wine" --version
 
     - name: Install + verify Maxima in a fresh prefix
       env:
