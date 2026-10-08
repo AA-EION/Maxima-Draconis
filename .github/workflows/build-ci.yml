@@ -181,6 +181,52 @@ jobs:
         name: maxima-helper-zip
         path: dist/MaximaHelper.zip
 
+  # ── Linux arm64 (native) ─────────────────────────────────────────────────
+  # Compiles the aarch64 paths of maxima-lib (hardware hash via /proc/cpuinfo
+  # and lscpu instead of cpuid) on a real arm64 runner. Same crates as the
+  # x86_64 Linux job; glibc target, so no static musl build here.
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libdbus-1-dev pkg-config
+
+    - name: Install Rust nightly
+      # rust-toolchain.toml pins nightly; rustup picks it up on first use.
+      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: Linux-arm64-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Build Maxima
+      run: |
+        cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-server
+
+    - name: Unit tests (maxima-lib)
+      # read_files/write_files need a live EA session.
+      run: cargo test --release -p maxima-lib --lib -- --skip read_files --skip write_files
+
+    - name: Smoke-test the arm64 CLI
+      run: |
+        set -e
+        ./target/release/maxima-cli --help >/dev/null
+        test "$(uname -m)" = aarch64
+
   # ── macOS native (Apple Silicon) ─────────────────────────────────────────
   # The native-mode binaries (maxima-cli / maxima-server / maxima-bootstrap /
   # maxima-tui), MaximaBootstrap.app and the SwiftUI Maxima.app. The matrix
