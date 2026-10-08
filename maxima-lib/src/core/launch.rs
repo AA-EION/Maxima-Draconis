@@ -570,7 +570,9 @@ pub async fn start_game(
         }
     };
 
-    let child = child.spawn().expect("Failed to start child");
+    let child = child
+        .spawn()
+        .map_err(|e| LaunchError::Native(NativeError::Io(e)))?;
 
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,
