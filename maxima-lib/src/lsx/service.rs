@@ -138,7 +138,8 @@ mod tests {
     use crate::{
         core::{Maxima, MaximaOptionsBuilder},
         lsx::types::{
-            LSXChallengeResponse, LSXEventType, LSXGameInfoId, LSXGetGameInfo, LSXMessageType,
+            LSXChallengeResponse, LSXEventType, LSXGameInfoId, LSXGetAllGameInfo, LSXGetGameInfo,
+            LSXMessageType,
             LSXRequest, LSXRequestType, LSXResponseType, LSX,
         },
         util::simple_crypto::{make_challenge_response, make_lsx_key, simple_decrypt, simple_encrypt},
@@ -520,6 +521,61 @@ mod tests {
         let guard = other.lock().await;
         assert_eq!(guard.lsx_bound_port(), None);
         assert_eq!(guard.effective_lsx_port(), port);
+    }
+
+    #[tokio::test]
+    async fn all_game_info_reflects_the_client_not_a_hardcoded_title() {
+        let (_maxima, port) = start().await;
+
+        let mut client = Client::connect(port).await;
+        client.handshake("SomeOtherGame").await;
+        client
+            .send(
+                LSXRequestType::GetAllGameInfo(LSXGetAllGameInfo {
+                    attr_version: String::new(),
+                }),
+                "5",
+            )
+            .await;
+        let reply: LSX = quick_xml::de::from_str(&client.frame().await).unwrap();
+        let LSXMessageType::Response(reply) = reply.value else {
+            panic!("expected a response");
+        };
+        match reply.value {
+            LSXResponseType::GetAllGameInfoResponse(info) => {
+                // No game launched through Maxima: the challenge is all we know.
+                assert_eq!(info.attr_DisplayName, "SomeOtherGame");
+                assert_eq!(info.attr_InstalledVersion, "1.2.3.4");
+                assert_eq!(info.attr_AvailableVersion, "1.2.3.4");
+                assert_eq!(info.attr_EntitlementSource, "EA");
+                assert!(!info.attr_FullGameReleaseDate.starts_with("2016"));
+            }
+            other => panic!("unexpected response {:?}", other),
+        }
+
+        // Before any challenge there is nothing to report, so nothing is made up.
+        let mut early = Client::connect(port).await;
+        let _ = early.frame().await;
+        early
+            .send(
+                LSXRequestType::GetAllGameInfo(LSXGetAllGameInfo {
+                    attr_version: String::new(),
+                }),
+                "6",
+            )
+            .await;
+        let reply: LSX = quick_xml::de::from_str(&early.frame().await).unwrap();
+        let LSXMessageType::Response(reply) = reply.value else {
+            panic!("expected a response");
+        };
+        match reply.value {
+            LSXResponseType::GetAllGameInfoResponse(info) => {
+                assert_eq!(info.attr_DisplayName, "");
+                assert_eq!(info.attr_InstalledVersion, "");
+                assert_eq!(info.attr_AvailableVersion, "");
+            }
+            other => panic!("unexpected response {:?}", other),
+        }
     }
 
     #[tokio::test]

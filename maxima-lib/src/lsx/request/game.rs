@@ -38,69 +38,84 @@ pub async fn handle_game_info_request(
 //   DisplayName="Battlefield V Definitive Edition" FreeTrial="false"
 //   SystemTime="2023-06-23T04:22:10"/>
 
+const UNKNOWN_RELEASE_DATE: &str = "0000-00-00T00:00:00";
+
 /// Handles `GetAllGameInfo` — the LSX request the game uses to verify that
 /// the auth server's view of "what's installed" matches what's on disk.
 ///
-/// CRITICAL: `InstalledVersion` and `AvailableVersion` must match the client's
-/// own version, or TF2 (and similar Source games) raises an "Engine Error:
-/// File corruption detected" dialog and exits. The version arrives in the
-/// `<Version>` element of the LSX challenge handshake, which we capture into
-/// connection state (`set_game_metadata`) so we can echo it back here.
+/// Everything here is about the game that is actually running: the display
+/// name and versions come from the active offer's library data when Maxima
+/// launched the game, else from what the client reported in the LSX
+/// challenge (`Version` / `Title`, captured via `set_game_metadata`), else
+/// they are left empty. Nothing in this handler is specific to one title.
 ///
-/// Older upstream code hardcoded `InstalledVersion="0"` / `AvailableVersion="1.0.1.3"`
-/// which worked with old client builds but breaks current TF2 (9.12.1.3).
+/// `InstalledVersion` and `AvailableVersion` need to agree with the client's
+/// own idea of its version: some games (Titanfall 2 among them) treat a
+/// mismatch as tampering and raise an "Engine Error: File corruption
+/// detected" dialog.
 pub async fn handle_all_game_info_request(
     state: LockedConnectionState,
     _: LSXGetAllGameInfo,
 ) -> Result<Option<LSXResponseType>, LSXRequestError> {
-    let (version, title) = {
+    let (challenge_version, challenge_title) = {
         let s = state.read().await;
+        (s.game_version().clone(), s.game_title().clone())
+    };
+
+    // `EntitlementSource` must agree with `IsSteamSubscriber` in
+    // `GetProfileResponse` — a contradiction (e.g. "STEAM" +
+    // IsSteamSubscriber=false) is read as a tamper signal by some games' DRM
+    // stubs. Both are sourced from `ActiveGameContext.steam_app_id`, the
+    // Steam App ID that triggered this launch, if any; anything else is an
+    // EA launch.
+    let (offer, is_steam) = {
+        let arc = state.write().await.maxima_arc();
+        let maxima = arc.lock().await;
+        let playing = maxima.playing().as_ref();
         (
-            s.game_version()
-                .clone()
-                .unwrap_or_else(|| "1.0.1.3".to_string()),
-            s.game_title()
-                .clone()
-                .unwrap_or_else(|| "Titanfall® 2 Deluxe Edition".to_string()),
+            playing.and_then(|p| p.offer().clone()),
+            playing.is_some_and(|p| p.steam_app_id().is_some()),
         )
     };
 
-    // EntitlementSource must agree with `IsSteamSubscriber` in
-    // `GetProfileResponse` — TF2's DRM stub treats any contradiction
-    // (e.g. "STEAM" + IsSteamSubscriber=false) as a tamper signal and
-    // shows "Engine Error: File corruption detected". Both are now
-    // sourced from `ActiveGameContext.steam_app_id` (the original
-    // Steam App ID that triggered this launch, if any).
-    let entitlement_source: String = {
-        let arc = state.write().await.maxima_arc();
-        let maxima = arc.lock().await;
-        let is_steam = maxima
-            .playing()
-            .as_ref()
-            .and_then(|p| p.steam_app_id().as_ref())
-            .is_some();
-        if is_steam {
-            "STEAM".to_string()
-        } else {
-            "EA".to_string()
+    // The offer is a clone, so the Maxima lock is not held while reading the
+    // install manifest from disk.
+    let (display_name, installed_version, available_version, release_date) = match &offer {
+        Some(offer) => {
+            let download = offer.offer().downloads().first();
+            (
+                Some(offer.offer().display_name().to_owned()),
+                offer.installed_version().await.ok(),
+                download.and_then(|d| d.game_version().clone()),
+                download.map(|d| d.build_live_date().clone()),
+            )
         }
+        None => (None, None, None, None),
     };
+
+    let display_name = display_name.or(challenge_title).unwrap_or_default();
+    let installed_version = installed_version
+        .or_else(|| challenge_version.clone())
+        .unwrap_or_default();
+    let available_version = available_version
+        .or(challenge_version)
+        .unwrap_or_default();
 
     make_lsx_handler_response!(Response, GetAllGameInfoResponse, {
         attr_FullGamePurchased: true,
         attr_FullGameReleased: true,
-        attr_InstalledVersion: version.clone(),
+        attr_InstalledVersion: installed_version,
         attr_MaxGroupSize: 16,
         attr_Languages: LANGUAGES.to_string(),
         attr_Expiration: "0000-00-00T00:00:00".to_string(),
         attr_UpToDate: true,
         attr_HasExpiration: false,
-        attr_EntitlementSource: entitlement_source,
-        attr_AvailableVersion: version,
-        attr_DisplayName: title,
+        attr_EntitlementSource: if is_steam { "STEAM" } else { "EA" }.to_string(),
+        attr_AvailableVersion: available_version,
+        attr_DisplayName: display_name,
         attr_FreeTrial: false,
         attr_InstalledLanguage: "en_US".to_string(),
-        attr_FullGameReleaseDate: "2016-10-28T04:00:00".to_string(),
+        attr_FullGameReleaseDate: release_date.unwrap_or_else(|| UNKNOWN_RELEASE_DATE.to_string()),
         attr_SystemTime: "2023-06-22T04:00:00".to_string()
     })
 }
