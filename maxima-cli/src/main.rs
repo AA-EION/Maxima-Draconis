@@ -1294,13 +1294,23 @@ async fn start_game_inner(
         maxima.start_lsx(maxima_arc.clone()).await?;
 
         if login.is_none() {
-            maxima.rtm().login().await?;
-
-            let friends = maxima.friends(0).await?;
-            let players: Vec<String> = friends.iter().map(|f| f.id().to_owned()).collect();
-            info!("Subscribed to {} players", players.len());
-
-            maxima.rtm().subscribe(&players).await?;
+            // RTM only feeds friends presence; a failure must not block the launch.
+            if let Err(err) = maxima.rtm().login().await {
+                warn!("RTM login failed (continuing without presence): {}", err);
+            } else {
+                match maxima.friends(0).await {
+                    Ok(friends) => {
+                        let players: Vec<String> =
+                            friends.iter().map(|f| f.id().to_owned()).collect();
+                        if let Err(err) = maxima.rtm().subscribe(&players).await {
+                            warn!("Failed to subscribe to friends presence: {}", err);
+                        } else {
+                            info!("Subscribed to {} players", players.len());
+                        }
+                    }
+                    Err(err) => warn!("Failed to fetch friends list: {}", err),
+                }
+            }
         }
     }
 

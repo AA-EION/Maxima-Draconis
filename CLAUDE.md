@@ -1007,6 +1007,16 @@ When TF2 emits `link2ea://`, bootstrap forwards to the running `serve` and exits
 
 History of significant changes since this fork was forked. Not a substitute for `git log` but useful for "when did X land" questions.
 
+### 2026-10-08 — upstream fix ports
+
+Hand-ported (not cherry-picked) fixes from upstream `ArmchairDevelopers/Maxima` PR #70 plus one fork-owned hardening, on branch `port/upstream-fixes`:
+
+- **Cloud saves** ([cloudsync.rs](maxima-lib/src/core/cloudsync.rs)) — downloaded saves are opened with `.truncate(true)` so a shorter cloud save no longer keeps trailing bytes of the old local file (upstream `871cf57`); `obtain_lock` falls back to the offer id when an offer has no `multiplayer_id` instead of `unwrap()`-panicking (upstream `ce48ac2`). Unit-tested.
+- **Launch** ([launch.rs](maxima-lib/src/core/launch.rs)) — the game spawn returns `LaunchError::Native` instead of `expect()`-panicking (upstream `ce48ac2`).
+- **RTM is best-effort (fork-owned)** — the in-process `launch` path (`start_game_inner`) warns and continues if RTM login / friends / subscribe fail, and `handle_set_presence_request` logs a warning and still answers `ErrorSuccess` when the RTM presence update fails, so a flaky presence service can't kill a game launch or its LSX session. Matches what `maxima-server` already did.
+- **RTM frame reader** ([rtm/connection.rs](maxima-lib/src/rtm/connection.rs), upstream `cdbfe79`, `e64f1d5`) — no `unwrap()` on the response oneshot, frame sizes outside `0..=16 MiB` close the connection before allocating, body-less messages are logged and skipped instead of ending the read loop. The protobuf oneof changes from #70 were deliberately not taken.
+- **Service layer throttle** ([service_layer.rs](maxima-lib/src/core/service_layer.rs), upstream `67a8ac9`) — global semaphore of 3 concurrent requests, ≥100ms between request starts, and up to 3 retries with 500ms·2^n backoff on HTTP 429. The permit is released before the backoff sleep; the 15s connect / 60s per-request timeouts are unchanged.
+
 ### 2026-07-06 — CLI truly a client; server-owned icon on all OSes; stable install path; native friends rail
 
 Follow-through on "the server does everything, the CLI/TUI/GUI are its only clients." Three new docs under [docs/](docs/) capture the state: [CLEANUP.md](docs/CLEANUP.md) (dead-code ledger), [CONSUMER_MIGRATION.md](docs/CONSUMER_MIGRATION.md) (how Draconis adopts the server-based Maxima — the `--json` contract is unchanged), [MACOS_BUNDLING.md](docs/MACOS_BUNDLING.md) (install location + the icon architecture).

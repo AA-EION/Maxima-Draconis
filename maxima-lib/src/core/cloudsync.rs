@@ -343,11 +343,7 @@ impl<'a> CloudSyncLock<'a> {
             );
 
             tokio::fs::create_dir_all(path.safe_parent()?).await?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(path)
-                .await?;
+            let mut file = open_download_target(path).await?;
 
             let mut body = res.bytes_stream();
             while let Some(item) = body.next().await {
@@ -552,10 +548,10 @@ impl CloudSyncClient {
         offer: &OwnedOffer,
         mode: CloudSyncLockMode,
     ) -> Result<CloudSyncLock, CloudSyncError> {
-        let id = format!(
-            "{}_{}",
+        let id = cloudsync_id(
             offer.offer().primary_master_title_id(),
-            offer.offer().multiplayer_id().as_ref().unwrap()
+            offer.offer().multiplayer_id().as_deref(),
+            offer.offer().offer_id(),
         );
 
         let mut allowed_files = Vec::new();
@@ -617,11 +613,55 @@ impl CloudSyncClient {
     }
 }
 
+/// Offers without a multiplayer ID (many non-multiplayer titles) fall back to the offer ID.
+fn cloudsync_id(master_title_id: &str, multiplayer_id: Option<&str>, offer_id: &str) -> String {
+    format!("{}_{}", master_title_id, multiplayer_id.unwrap_or(offer_id))
+}
+
+/// Truncation matters: a cloud save shorter than the existing local file must not
+/// leave trailing bytes of the old content behind.
+async fn open_download_target(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::{auth::storage::AuthStorage, library::GameLibrary};
 
     use super::*;
+
+    #[test]
+    fn cloudsync_id_falls_back_to_offer_id() {
+        assert_eq!(cloudsync_id("123", Some("456"), "Origin.OFR.1"), "123_456");
+        assert_eq!(cloudsync_id("123", None, "Origin.OFR.1"), "123_Origin.OFR.1");
+    }
+
+    #[tokio::test]
+    async fn download_target_is_truncated() {
+        let path = std::env::temp_dir().join(format!(
+            "maxima-cloudsync-truncate-{}-{}.sav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::write(&path, b"0123456789").await.unwrap();
+
+        let mut file = open_download_target(&path).await.unwrap();
+        file.write_all(b"abc").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let contents = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(contents, b"abc");
+    }
 
     #[tokio::test]
     async fn read_files() -> Result<(), CloudSyncError> {

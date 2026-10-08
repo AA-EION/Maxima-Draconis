@@ -1,11 +1,17 @@
 #![allow(non_snake_case)]
 
-use log::debug;
-use reqwest::{Client, StatusCode};
+use std::{
+    sync::Mutex as StdMutex,
+    time::{Duration, Instant},
+};
+
+use log::{debug, warn};
+use reqwest::{Client, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2_const::Sha256;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use derive_builder::Builder;
 use derive_getters::Getters;
@@ -24,6 +30,34 @@ const MEDIUM_AVATAR_PATH: &str =
     "https://eaavatarservice.akamaized.net/production/avatar/prod/1/599/208x208.JPEG";
 const SMALL_AVATAR_PATH: &str =
     "https://eaavatarservice.akamaized.net/production/avatar/prod/1/599/40x40.JPEG";
+
+/// EA's service layer rate-limits aggressively (HTTP 429) when a library load fans
+/// out into many parallel requests, so every call goes through a process-wide
+/// throttle: at most `MAX_CONCURRENT_REQUESTS` in flight, request starts spaced
+/// at least `MIN_REQUEST_INTERVAL` apart, and 429s retried with backoff.
+const MAX_CONCURRENT_REQUESTS: usize = 3;
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+const RATE_LIMIT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+static REQUEST_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_REQUESTS);
+static LAST_REQUEST_START: StdMutex<Option<Instant>> = StdMutex::new(None);
+
+/// 500ms, 1s, 2s, ... for retry attempts 0, 1, 2, ...
+fn rate_limit_backoff(attempt: u32) -> Duration {
+    RATE_LIMIT_BACKOFF_BASE * 2u32.saturating_pow(attempt)
+}
+
+/// Reserves the next request-start slot, at least `min_interval` after the previous
+/// reservation (or `now` if that is already in the past), and records it.
+fn reserve_start_slot(last: &mut Option<Instant>, now: Instant, min_interval: Duration) -> Instant {
+    let slot = match *last {
+        Some(prev) => now.max(prev + min_interval),
+        None => now,
+    };
+    *last = Some(slot);
+    slot
+}
 
 #[derive(Error, Debug)]
 pub enum ServiceLayerError {
@@ -173,6 +207,59 @@ impl ServiceLayerClient {
         result
     }
 
+    /// Sends a request through the global throttle, retrying on HTTP 429. The
+    /// concurrency permit is only held while a request is actually in flight, never
+    /// across the backoff sleep, so waiting retries can't starve other callers.
+    async fn execute_throttled(
+        &self,
+        request: Request,
+    ) -> Result<(StatusCode, String), reqwest::Error> {
+        let mut attempt = 0;
+        loop {
+            // Bodies here are plain strings, so cloning only fails for streamed bodies;
+            // in that case send once without retrying.
+            let Some(this_try) = request.try_clone() else {
+                return self.execute_once(request).await;
+            };
+
+            let (status, text) = self.execute_once(this_try).await?;
+            if status != StatusCode::TOO_MANY_REQUESTS || attempt >= MAX_RATE_LIMIT_RETRIES {
+                return Ok((status, text));
+            }
+
+            let delay = rate_limit_backoff(attempt);
+            warn!(
+                "Service layer returned HTTP 429, retrying in {:?} (retry {}/{})",
+                delay,
+                attempt + 1,
+                MAX_RATE_LIMIT_RETRIES
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
+    async fn execute_once(&self, request: Request) -> Result<(StatusCode, String), reqwest::Error> {
+        // The semaphore is a static that is never closed.
+        let _permit = REQUEST_PERMITS
+            .acquire()
+            .await
+            .expect("request semaphore closed");
+
+        let slot = {
+            let mut last = LAST_REQUEST_START
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            reserve_start_slot(&mut last, Instant::now(), MIN_REQUEST_INTERVAL)
+        };
+        tokio::time::sleep_until(slot.into()).await;
+
+        let res = self.client.execute(request).await?;
+        let status = res.status();
+        let text = res.text().await?;
+        Ok((status, text))
+    }
+
     async fn request2<T, R>(
         &self,
         operation: &ServiceLayerGraphQLRequest,
@@ -206,7 +293,7 @@ impl ServiceLayerClient {
             request = request.header("Authorization", &("Bearer ".to_owned() + &access_token));
         }
 
-        let res = if full_query {
+        let request = if full_query {
             let data = FullServiceRequest {
                 extensions,
                 variables,
@@ -224,11 +311,9 @@ impl ServiceLayerClient {
                 ("variables", serde_json::to_string(&variables)?.as_str()),
             ])
         }
-        .send()
-        .await?;
+        .build()?;
 
-        let status = res.status();
-        let text = res.text().await?;
+        let (status, text) = self.execute_throttled(request).await?;
         if status != StatusCode::OK {
             return Err(ServiceLayerError::Http {
                 status_code: status,
@@ -890,5 +975,32 @@ impl ServiceImage {
                 path: SMALL_AVATAR_PATH.to_owned(),
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_from_500ms() {
+        assert_eq!(rate_limit_backoff(0), Duration::from_millis(500));
+        assert_eq!(rate_limit_backoff(1), Duration::from_millis(1000));
+        assert_eq!(rate_limit_backoff(2), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn start_slots_are_spaced_by_the_minimum_interval() {
+        let min = Duration::from_millis(100);
+        let t0 = Instant::now();
+        let mut last = None;
+
+        assert_eq!(reserve_start_slot(&mut last, t0, min), t0);
+        // A burst of callers arriving at the same instant queues up behind each other.
+        assert_eq!(reserve_start_slot(&mut last, t0, min), t0 + min);
+        assert_eq!(reserve_start_slot(&mut last, t0, min), t0 + min * 2);
+        // A caller arriving after the last slot has passed starts immediately.
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(reserve_start_slot(&mut last, later, min), later);
     }
 }
