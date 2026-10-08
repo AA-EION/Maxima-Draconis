@@ -277,16 +277,18 @@ impl<'a> CloudSyncLock<'a> {
 
             let file = OpenOptions::new().read(true).open(path.clone()).await;
 
-            let md5 = if let Ok(file) = file {
+            let should_download = if let Ok(file) = file {
                 let md5 = calc_file_md5(file, HashMode::Hex).await?;
-                if let Some(_) = self.manifest.file_by_md5(&md5) {
-                    debug!("Skipping CloudSync read {}", &path.display());
-                    continue;
-                }
-                md5
+                self.manifest.file_by_md5(&md5).is_none()
             } else {
-                continue;
+                // Missing locally (fresh bottle): restore it from the cloud.
+                true
             };
+
+            if !should_download {
+                debug!("Skipping CloudSync read {}", &path.display());
+                continue;
+            }
 
             value.request.push(CloudSyncRequest {
                 attr_id: i.to_string(),
