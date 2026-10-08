@@ -261,12 +261,16 @@ impl BridgeThread {
                     info!("Installing service...");
                     backend_responder.send(MaximaLibResponse::ServiceNeedsStarting)?;
                     'wait_for_user_to_authorize: loop {
-                        let request = backend_cmd_listener.try_recv();
-                        if request.is_err() {
-                            continue;
-                        }
+                        let request = match backend_cmd_listener.try_recv() {
+                            Ok(request) => request,
+                            Err(TryRecvError::Empty) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                continue;
+                            }
+                            Err(TryRecvError::Disconnected) => return Ok(()),
+                        };
 
-                        match request.unwrap() {
+                        match request {
                             MaximaLibRequest::StartService => {
                                 register_service_user()?;
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -309,10 +313,14 @@ impl BridgeThread {
         if !logged_in {
             backend_responder.send(MaximaLibResponse::LoginCacheEmpty)?;
             'outer: loop {
-                let request = backend_cmd_listener.try_recv();
-                if request.is_err() {
-                    continue;
-                }
+                let request = match backend_cmd_listener.try_recv() {
+                    Ok(request) => Ok::<_, TryRecvError>(request),
+                    Err(TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                };
 
                 match request? {
                     MaximaLibRequest::LoginRequestOauth => {

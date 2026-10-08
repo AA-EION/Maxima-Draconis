@@ -276,10 +276,11 @@ impl Maxima {
         match probe_result {
             Ok(Ok(stream)) => {
                 drop(stream);
-                info!(
-                    "LSX server already listening on {} (likely `maxima-cli serve` \
-                     in another window); skipping our own bind so the game's traffic \
-                     lands on the existing server.",
+                warn!(
+                    "An LSX server is already listening on {}; not starting our own. \
+                     That's expected when another Maxima (server, serve, UI) is running, \
+                     but if it's EA Desktop / Origin in the same prefix, games will \
+                     authenticate against it instead of Maxima — close it if launches fail.",
                     probe_addr
                 );
                 return Ok(());

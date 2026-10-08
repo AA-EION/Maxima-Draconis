@@ -29,7 +29,7 @@ use crate::util::{
 };
 
 lazy_static! {
-    static ref PROTON_PATTERN: Regex = Regex::new(r"GE-Proton\d+-\d+\.tar\.gz").unwrap();
+    static ref PROTON_PATTERN: Regex = Regex::new(r"GE-Proton\d+-\d+(?:-x86_64)?\.tar\.gz").unwrap();
 }
 
 // A Proton verb to use
@@ -497,7 +497,10 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .env("STORE", "ea")
         .env("PROTON_EAC_RUNTIME", eac_path)
         .env("UMU_ZENITY", "1")
-        .env("WINEDEBUG", "fixme-all")
+        .env(
+            "WINEDEBUG",
+            std::env::var("WINEDEBUG").unwrap_or_else(|_| "fixme-all".to_owned()),
+        )
         .env("LD_PRELOAD", "") // Fixes some log errors for some games
         .arg(arg);
 
