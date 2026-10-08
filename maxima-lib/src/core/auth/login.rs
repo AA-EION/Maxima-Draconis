@@ -13,8 +13,14 @@ lazy_static! {
 }
 
 pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result<(), AuthError> {
-    open::that(context.nucleus_auth_url(JUNO_PC_CLIENT_ID, "code")?)?;
+    let auth_url = context.nucleus_auth_url(JUNO_PC_CLIENT_ID, "code")?;
+    // Bind before opening the browser so a fast redirect can't beat us.
     let listener = TcpListener::bind("127.0.0.1:31033").await?;
+    // Not fatal: a detached server (or a headless box) may have no browser
+    // handler, and the user can still open the logged URL by hand.
+    if let Err(err) = open::that(&auth_url) {
+        log::warn!("Couldn't open a browser ({}). Open this URL to log in: {}", err, auth_url);
+    }
 
     println!("============================================================");
     println!("Please log in via the browser window that just opened.");

@@ -534,6 +534,11 @@ fn main() {
             Ok(_) => error!("{}:\n{}", e, e.backtrace().to_string()),
             Err(_) => error!("{}: {}", e, e.root_cause()),
         }
+        // Consumers (Draconis) key success off the exit status, and in
+        // --json mode the logger's stdout sink is muted — so make the
+        // failure visible on both channels a caller can see.
+        eprintln!("error: {:#}", e);
+        std::process::exit(1);
     }
 }
 
