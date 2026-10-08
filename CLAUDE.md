@@ -37,7 +37,9 @@ macOS host
 │
 └── CrossOver bottle (Wine prefix)
     └── Program Files/Maxima/
-        ├── maxima-cli.exe         — auth + launch CLI (also runs `serve` mode)
+        ├── maxima-cli.exe         — thin client: forwards every product command to maxima-server
+        ├── maxima-server.exe      — the long-lived session (login, LSX, /authorize, RTM, downloads);
+        │                            spawned on demand by maxima-cli, never autostarted in a bottle
         ├── maxima-bootstrap.exe   — link2ea:// / origin2:// / qrc:// handler
         ├── maxima-service.exe     — background service (DLL injection, registry setup)
         ├── maxima.exe             — upstream GUI (shipped, not yet wired into Draconis)
@@ -324,7 +326,8 @@ game in bottle emits link2ea://…
 
 - **Wire protocol** (newline-delimited JSON): requests `{"id":N,"cmd":"list-games"|"friends"|"launch"|"install"|"status"|"shutdown",…}`; matched responses `{"id":N,"ok":bool,…}`; and **broadcast events** (no id) pushed to *every* client — `ready`, `presence` diffs, `install-progress`/`install-done`/`install-error`, `game-started`/`game-stopped`. Launch a game from the CLI and a connected UI sees `game-started`; a third-party `link2ea://` that hits `/authorize` broadcasts to all.
 - **CLI is a pure client**: every product command — `list-games`, `install` (incl. `--build-id` / `--replace-files` / `--only-listed-files`), `launch`, `verify` (+`--repair`), `download-specific-file`, `bottle-info`, `register-protocols`, `cloud-sync` — `ensure_server_running`s the `maxima-server` binary (spawning it if down) and forwards over the proto at the very top of startup, before any login/wine setup. The CLI holds no session of its own. Streaming commands (install/verify) translate the server's proto notifications back into the exact JSONL shapes Draconis parses, so its contract is unchanged (verified on macOS: forwarded bottle-info / list-games / register-protocols work). `server-stop` / `server-status` are login-free client commands. The generalized replace-files/verify are **not** TF2-specific — they refresh arbitrary files of any title (the Steam-CEG fix is one caller). Only developer/diagnostic subcommands (`account-info`, `get-user-by-id`, `test-rtm-connection`, …) and `launch --login` (self-contained manual login) remain in-process; the dormant in-process implementations of the forwarded commands are unreachable fallback to be pruned.
-- **Auto-start**: `server::ensure_server_running` (CLI) and `maxima_lib::server_client::ensure_running` (egui) probe the port and spawn `maxima-cli server` detached if it's down.
+- **Auto-start**: `server::ensure_server_running` (CLI) and `maxima_lib::server_client::ensure_running` (egui) probe the port and spawn the `maxima-server` binary detached if it's down. The CLI keeps waiting while the spawned server is alive (up to 5 min) because the server binds its control port only after login, and a first-run login waits on the user in the browser.
+- **In a CrossOver bottle the server is never autostarted.** `MaximaSetup.exe` ships `maxima-server.exe` next to the CLI but skips the `HKCU\…\Run` entry when it detects Wine: wineboot replays Run keys whenever the bottle boots, so the server would be started by whatever host process booted the bottle and inherit its macOS responsibility / App Nap state — and every game the server launches would inherit it too (the GUI-launch freeze). Consumers must make their **first** `maxima-cli` call of a session from a disclaimed spawn (Draconis routes all of them through `CleanSpawn`).
 
 **`maxima-proto` — the real typed RPC layer (added 2026-07-05; PR #23's `maxima_proto`).** A standalone crate with **no `maxima-lib` dependency**, so a frontend can be a true thin client without linking the server's EA/auth/LSX/download logic. It carries the wire DTOs ([types.rs](maxima-proto/src/types.rs): `GameDto`, `FriendDto`, `GameDetailsDto`, `PresenceDto`, `StatusDto`), the typed request/response/notification envelopes ([message.rs](maxima-proto/src/message.rs)) that serialize to the **exact** newline-JSON the server always emitted (so the SwiftUI app is unaffected), and a real async [`MaximaClient`](maxima-proto/src/client.rs) — TCP connect, response↔request correlation by id, a broadcast notification stream, typed RPCs (`list_games`/`friends`/`status`/`game_details`/`launch`/`install`/`locate_game`/`cloud_sync`/`shutdown`), `await_ready`, and `connect_or_spawn`. The server ([server.rs](maxima-cli/src/server.rs)) now dispatches these typed requests against the real `Maxima` and maps its rich types onto the DTOs.
 
@@ -334,7 +337,7 @@ game in bottle emits link2ea://…
 - **CLI** — `server-stop`/`server-status`/`launch`/`install` forwarding all go through `MaximaClient`. ✅
 - **egui UI (`maxima-ui`)** — **server-side ready, bridge rewire is the remaining step.** The proto + server now expose *everything* the egui UI needs as a thin client — `who-am-i` (persona+id+avatar), `game-images <slug>` (hero/logo/background URLs, reusing `get_games::handle_images`' selection), `game-details`, `friends` with `avatar_url`, plus launch/install/locate/cloud-sync and the presence/install/game notifications. What's left is purely inside `maxima-ui`: rewire `bridge_thread::run` + the `bridge/*` handlers + `event_thread` onto a `MaximaClient` (feeding the **kept** image-loader thread with server URLs), and change two response types (`InteractThreadLoginResponse.you: ServicePlayer` → persona/id strings; `GameInfo.dlc: Vec<OwnedOffer>` → `Vec<ExtraOfferDto>`) with the ~2 view sites that read them (`bridge_processor` login, `game_view` dlc loop, `event_thread` presence → build `RichPresence` from `PresenceDto`). It's mechanical against a ready server but ~600 lines across a working 5.5k-line UI, deliberately not rushed to avoid leaving it half-broken. The egui UI meanwhile still runs in-process and `ensure_running`s the server so the tray / other clients work.
 - **Bar icon, per-OS idiom — the *server* owns it** (all three do Open-UI / Stop-Server), dispatched from [maxima-server/src/status_icon.rs](maxima-server/src/status_icon.rs) after the server binds: **Windows** — native `Shell_NotifyIcon` tray inside the server ([maxima-server/src/tray.rs](maxima-server/src/tray.rs), winapi), now showing the embedded `logo.ico` (build.rs + maxima-resources, winres icon id 1). **macOS** — the server spawns `Maxima.app --menubar` (status items need a GUI app; a headless launchd Rust binary can't draw one), which runs as an `.accessory` `MenuBarExtra` and connects back as a client; "Open Maxima" promotes it to a window. `open` coalesces to one instance, so no spawn loop. **Linux** — SNI tray (pure D-Bus via `ksni`) behind the off-by-default `linux-tray` cargo feature; the default build stays headless (drive it with `maxima-cli` + the systemd unit). CI builds `maxima-server` on Linux and `cargo check`s `--features linux-tray` (it can't be cross-checked on macOS — `ring` needs a Linux C toolchain). See [docs/MACOS_BUNDLING.md](docs/MACOS_BUNDLING.md).
-- **Logon autostart**: Windows NSIS writes `HKCU\…\Run\MaximaServer` (uninstaller stops the server + removes it); macOS launchd agent + Linux systemd user unit templates live in [installer/autostart/](installer/autostart/) with install instructions in their headers.
+- **Logon autostart**: Windows NSIS writes `HKCU\…\Run\MaximaServer` → `maxima-server.exe` on native Windows only (skipped under Wine, see above; uninstaller stops the server + removes it); macOS launchd agent + Linux systemd user unit templates live in [installer/autostart/](installer/autostart/) with install instructions in their headers.
 - **Game-exit detection nuance**: on the cxstart launch path the game is detached, so `run_via_cxstart` polls `/usr/bin/pgrep -if <exe>` to know when it exits (sysinfo can't read wine/Rosetta cmdlines; the absolute path survives a minimal launchd PATH). Correctness is anchored regardless by `update_playing_status`'s LSX-connection guard — `playing` only clears once the game's LSX closes AND the bootstrap has exited, so a flaky poll delays `game-stopped` at worst, never fires it early.
 
 **The GUI-launch freeze — root cause and fix (solved 2026-07-04 after seven elimination experiments).** TF2 launched from any `.app`-originated chain froze at a blank window right after LSX `GetAllGameInfo`; the identical chain from a shell reached the menu. Eliminated one by one: stdio pipes (real hygiene issue, fixed, insufficient), environment (minimal app-like env works from a shell), stale wineserver state, App Nap of the backend (it answered HTTP in 8ms mid-freeze), QoS clamp (`taskpolicy -B` didn't help; game at normal PRI 31, 0% CPU), and `POSIX_SPAWN_SETSID`. `sample(1)` of the frozen game showed the truth: wine's display driver main thread parked forever in `mach_msg` inside `CFRunLoopServiceMachPort` — **starved of WindowServer events because the game's macOS "responsible process" resolved to a windowless ancestor** (the app, or a headless disclaimed backend). The fix mirrors Draconis's production recipe at the correct hop: `run_via_cxstart` (unix/wine.rs) spawns **cxstart** via raw `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` + `POSIX_SPAWN_SETSID` + `responsibility_spawnattrs_setdisclaim` (dlsym, graceful no-op if Apple removes it) + `/dev/null` stdio — the disclaim lands on the game's DIRECT ancestor, so the tree is responsibility-attributed to itself with a healthy GUI context. Games on macOS launch through cxstart (CrossOver-owned, like double-clicking in its UI) whenever CrossOver is the auto-detected engine; a user-set `MAXIMA_WINE_COMMAND` opts out. cxstart exits after handoff, so wait-for-exit is emulated by polling for the exe's process (sysinfo). Verdict test: full LSX boot from the app's backend — `GetAuthCode → QueryEntitlements → QueryFriends → SetPresence("Main Menu")`.
@@ -544,13 +547,11 @@ When `serve` is NOT running, step 5 takes branch 5c and a fresh `maxima-cli laun
 
 ---
 
-## Why NorthstarLauncher.exe is *not* in the flow
+## NorthstarLauncher.exe and `-noOriginStartup`
 
-`NorthstarLauncher.exe` in the TF2 directory **hard-codes a Win32 attempt to start Origin** (via a path to `Origin.exe`, not via `origin2://`). On macOS / Wine there is no Origin install, and our `origin2://` handler doesn't get a chance to intercept. Result: `[*] Starting Origin... [*] Waiting for Origin...` hangs forever.
+Without flags, `NorthstarLauncher.exe` tries to start Origin itself (`[*] Starting Origin... [*] Waiting for Origin...`) and hangs forever on macOS / Wine, where there is no Origin install. **`-noOriginStartup` is a real NorthstarLauncher flag** that skips that step (`primedev/primelauncher/main.cpp` gates `EnsureOriginStarted` on it, and `primedev/origin/origin.cpp` hooks the Origin SDK's "is Origin installed / start Origin" checks for exactly the "no EA app in the same Wine prefix" case).
 
-Draconis works around this by launching Northstar mode via Steam's `-northstar` launch option (`steam.exe -applaunch 1237970 -northstar -noOriginStartup -multiple`), so Steam invokes `Titanfall2.exe` with the flag and Northstar's `wsock32` proxy hooks load. `NorthstarLauncher.exe` is never invoked.
-
-If you want to fix Northstar to work standalone here, the right place is to make Northstar's "start Origin" step use `origin2://` (so maxima-bootstrap can catch it). That's an upstream Northstar issue, not Maxima's.
+So Draconis **does** launch Northstar through `NorthstarLauncher.exe` — always with `-noOriginStartup` (and `-vanilla` for vanilla mode with Northstar installed), handed to Maxima as `maxima-cli launch Origin.OFR.50.0001456 --game-path …\NorthstarLauncher.exe --game-args -noOriginStartup`. Passing `-northstar` to `Titanfall2.exe` does not work on this Wine branch. Draconis's CLAUDE.md "Launch decision matrix" is the authoritative table; Maxima only provides the universal `launch --game-path/--game-args` primitive.
 
 Credit to [catornot](https://github.com/catornot) for documenting the `-noOriginStartup` requirement and contributing the external-LSX patch in the first place.
 
@@ -586,18 +587,21 @@ Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)
 
 ### `build-ci.yml` — push CI
 
-Fires on every push to any branch except `v*` tags. Matrix: Linux, Windows, macOS.
+Fires on every push to any branch except `v*` tags.
 
-| Job             | What it builds                                                                                                          |
+| Job             | What it builds / checks                                                                                                  |
 |-----------------|-------------------------------------------------------------------------------------------------------------------------|
-| ubuntu-latest   | `cargo build --release --target x86_64-unknown-linux-musl -p maxima-cli -p maxima-bootstrap` (skips UI/TUI)             |
-| windows-latest  | `cargo build --release` (full workspace → all 5 binaries), then `makensis /DBIN_DIR="..\target\release"`                |
-| macos-latest    | `bash MaximaHelper/build.sh --output ./dist --no-register`, then sanity check that `Info.plist` declares `qrc://`        |
+| ubuntu-latest   | `cargo build --release --target x86_64-unknown-linux-musl -p maxima-cli -p maxima-bootstrap -p maxima-server`, plus `cargo check -p maxima-server --features linux-tray` (needs `libdbus-1-dev`) |
+| windows-latest  | `cargo build --release` (full workspace), then `makensis /DBIN_DIR="..\target\release"`                                 |
+| macos-latest    | `MaximaHelper/build.sh`, sanity check that `Info.plist` declares `qrc://`                                                |
+| macos-native (macos-26) | native arm64 `maxima-cli`/`maxima-server`/`maxima-bootstrap`/`maxima-tui`, `cargo test -p maxima-proto`, `MaximaBootstrap.app` + SwiftUI `Maxima.app`, `server-status --json` smoke test |
+| wine-smoke (macos-15-intel) | installs the CI-built `MaximaSetup.exe /S` into a fresh Wine prefix ([installer/wine-smoke.sh](installer/wine-smoke.sh)): binaries incl. `maxima-server.exe` present, `link2ea`/`origin2`/`qrc` routed to the bootstrap, Run-key autostart skipped under Wine, `server-status --json` works, `list-games` spawns `maxima-server.exe`, and the server idles (<50% CPU) while waiting for a login that never comes |
 
 What CI does **not** validate:
 
 - `maxima-ui` / `maxima-tui` on Linux — pull `rustix 0.37` via `accesskit_unix → zbus 3 → async-process 1.8 → async-io 1.13`, which doesn't build on modern nightly because of `rustc_attrs` namespace reservation.
-- `MaximaSetup.exe` actually installing into a Wine bottle. We sanity-check size (>100KB) but never run it.
+- Anything behind an EA login (library, install, launch) — no account on CI. The Wine smoke test stops at "server is up and waiting for login".
+- CrossOver itself (licensed, not on runners) — the smoke test uses upstream Wine, so CrossOver-specific behaviour (cxstart, the disclaim chain) is still validated by hand.
 - `MaximaHelper.app`'s code signature — it ships linker-signed (adhoc) and Draconis re-signs it at consumption time with `codesign --force --deep --sign -`.
 
 ### `release.yml` — tag release
@@ -711,14 +715,16 @@ cxstart --bottle "Titanfall 2" --env "RUST_LOG=wgpu_core=info,wgpu_hal=info" -- 
 
 The maxima.log file inside the bottle is at `~/Library/Application Support/CrossOver/Bottles/<bottle>/drive_c/users/crossover/AppData/Local/Maxima/Logs/maxima.log` and gets a `===== maxima log session opened (pid=…) =====` header per process start.
 
-### Steam vs vanilla launch contract (Draconis ↔ here)
+### Launch contract (Draconis ↔ here)
 
-Draconis v0.4.0+:
+Draconis calls `maxima-cli.exe` inside the bottle via `cxstart --bottle <name> [--wait] maxima-cli.exe …`, always through its `CleanSpawn` wrapper (`posix_spawn` + `CLOEXEC_DEFAULT` + `SETSID` + responsibility disclaim):
 
-- Vanilla launch: runs `Titanfall2.exe` directly. The binary's own Steam DRM stub self-relaunches via `steam://run/1237970` if needed; the EA path triggers `link2ea://` which reaches maxima-bootstrap.
-- Northstar launch: runs `steam.exe -applaunch 1237970 -novid -northstar -noOriginStartup -multiple`. Steam routes through TF2, the Northstar hooks load, EA auth still goes via link2ea:// → maxima-bootstrap.
+- `list-games --json` — onboarding pre-flight (is TF2 in the EA library?).
+- `install titanfall-2 --path <steam dir> --replace-files "Titanfall2.exe,Titanfall2_trial.exe" --only-listed-files` — the Steam-CEG fix.
+- `launch Origin.OFR.50.0001456 --game-path <…\Titanfall2.exe | …\NorthstarLauncher.exe> [--game-args …]` — every launch when the bottle's Maxima role isn't `.none`.
+- `maxima.exe --install titanfall-2 --install-path <dir>` — the wizard's Maxima install route; completion is `FInstall.txt`.
 
-Draconis never calls `maxima-cli.exe` directly. If you see `maxima-cli launch 1237970` in any log, it's from an old Draconis (≤ v0.3.9) — they shouldn't exist in v0.4.0+ flows.
+Asset names `MaximaSetup.exe` / `MaximaHelper.zip` and these command shapes are the compatibility surface. **Draconis fetches the *latest* Maxima release at runtime**, so a tagged release reaches existing Draconis installs immediately — ship the consumer side of any contract change first.
 
 ---
 
