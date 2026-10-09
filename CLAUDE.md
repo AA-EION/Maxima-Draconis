@@ -597,7 +597,7 @@ If you ever change how `MaximaHelper.app` is signed at release time in this repo
 
 ## CI
 
-Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)]` in `maxima-ui/src/main.rs` and similar feature gates elsewhere — inherited from upstream).
+Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)]` in `maxima-ui/src/main.rs` and similar feature gates elsewhere — inherited from upstream). The nightly is **pinned by date in `rust-toolchain.toml`** and every job installs exactly that one (`rustup toolchain install`): nightlies from late September 2026 on reject `objc2 0.4.1`, which `eframe 0.28` pulls in on macOS, so an unpinned nightly broke the macOS `maxima-ui` build without any commit. Bump the pin deliberately and watch the macOS jobs.
 
 ### `build-ci.yml` — push CI
 

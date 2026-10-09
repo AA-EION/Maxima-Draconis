@@ -1,2 +1,7 @@
 [toolchain]
-channel = "nightly"
+# Nightly is required (feature gates in maxima-ui and elsewhere). Pinned so a
+# new nightly can't break the build without a commit: nightlies from
+# 2026-09-2x on reject objc2 0.4.1, which eframe 0.28 pulls in on macOS.
+# Bump deliberately, after checking the macOS jobs.
+channel = "nightly-2026-09-15"
+profile = "minimal"

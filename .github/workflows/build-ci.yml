@@ -36,7 +36,7 @@ jobs:
       uses: actions/cache@v3
       with:
         path: ${{ github.workspace }}\rust\.rustup
-        key: rust-${{ matrix.rust-version }}-${{ hashFiles('**/rust-toolchain') }}
+        key: rust-${{ matrix.rust-version }}-${{ hashFiles('rust-toolchain.toml') }}
 
     - name: Setup Rust ${{ matrix.rust-version }}
       if: runner.os != 'macOS'
@@ -44,8 +44,12 @@ jobs:
       with:
         profile: minimal
         toolchain: ${{ matrix.rust-version }}
-        override: true
         components: rustfmt, clippy
+
+    - name: Install the pinned nightly
+      # rust-toolchain.toml decides the compiler; no directory override above.
+      if: runner.os != 'macOS'
+      run: rustup toolchain install
 
     - name: Install Protoc
       # Only needed for the Rust build (maxima-lib/prost-build). macOS only
@@ -204,8 +208,8 @@ jobs:
         sudo apt-get install -y libdbus-1-dev pkg-config
 
     - name: Install Rust nightly
-      # rust-toolchain.toml pins nightly; rustup picks it up on first use.
-      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
 
     - uses: Swatinem/rust-cache@v2
       with:
@@ -310,8 +314,8 @@ jobs:
       run: brew install protobuf
 
     - name: Install Rust nightly
-      # rust-toolchain.toml pins nightly; rustup picks it up on first use.
-      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
 
     - uses: Swatinem/rust-cache@v2
       with:
@@ -365,7 +369,8 @@ jobs:
       run: brew install ffmpeg@7 pkgconf protobuf
 
     - name: Install Rust nightly
-      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
 
     - uses: Swatinem/rust-cache@v2
       with:
