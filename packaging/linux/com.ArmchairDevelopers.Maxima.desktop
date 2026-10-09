@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Maxima
+GenericName=EA Game Launcher
+Comment=A free and open-source replacement for the EA Desktop Launcher
+Exec=maxima %u
+Icon=com.ArmchairDevelopers.Maxima
+Terminal=false
+Categories=Game;
+Keywords=ea;origin;launcher;games;
+StartupNotify=true
+MimeType=x-scheme-handler/link2ea;x-scheme-handler/origin2;x-scheme-handler/qrc;

@@ -1,0 +1,70 @@
+# Reproducible Linux release build of the Maxima binaries.
+#
+#   podman build -f packaging/linux/Containerfile --target artifacts \
+#       --output type=local,dest=dist/linux .
+#   (or `docker buildx build ...` with the same flags; build-container.sh wraps
+#    both and also works with plain `docker build`)
+#
+# Produces statically linked musl binaries (no glibc / library requirements on
+# the target machine): maxima-cli, maxima-server, maxima-bootstrap, maxima-tui.
+#
+# Not built: maxima-ui. It pulls rustix 0.37 via accesskit_unix -> zbus 3 ->
+# async-io 1.13, which does not compile on current nightly (the `rustc_attrs`
+# namespace is reserved). maxima-service is Windows-only. maxima-tui builds on
+# Linux (musl, static) and is included; --build-arg BUILD_TUI=0 drops it.
+#
+# Reproducibility: rust-toolchain.toml only says "nightly". Pass a dated
+# nightly (--build-arg RUST_TOOLCHAIN=nightly-2026-10-07) to pin the compiler;
+# the base image is pinned by tag and crate versions come from Cargo.lock
+# (--locked).
+
+ARG DEBIAN_RELEASE=bookworm-slim
+FROM docker.io/library/debian:${DEBIAN_RELEASE} AS build
+
+ARG RUST_TOOLCHAIN=nightly
+ARG BUILD_TUI=1
+ARG RUSTUP_VERSION=1.28.2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH \
+    CARGO_TERM_COLOR=always
+
+# protobuf-compiler: prost-build in maxima-lib/maxima-proto.
+# libdbus-1-dev + pkg-config: only needed for the optional linux-tray feature of
+# maxima-server, installed so that feature can be built in the same image.
+# musl-tools: musl-gcc, needed by `ring` for the static target.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git libdbus-1-dev musl-tools \
+      pkg-config protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(uname -m)" \
+ && curl -fsSL "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${arch}-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init \
+ && chmod +x /tmp/rustup-init \
+ && /tmp/rustup-init -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
+      --target "${arch}-unknown-linux-musl" \
+ && rm /tmp/rustup-init
+
+WORKDIR /src
+COPY . .
+
+# RUSTUP_TOOLCHAIN overrides rust-toolchain.toml so a dated nightly sticks.
+RUN arch="$(uname -m)" \
+ && export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" \
+ && export RUSTFLAGS="-C target-feature=+crt-static" \
+ && pkgs="-p maxima-cli -p maxima-server -p maxima-bootstrap" \
+ && if [ "${BUILD_TUI}" = 1 ]; then pkgs="$pkgs -p maxima-tui"; fi \
+ && cargo build --release --locked --target "${arch}-unknown-linux-musl" $pkgs \
+ && mkdir -p /out \
+ && for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do \
+      if [ -x "target/${arch}-unknown-linux-musl/release/$b" ]; then \
+        install -m 0755 "target/${arch}-unknown-linux-musl/release/$b" /out/; \
+      fi; \
+    done
+
+# `--output type=local` exports exactly this stage's filesystem.
+FROM scratch AS artifacts
+COPY --from=build /out/ /

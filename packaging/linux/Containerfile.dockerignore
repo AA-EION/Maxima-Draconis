@@ -1,0 +1,10 @@
+.git
+.claude
+target
+dist
+**/target
+maxima-native/build
+MaximaHelper/build
+installer/MaximaSetup.exe
+packaging/linux/flatpak/build-dir
+packaging/linux/flatpak/.flatpak-builder
