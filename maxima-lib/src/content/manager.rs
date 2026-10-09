@@ -244,6 +244,9 @@ impl GameDownloader {
             }
             entries.push(ele.clone());
         }
+        // Biggest first: a few huge files left at the end would download on
+        // a single connection each while the other slots sit idle.
+        entries.sort_by(|a, b| b.compressed_size().cmp(a.compressed_size()));
         if excluded > 0 {
             info!(
                 "Excluding {} file(s) from the download ({} pattern(s))",
@@ -335,8 +338,12 @@ impl GameDownloader {
 
             async move {
                 tokio::select! {
-                    result = downloader.download_single_file(&ele, Some(Box::new(move |bytes| {
-                        completed_bytes.fetch_add(bytes, Ordering::SeqCst);
+                    result = downloader.download_single_file(&ele, Some(Box::new(move |delta: isize| {
+                        if delta >= 0 {
+                            completed_bytes.fetch_add(delta as usize, Ordering::SeqCst);
+                        } else {
+                            completed_bytes.fetch_sub(delta.unsigned_abs(), Ordering::SeqCst);
+                        }
                     }))) => {
                         if let Err(err) = result {
                             error!("Download of {} failed: {}", ele.name(), err);
@@ -405,19 +412,7 @@ impl GameDownloader {
     }
 
     pub fn is_done(&self) -> bool {
-        // `>=` (not `==`): the per-file `BytesDownloadedCallback` adds to
-        // `completed_bytes` on every successful chunk read inside
-        // `ByteCountingStream`. When a file's download is retried (see
-        // `EntryDownloadRequest::download` — up to 6 attempts on a single
-        // file under the v0.12.1 retry layer), each attempt streams bytes
-        // through that callback before its eventual outcome — so the
-        // counter ends up at `N × bytes_per_attempt` for an N-retry file
-        // rather than exactly `compressed_size`. With `==` semantics, a
-        // single retried file pushed the counter past `total_bytes` and
-        // `is_done()` returned false forever — install hung silently
-        // forever after "Installation finished!" landed in the log.
-        // Found while debugging an install where `general_stream_patch_2.mstr`
-        // hit 6 retries and over-counted by ~25MB.
+        // The final unit is only added after the touchup.
         self.completed_bytes.load(Ordering::SeqCst) >= self.total_bytes
     }
 
@@ -537,6 +532,12 @@ impl ContentManager {
         }
         self.queue.paused = true;
         self.queue.save().await
+    }
+
+    /// Start the next queued install unless something is downloading or the
+    /// queue is paused. Installs interrupted by a previous exit resume here.
+    pub async fn start_queue(&mut self) -> Result<(), ContentManagerError> {
+        self.advance().await
     }
 
     /// Lift a pause and start the next queued install, if any.
