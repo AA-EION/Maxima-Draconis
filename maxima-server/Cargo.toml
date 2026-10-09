@@ -17,12 +17,16 @@ path = "src/main.rs"
 # default so the standard Linux/server build stays headless + dep-free. See
 # docs/MACOS_BUNDLING.md.
 linux-tray = ["dep:ksni"]
+# EA's social gRPC presence backend (MAXIMA_PRESENCE_BACKEND=grpc|auto). Off by
+# default; adds tonic/hyper/rustls 0.23. See maxima-lib/src/presence/.
+presence-grpc = ["maxima-lib/presence-grpc"]
 
 [build-dependencies]
 # Embeds logo.ico + version info into maxima-server.exe (Windows only).
 maxima-resources = { path = "../maxima-resources" }
 
 [dependencies]
+serde = "1"
 maxima-lib = { path = "../maxima-lib" }
 maxima-proto = { path = "../maxima-proto" }
 tokio = { version = "1.28.2", features = [ "full", "rt", "rt-multi-thread", "time", "net" ] }

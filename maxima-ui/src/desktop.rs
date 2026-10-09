@@ -1,5 +1,5 @@
 use log::{error, info};
-use maxima::util::native::{maxima_dir, NativeError, SafeParent};
+use maxima::util::native::{maxima_cache_dir, maxima_dir, NativeError, SafeParent, APP_ID};
 use std::collections::HashMap;
 use std::process::{Command, Output};
 use thiserror::Error;
@@ -25,7 +25,7 @@ pub fn check_desktop_icon() -> Result<(), DesktopError> {
     let desktop_file_path = maxima_dir
         .safe_parent()?
         .join("applications")
-        .join("io.github.ArmchairDevelopers.Maxima.desktop");
+        .join(format!("{APP_ID}.desktop"));
     if desktop_file_path.exists() {
         return Ok(());
     }
@@ -43,7 +43,7 @@ pub fn check_desktop_icon() -> Result<(), DesktopError> {
     };
 
     if icon {
-        let png_path_temp = &maxima_dir.join("32.png");
+        let png_path_temp = &maxima_cache_dir()?.join("32.png");
         std::fs::write(
             png_path_temp,
             include_bytes!("../../maxima-resources/assets/logo.png"),

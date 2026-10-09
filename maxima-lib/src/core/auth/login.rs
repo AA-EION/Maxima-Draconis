@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use lazy_static::lazy_static;
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::core::{auth::storage::AuthError, clients::JUNO_PC_CLIENT_ID};
@@ -12,10 +14,38 @@ lazy_static! {
         Regex::new(r"^([A-Za-z]+) +(.*) +(HTTP/[0-9][.][0-9])").unwrap();
 }
 
+/// Port EA's `qrc://` login redirect is forwarded to on the host loopback.
+pub const LOGIN_CALLBACK_PORT: u16 = 31033;
+const LOGIN_WAIT: Duration = Duration::from_secs(300);
+
+/// Bind the login callback. EA redirects every login to the same port, and
+/// the host and every Wine prefix share one loopback, so only one Maxima can
+/// log in at a time: wait for another login to finish rather than fail.
+async fn bind_login_callback() -> Result<TcpListener, AuthError> {
+    let deadline = tokio::time::Instant::now() + LOGIN_WAIT;
+    let mut announced = false;
+    loop {
+        match TcpListener::bind(("127.0.0.1", LOGIN_CALLBACK_PORT)).await {
+            Ok(listener) => return Ok(listener),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                if !announced {
+                    log::info!("Another Maxima login is in progress; waiting for it to finish...");
+                    announced = true;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result<(), AuthError> {
     let auth_url = context.nucleus_auth_url(JUNO_PC_CLIENT_ID, "code")?;
     // Bind before opening the browser so a fast redirect can't beat us.
-    let listener = TcpListener::bind("127.0.0.1:31033").await?;
+    let listener = bind_login_callback().await?;
     // Not fatal: a detached server (or a headless box) may have no browser
     // handler, and the user can still open the logged URL by hand.
     if let Err(err) = open::that(&auth_url) {
@@ -62,14 +92,28 @@ pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result
                         .map(querystring::querify)
                         .ok_or(AuthError::Query)?;
 
-                    for query in query {
-                        if query.0 == "code" {
-                            context.set_code(query.1);
-                            return Ok(());
-                        }
+                    // EA may or may not echo `state`; when it does, it must be
+                    // ours. PKCE still binds the code to this login either way.
+                    let state = query.iter().find(|(k, _)| *k == "state").map(|(_, v)| *v);
+                    if state.is_some_and(|s| s != context.state()) {
+                        log::warn!("Ignoring a login redirect meant for another Maxima instance");
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        continue;
                     }
 
-                    return Err(AuthError::NoAuthCode.into());
+                    let code = query.iter().find(|(k, _)| *k == "code").map(|(_, v)| *v);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    match code {
+                        Some(code) => {
+                            context.set_code(code);
+                            return Ok(());
+                        }
+                        None => return Err(AuthError::NoAuthCode.into()),
+                    }
                 }
             }
             read_res = stdin_reader.read_line(&mut stdin_line), if stdin_open => {

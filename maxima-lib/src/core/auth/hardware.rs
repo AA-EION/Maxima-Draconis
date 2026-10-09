@@ -3,15 +3,16 @@ use gethostname::gethostname;
 use hex::ToHex;
 use regex::Regex;
 use ring::digest::SHA1_FOR_LEGACY_USE_ONLY;
+use std::path::Path;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::CpuidResult;
 use thiserror::Error;
 
-/// aarch64 has no cpuid; same-shape stand-in so the hash composition code
-/// stays portable. Zeroed flags are fine — the hash only needs per-machine
-/// stability, not real x86 feature bits.
+/// Stand-in for architectures without a cpuid instruction (aarch64). Same
+/// shape as `core::arch::x86_64::CpuidResult` so the hash composition code
+/// is shared; the registers are always zero there (see `cpu::detect_arm`).
 #[cfg(not(target_arch = "x86_64"))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuidResult {
     pub eax: u32,
     pub ebx: u32,
@@ -65,8 +66,10 @@ pub enum HardwareHashError {
 }
 
 impl HardwareInfo {
+    /// `wine_prefix` is the Wine prefix the hash is for (unix: its creation
+    /// time is part of the identity); ignored on Windows.
     #[cfg(windows)]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, _wine_prefix: Option<&Path>) -> Self {
         use std::collections::HashMap;
 
         use log::warn;
@@ -162,7 +165,7 @@ impl HardwareInfo {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, wine_prefix: Option<&Path>) -> Self {
         use std::{fs, path::Path, process::Command};
 
         let board_manufacturer = match fs::read_to_string("/sys/class/dmi/id/board_vendor") {
@@ -180,7 +183,7 @@ impl HardwareInfo {
         };
 
         let bios_sn = String::from("Serial number");
-        let os_install_date = get_root_creation_str();
+        let os_install_date = get_root_creation_str(wine_prefix);
         let os_sn = String::from("00330-50000-00000-AAOEM");
 
         let mut gpu_pnp_id: Option<String> = None;
@@ -259,7 +262,7 @@ impl HardwareInfo {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, wine_prefix: Option<&Path>) -> Self {
         use std::process::Command;
 
         use smbioslib::{
@@ -293,7 +296,7 @@ impl HardwareInfo {
             bios_sn = bios.serial_number().to_string();
         }
 
-        let os_install_date = get_root_creation_str();
+        let os_install_date = get_root_creation_str(wine_prefix);
         let mut os_sn = String::from("None");
         if let Some(uuid) = bios_data.and_then(|bios| bios.uuid()) {
             os_sn = uuid.to_string();
@@ -371,67 +374,8 @@ impl HardwareInfo {
         }
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
     pub fn get_cpu_details() -> CpuDetails {
-        // No cpuid on Apple Silicon; sysctl gives a stable brand string and
-        // zeroed flags keep the hash deterministic.
-        let brand_name = std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "Apple Silicon".to_string());
-
-        CpuDetails {
-            flags: CpuidResult {
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            },
-            manufacturer: "Apple".to_string(),
-            brand_name,
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub fn get_cpu_details() -> CpuDetails {
-        use core::arch::x86_64::__cpuid;
-
-        let m = unsafe { __cpuid(0) };
-        let flags = unsafe { __cpuid(1) };
-
-        let mut man = Vec::new();
-        for val in [m.ebx, m.edx, m.ecx] {
-            for b in val.to_ne_bytes() {
-                man.push(b);
-            }
-        }
-
-        let mut brand_name = Vec::with_capacity(47);
-        'outer: for eax in [0x80000002, 0x80000003, 0x80000004] {
-            let part = unsafe { __cpuid(eax) };
-            for val in [part.eax, part.ebx, part.ecx, part.edx] {
-                for b in val.to_ne_bytes() {
-                    if b == 0 {
-                        break 'outer;
-                    }
-                    brand_name.push(b);
-                }
-            }
-        }
-        brand_name.resize(47, 0);
-        let brand_name = std::str::from_utf8(&brand_name)
-            .unwrap_or("Unknown")
-            .to_string();
-        let manufacturer = std::str::from_utf8(&man).unwrap_or("Unknown").to_string();
-
-        CpuDetails {
-            flags,
-            manufacturer,
-            brand_name,
-        }
+        cpu::detect()
     }
 
     pub fn generate_mid(&self) -> Result<String, HardwareHashError> {
@@ -522,18 +466,23 @@ impl HardwareInfo {
     }
 }
 
+/// Creation time of the Wine prefix's `drive_c`, standing in for "OS install
+/// date". Without a prefix the user explicitly chose (an auth-time hash has
+/// no game), the epoch default keeps the identity stable instead of
+/// depending on whichever game was set up last.
 #[cfg(unix)]
-fn get_root_creation_str() -> String {
-    use crate::unix::wine::wine_prefix_dir;
+fn get_root_creation_str(wine_prefix: Option<&Path>) -> String {
     use chrono::{TimeZone, Utc};
     use std::{fs, os::unix::fs::MetadataExt};
 
     let date_str = String::from("1970010100:00:00.000000000+0000");
-    let wine_prefix = wine_prefix_dir();
-    if wine_prefix.is_err() {
-        return date_str;
-    }
-    let wine_prefix = wine_prefix.unwrap();
+    let wine_prefix = match wine_prefix
+        .map(Path::to_path_buf)
+        .or_else(crate::unix::prefix::explicit_override)
+    {
+        Some(prefix) => prefix,
+        None => return date_str,
+    };
     let date_str = match fs::metadata(wine_prefix.join("drive_c")) {
         Ok(metadata) => {
             let nsec = (metadata.mtime_nsec() / 1_000_000) * 1_000_000;
@@ -643,18 +592,454 @@ fn get_ea_mac_address() -> Option<String> {
     }
 }
 
+/// CPU identification, one implementation per architecture family.
+///
+/// * x86 / x86_64 read the real `cpuid` leaves, exactly what EA's
+///   `Activation.dll` probes.
+/// * aarch64 has no `cpuid`. The OS-provided CPU description is used
+///   instead (macOS `sysctl`, Linux `/proc/cpuinfo` then `lscpu`, Windows
+///   registry) and the register block is zero. The hash only needs to be
+///   stable per machine, it cannot be made to equal an x86 hash.
+///
+/// Caveat (upstream issue 49): on Windows-on-ARM, and on Linux with
+/// box64/FEX, the *game* runs x86_64-emulated, so its `Activation.dll` sees
+/// the emulated `cpuid` and computes a different hardware hash than a
+/// native-arm64 Maxima does. In those setups run the x86_64 Maxima build
+/// under the same emulation so both sides probe the same CPU. macOS is
+/// different: license validation was validated end to end with the native
+/// arm64 hash.
+mod cpu {
+    use super::{CpuDetails, CpuidResult};
+
+    /// Pure decode of the x86 `cpuid` leaves; `detect` feeds it live values.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(super) fn decode_x86(
+        vendor: CpuidResult,
+        features: CpuidResult,
+        brand_leaves: [CpuidResult; 3],
+    ) -> CpuDetails {
+        let mut man = Vec::new();
+        for val in [vendor.ebx, vendor.edx, vendor.ecx] {
+            for b in val.to_ne_bytes() {
+                man.push(b);
+            }
+        }
+
+        let mut brand_name = Vec::with_capacity(47);
+        'outer: for part in brand_leaves {
+            for val in [part.eax, part.ebx, part.ecx, part.edx] {
+                for b in val.to_ne_bytes() {
+                    if b == 0 {
+                        break 'outer;
+                    }
+                    brand_name.push(b);
+                }
+            }
+        }
+        brand_name.resize(47, 0);
+        let brand_name = std::str::from_utf8(&brand_name)
+            .unwrap_or("Unknown")
+            .to_string();
+        let manufacturer = std::str::from_utf8(&man).unwrap_or("Unknown").to_string();
+
+        CpuDetails {
+            flags: features,
+            manufacturer,
+            brand_name,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn detect() -> CpuDetails {
+        use core::arch::x86_64::__cpuid;
+
+        // SAFETY: cpuid is available on every x86_64 CPU. (Safe fn on newer
+        // toolchains, hence the allow.)
+        #[allow(unused_unsafe)]
+        let details = unsafe {
+            decode_x86(
+                __cpuid(0),
+                __cpuid(1),
+                [
+                    __cpuid(0x80000002),
+                    __cpuid(0x80000003),
+                    __cpuid(0x80000004),
+                ],
+            )
+        };
+        details
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(super) fn detect() -> CpuDetails {
+        detect_arm()
+    }
+
+    /// What the OS tells us about an ARM CPU.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(super) struct ArmCpu {
+        pub manufacturer: Option<String>,
+        pub brand_name: Option<String>,
+    }
+
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn arm_implementer_name(implementer: u32) -> Option<&'static str> {
+        Some(match implementer {
+            0x41 => "ARM",
+            0x42 => "Broadcom",
+            0x43 => "Cavium",
+            0x46 => "Fujitsu",
+            0x48 => "HiSilicon",
+            0x4e => "NVIDIA",
+            0x50 => "Applied Micro",
+            0x51 => "Qualcomm",
+            0x61 => "Apple",
+            0x70 => "Phytium",
+            0xc0 => "Ampere",
+            _ => return None,
+        })
+    }
+
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn parse_hex(value: &str) -> Option<u32> {
+        u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+    }
+
+    /// Parses the first processor block of an arm64 `/proc/cpuinfo`.
+    /// Brand preference: `model name`, then `Hardware`, then a string built
+    /// from `CPU implementer` / `CPU part` (arm64 kernels usually only have
+    /// those).
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(super) fn parse_proc_cpuinfo(text: &str) -> ArmCpu {
+        let mut model_name = None;
+        let mut hardware = None;
+        let mut implementer = None;
+        let mut part = None;
+        let mut seen_processor = false;
+
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                if line.trim().is_empty() && seen_processor {
+                    break;
+                }
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key.to_ascii_lowercase().as_str() {
+                "processor" => seen_processor = true,
+                "model name" if model_name.is_none() && !value.is_empty() => {
+                    model_name = Some(value.to_string())
+                }
+                "hardware" if hardware.is_none() && !value.is_empty() => {
+                    hardware = Some(value.to_string())
+                }
+                "cpu implementer" if implementer.is_none() => implementer = parse_hex(value),
+                "cpu part" if part.is_none() => part = parse_hex(value),
+                _ => {}
+            }
+        }
+
+        let manufacturer = implementer.and_then(arm_implementer_name).map(String::from);
+        let brand_name = model_name.or(hardware).or_else(|| {
+            implementer.map(|imp| match part {
+                Some(part) => format!("ARM implementer 0x{imp:02x} part 0x{part:03x}"),
+                None => format!("ARM implementer 0x{imp:02x}"),
+            })
+        });
+
+        ArmCpu {
+            manufacturer,
+            brand_name,
+        }
+    }
+
+    /// Parses `lscpu` output (`Vendor ID` / `Model name`).
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(super) fn parse_lscpu(text: &str) -> ArmCpu {
+        let mut cpu = ArmCpu::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match key.trim() {
+                "Vendor ID" if cpu.manufacturer.is_none() => {
+                    cpu.manufacturer = Some(value.to_string())
+                }
+                "Model name" if cpu.brand_name.is_none() => {
+                    cpu.brand_name = Some(value.to_string())
+                }
+                _ => {}
+            }
+        }
+        cpu
+    }
+
+    /// `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`.
+    #[cfg(windows)]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn read_os_cpu() -> ArmCpu {
+        use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
+
+        let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+        let Ok(key) = key else {
+            return ArmCpu::default();
+        };
+        let non_empty = |v: String| Some(v.trim().to_string()).filter(|v| !v.is_empty());
+        ArmCpu {
+            manufacturer: key
+                .get_value::<String, _>("VendorIdentifier")
+                .ok()
+                .and_then(non_empty),
+            brand_name: key
+                .get_value::<String, _>("ProcessorNameString")
+                .ok()
+                .and_then(non_empty),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn read_os_cpu() -> ArmCpu {
+        let brand_name = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        ArmCpu {
+            manufacturer: Some("Apple".to_string()),
+            brand_name,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn read_os_cpu() -> ArmCpu {
+        let mut cpu = std::fs::read_to_string("/proc/cpuinfo")
+            .map(|t| parse_proc_cpuinfo(&t))
+            .unwrap_or_default();
+
+        if cpu.brand_name.is_none() || cpu.manufacturer.is_none() {
+            let lscpu = std::process::Command::new("lscpu")
+                .env("LC_ALL", "C")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| parse_lscpu(&String::from_utf8_lossy(&o.stdout)))
+                .unwrap_or_default();
+            cpu.manufacturer = cpu.manufacturer.or(lscpu.manufacturer);
+            cpu.brand_name = cpu.brand_name.or(lscpu.brand_name);
+        }
+        cpu
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    fn read_os_cpu() -> ArmCpu {
+        ArmCpu::default()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_arch = "x86_64")))]
+    fn warn_native_arm_caveat() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::warn!(
+                "Running natively on aarch64: the hardware hash is computed from the ARM CPU \
+                 description, not from cpuid. If the game runs x86_64-emulated here (Windows on \
+                 ARM, box64/FEX), its Activation.dll sees the emulated cpuid and computes a \
+                 different hash, so license validation can fail. Use the x86_64 Maxima build \
+                 under the same emulation instead."
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_arm() -> CpuDetails {
+        #[cfg(not(target_os = "macos"))]
+        warn_native_arm_caveat();
+
+        let cpu = read_os_cpu();
+        CpuDetails {
+            flags: CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+            manufacturer: cpu.manufacturer.unwrap_or_else(|| "ARM".to_string()),
+            brand_name: cpu.brand_name.unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    "Apple Silicon".to_string()
+                } else {
+                    "ARM Processor".to_string()
+                }
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Guards the Apple Silicon path: no SMBIOS, no cpuid, no PCI GPU ids —
-    // HardwareInfo::new must still produce a non-empty hash without panicking.
+    // Guards the non-x86 path (Apple Silicon: no SMBIOS, no cpuid, no PCI GPU
+    // ids): HardwareInfo::new must still produce a non-empty hash without
+    // panicking.
     #[test]
     fn hardware_info_builds_without_panicking() {
         for version in [1, 2] {
-            let info = HardwareInfo::new(version);
+            let info = HardwareInfo::new(version, None);
             assert!(!info.generate_hardware_hash().is_empty());
             assert!(!info.generate_mid().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn live_cpu_details_are_populated() {
+        let cpu = HardwareInfo::get_cpu_details();
+        assert!(!cpu.manufacturer.is_empty());
+        assert!(!cpu.brand_name.is_empty());
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(
+            cpu.flags,
+            CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0
+            }
+        );
+    }
+
+    fn fixed_info(version: u32) -> HardwareInfo {
+        HardwareInfo {
+            version,
+            board_manufacturer: "ASUSTeK COMPUTER INC.".into(),
+            board_sn: "210123456789".into(),
+            bios_manufacturer: "American Megatrends Inc.".into(),
+            bios_sn: "Default string".into(),
+            os_install_date: "20230415123456.000000+000".into(),
+            os_sn: "00330-80000-00000-AA123".into(),
+            disk_sn: "S4EVNX0R123456".into(),
+            volume_sn: "a1b2c3d4".into(),
+            gpu_pnp_id: Some("PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000&REV_A1".into()),
+            mac: None,
+            cpu_details: CpuDetails {
+                flags: CpuidResult {
+                    eax: 0x000A0671,
+                    ebx: 0,
+                    ecx: 0x7FFAFBFF,
+                    edx: 0xBFEBFBFF,
+                },
+                manufacturer: "GenuineIntel".into(),
+                brand_name: "Intel(R) Core(TM) i9-11900K @ 3.50GHz".into(),
+            },
+            hostname: "DESKTOP-TEST".into(),
+        }
+    }
+
+    // Pins the hash composition (field order, `{:x}` vs `{:02x}` quirk below
+    // v4, brand-name suffix from v2) with fixed inputs. Expected values were
+    // computed independently of the Rust code and match the pre-refactor
+    // implementation, so x86_64 hashes must never change.
+    #[test]
+    fn hardware_hash_composition_is_pinned() {
+        let expected = [
+            (0, "1cf677e1aa2c96f952e627af7229e4448fd817"),
+            (1, "1cf677e1aa2c96f952e627af7229e4448fd817"),
+            (2, "d22d90fe3a1a7f18df429b7c4d5f98b432f35fc"),
+            (3, "7b7fd8c1e78931cd3a75e8b4c94def0d991c"),
+            (4, "534f21c4aaee7d0b73deb80dd56c68de21b2d327"),
+            (5, "534f21c4aaee7d0b73deb80dd56c68de21b2d327"),
+        ];
+        for (version, hash) in expected {
+            assert_eq!(fixed_info(version).generate_hardware_hash(), hash);
+        }
+    }
+
+    // Pins the cpuid decoding with fixed registers ("GenuineIntel" is
+    // EBX,EDX,ECX of leaf 0; the brand string is leaves 0x80000002..4 and is
+    // NUL-padded to 47 bytes).
+    #[test]
+    fn x86_cpuid_decoding_is_pinned() {
+        let reg = |s: &[u8; 4]| u32::from_ne_bytes(*s);
+        let leaf = |a: &[u8; 4], b: &[u8; 4], c: &[u8; 4], d: &[u8; 4]| CpuidResult {
+            eax: reg(a),
+            ebx: reg(b),
+            ecx: reg(c),
+            edx: reg(d),
+        };
+        let vendor = CpuidResult {
+            eax: 0x16,
+            ebx: reg(b"Genu"),
+            edx: reg(b"ineI"),
+            ecx: reg(b"ntel"),
+        };
+        let features = CpuidResult {
+            eax: 0x000A0671,
+            ebx: 0x00100800,
+            ecx: 0x7FFAFBFF,
+            edx: 0xBFEBFBFF,
+        };
+        let brand = [
+            leaf(b"Inte", b"l(R)", b" Cor", b"e(TM"),
+            leaf(b") i9", b"-119", b"00K ", b"@ 3."),
+            leaf(b"50GH", b"z\0\0\0", b"\0\0\0\0", b"\0\0\0\0"),
+        ];
+
+        let cpu = cpu::decode_x86(vendor, features, brand);
+        assert_eq!(cpu.manufacturer, "GenuineIntel");
+        assert_eq!(cpu.flags, features);
+        let mut brand_name = String::from("Intel(R) Core(TM) i9-11900K @ 3.50GHz");
+        while brand_name.len() < 47 {
+            brand_name.push('\0');
+        }
+        assert_eq!(cpu.brand_name, brand_name);
+    }
+
+    #[test]
+    fn arm_proc_cpuinfo_parsing() {
+        let apple = "processor\t: 0\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd\n\
+                     CPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x0\n\
+                     CPU part\t: 0x023\nCPU revision\t: 0\n\nprocessor\t: 1\nCPU implementer\t: 0x41\n";
+        let cpu = cpu::parse_proc_cpuinfo(apple);
+        assert_eq!(cpu.manufacturer.as_deref(), Some("Apple"));
+        assert_eq!(
+            cpu.brand_name.as_deref(),
+            Some("ARM implementer 0x61 part 0x023")
+        );
+
+        let named = "processor : 0\nmodel name : Neoverse-N1\nCPU implementer : 0x41\n\
+                     CPU part : 0xd0c\n\nHardware : ignored second block\n";
+        let cpu = cpu::parse_proc_cpuinfo(named);
+        assert_eq!(cpu.manufacturer.as_deref(), Some("ARM"));
+        assert_eq!(cpu.brand_name.as_deref(), Some("Neoverse-N1"));
+
+        let hw = "Processor : AArch64 Processor rev 4 (aarch64)\nprocessor : 0\n\
+                  CPU implementer : 0x51\nCPU part : 0x800\nHardware : Qualcomm Technologies, Inc SDM845\n";
+        let cpu = cpu::parse_proc_cpuinfo(hw);
+        assert_eq!(cpu.manufacturer.as_deref(), Some("Qualcomm"));
+        assert_eq!(
+            cpu.brand_name.as_deref(),
+            Some("Qualcomm Technologies, Inc SDM845")
+        );
+
+        assert_eq!(cpu::parse_proc_cpuinfo(""), cpu::ArmCpu::default());
+    }
+
+    #[test]
+    fn arm_lscpu_parsing() {
+        let out = "Architecture:        aarch64\nVendor ID:           ARM\n\
+                   Model name:          Cortex-A72\nModel:               3\n";
+        let cpu = cpu::parse_lscpu(out);
+        assert_eq!(cpu.manufacturer.as_deref(), Some("ARM"));
+        assert_eq!(cpu.brand_name.as_deref(), Some("Cortex-A72"));
     }
 }

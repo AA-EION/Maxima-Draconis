@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     content::{
         downloader::{DownloadError, ZipDownloader},
+        exclusion::get_exclusion_list,
         zip::{self, CompressionType, ZipError, ZipFileEntry},
         ContentService,
     },
@@ -29,15 +30,17 @@ use crate::{
         service_layer::ServiceLayerError,
         MaximaEvent,
     },
+    gameinfo::GameInstallInfo,
     util::native::{maxima_dir, NativeError},
 };
 
 const QUEUE_FILE: &str = "download_queue.json";
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
 /// Filename of the completion marker written into a game's install
 /// directory when ContentManager observes the download as `is_done()`.
 ///
-/// External launchers (notably Draconis on macOS/CrossOver) poll for
+/// External launchers (e.g. on macOS/CrossOver) poll for
 /// this file's presence to decide that an install is **truly**
 /// complete — not just that the game's exe exists. "Exe exists" can
 /// be true mid-download for size-padded files or partially-extracted
@@ -62,7 +65,7 @@ pub struct InstallMarker {
     /// ignore unknown fields.
     pub schema: u32,
     /// The offer the install was queued against (e.g.
-    /// `Origin.OFR.50.0001456` for Titanfall 2).
+    /// `Origin.OFR.50.0000001`).
     pub offer_id: String,
     /// The build that landed on disk (lets consumers tell whether the
     /// installed copy matches the current live build later).
@@ -76,11 +79,33 @@ pub struct InstallMarker {
     pub maxima_lib_version: String,
 }
 
-#[derive(Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedGame {
     offer_id: String,
     build_id: String,
     path: PathBuf,
+    /// Library slug: keys the install record and the per-game exclusion
+    /// file. Empty for entries queued by older versions, which then get
+    /// neither.
+    #[builder(default)]
+    #[serde(default)]
+    slug: String,
+    /// Wine prefix (unix) the game is installed into / will run in. Carried
+    /// with the queue entry so the touchup and the install record use the
+    /// prefix chosen when the install was requested, however long the
+    /// download is queued.
+    #[builder(default)]
+    #[serde(default)]
+    wine_prefix: Option<PathBuf>,
+    /// Extra glob patterns (on top of the game's exclusion file) for files
+    /// that must not be downloaded.
+    #[builder(default)]
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// Locale to record in the install record (e.g. `en_US`).
+    #[builder(default)]
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[derive(Default, Getters, Serialize, Deserialize)]
@@ -132,6 +157,8 @@ pub enum DownloaderError {
     EntrySize { requested: u64, entry: usize },
     #[error("unsupported compression type `{0:?}`")]
     CompressionType(CompressionType),
+    #[error("{failed} of {total} files failed to download")]
+    FilesFailed { failed: usize, total: usize },
 }
 
 impl DownloadQueue {
@@ -141,13 +168,16 @@ impl DownloadQueue {
             return Ok(Self::default());
         }
 
-        let data = fs::read_to_string(file).await?;
-        let result = serde_json::from_str(&data);
-        if result.is_err() {
-            return Ok(Self::default());
+        let data = fs::read_to_string(&file).await?;
+        match serde_json::from_str(&data) {
+            Ok(queue) => Ok(queue),
+            Err(err) => {
+                let backup = file.with_extension("json.bak");
+                error!("Corrupt download queue, moved to {}: {err}", backup.display());
+                let _ = fs::rename(&file, &backup).await;
+                Ok(Self::default())
+            }
         }
-
-        Ok(result?)
     }
 
     pub(crate) async fn save(&self) -> Result<(), ContentManagerError> {
@@ -157,24 +187,37 @@ impl DownloadQueue {
     }
 
     pub fn push_to_current(&mut self, game: QueuedGame) {
-        if let Some(current) = &self.current {
-            self.queued.push(current.clone());
+        if let Some(current) = self.current.take() {
+            self.queued.insert(0, current);
         }
+        self.current = Some(game);
+    }
 
-        self.current = Some(game.clone());
+    fn pop_next(&mut self) -> Option<QueuedGame> {
+        (!self.queued.is_empty()).then(|| self.queued.remove(0))
+    }
+
+    fn forget(&mut self, offer_id: &str) {
+        if self.current.as_ref().is_some_and(|g| g.offer_id == offer_id) {
+            self.current = None;
+        }
+        self.queued.retain(|g| g.offer_id != offer_id);
     }
 }
 
 pub struct GameDownloader {
     offer_id: String,
+    install_info: GameInstallInfo,
+    slug: String,
+    wine_prefix: Option<PathBuf>,
 
     downloader: Arc<ZipDownloader>,
     entries: Vec<ZipFileEntry>,
 
     cancel_token: CancellationToken,
     completed_bytes: Arc<AtomicUsize>,
-    total_count: usize,
     total_bytes: usize,
+    failure: Arc<Mutex<Option<String>>>,
     notify: Arc<Notify>,
 }
 
@@ -191,133 +234,174 @@ impl GameDownloader {
 
         let downloader = ZipDownloader::new(&game.offer_id, &url.url(), &game.path).await?;
 
+        let exclusion = get_exclusion_list(&game.slug, &game.exclude);
         let mut entries = Vec::new();
+        let mut excluded = 0usize;
         for ele in downloader.manifest().entries() {
-            // TODO: Filtering
+            if exclusion.is_match(ele.name()) {
+                excluded += 1;
+                continue;
+            }
             entries.push(ele.clone());
         }
+        if excluded > 0 {
+            info!(
+                "Excluding {} file(s) from the download ({} pattern(s))",
+                excluded,
+                exclusion.patterns().len()
+            );
+        }
 
-        let total_count = entries.len();
+        let mut install_info = GameInstallInfo::new(game.path.clone(), game.wine_prefix.clone())
+            .with_offer(&game.offer_id, Some(&game.build_id))
+            .with_exclude(game.exclude.clone());
+        if let Some(locale) = &game.locale {
+            install_info = install_info.with_locale(locale);
+        }
+        if !game.slug.is_empty() {
+            install_info = install_info.with_slug(&game.slug);
+        }
+
         let total_bytes = entries
             .iter()
             .map(|x| *x.compressed_size() as usize)
             .sum::<usize>()
-            + 1; // Add 1 to account for running touchup at the end. Bad solution, but we're a bit rushed
+            + 1; // the final unit is the touchup step
 
         Ok(GameDownloader {
             offer_id: game.offer_id.to_owned(),
+            install_info,
+            slug: game.slug.clone(),
+            wine_prefix: game.wine_prefix.clone(),
 
             downloader: Arc::new(downloader),
             entries,
             cancel_token: CancellationToken::new(),
             completed_bytes: Arc::new(AtomicUsize::new(0)),
-            total_count,
             total_bytes,
+            failure: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
         })
     }
 
     pub fn download(&self) {
-        let (downloader_arc, entries, cancel_token, completed_bytes, notify) =
-            self.prepare_download_vars();
-        let total_count = self.total_count;
+        let downloader = self.downloader.clone();
+        let entries = self.entries.clone();
+        let cancel_token = self.cancel_token.clone();
+        let completed_bytes = self.completed_bytes.clone();
+        let failure = self.failure.clone();
+        let notify = self.notify.clone();
+        let offer_id = self.offer_id.clone();
+        let install_info = self.install_info.clone();
+        let slug = self.slug.clone();
+        let wine_prefix = self.wine_prefix.clone();
+
         tokio::spawn(async move {
-            let dl = GameDownloader::start_downloads(
-                total_count,
-                downloader_arc,
+            let result = GameDownloader::start_downloads(
+                downloader,
                 entries,
                 cancel_token,
                 completed_bytes,
-                notify,
+                install_info,
+                slug,
+                wine_prefix,
             )
             .await;
-            if let Err(err) = dl {
-                error!("Error when downloading!: `{:?}", err)
+            if let Err(err) = result {
+                error!("Install of {offer_id} failed: {err}");
+                *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
             }
+            notify.notify_one();
         });
     }
 
-    fn prepare_download_vars(
-        &self,
-    ) -> (
-        Arc<ZipDownloader>,
-        Vec<ZipFileEntry>,
-        CancellationToken,
-        Arc<AtomicUsize>,
-        Arc<Notify>,
-    ) {
-        (
-            self.downloader.clone(),
-            self.entries.clone(),
-            self.cancel_token.clone(),
-            self.completed_bytes.clone(),
-            self.notify.clone(),
-        )
-    }
-
     async fn start_downloads(
-        total_count: usize,
-        downloader_arc: Arc<ZipDownloader>,
+        downloader: Arc<ZipDownloader>,
         entries: Vec<ZipFileEntry>,
         cancel_token: CancellationToken,
         completed_bytes: Arc<AtomicUsize>,
-        notify: Arc<Notify>,
+        mut install_info: GameInstallInfo,
+        slug: String,
+        wine_prefix: Option<PathBuf>,
     ) -> Result<(), DownloaderError> {
-        let mut handles = Vec::with_capacity(total_count);
+        let total = entries.len();
+        let failed = Arc::new(AtomicUsize::new(0));
 
-        for i in 0..total_count {
-            let downloader = downloader_arc.clone();
-            let ele = entries[i].clone();
-
+        let downloads = entries.into_iter().map(|ele| {
+            let downloader = downloader.clone();
             let cancel_token = cancel_token.clone();
             let completed_bytes = completed_bytes.clone();
+            let failed = failed.clone();
 
-            handles.push(async move {
-                if ele.name().contains("Cleanup") {
-                    info!("Ele: {:?}", ele);
-                }
-
+            async move {
                 tokio::select! {
                     result = downloader.download_single_file(&ele, Some(Box::new(move |bytes| {
                         completed_bytes.fetch_add(bytes, Ordering::SeqCst);
                     }))) => {
                         if let Err(err) = result {
-                            error!("File download failed: {}", err);
+                            error!("Download of {} failed: {}", ele.name(), err);
+                            failed.fetch_add(1, Ordering::SeqCst);
                         }
                     },
-                    _ = cancel_token.cancelled() => {
-                        info!("Download of {} cancelled", ele.name());
-                    },
+                    _ = cancel_token.cancelled() => {},
                 }
-            });
-        }
+            }
+        });
 
-        let _results = futures::stream::iter(handles)
-            .buffer_unordered(16)
-            .collect::<Vec<_>>()
+        futures::stream::iter(downloads)
+            .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+            .collect::<Vec<()>>()
             .await;
 
-        let path = downloader_arc.path();
+        if cancel_token.is_cancelled() {
+            info!("Download cancelled; finished files are kept and skipped next time");
+            return Ok(());
+        }
 
-        info!("Files downloaded, running touchup...");
+        let failed = failed.load(Ordering::SeqCst);
+        if failed > 0 {
+            return Err(DownloaderError::FilesFailed { failed, total });
+        }
+
+        let path = downloader.path();
+        info!("Files downloaded");
+
+        // From here on the game is "installed": the record, not any
+        // registry, is what says so (and which prefix it lives in).
+        if !slug.is_empty() {
+            install_info.save_to_json(&slug);
+        }
+
+        info!("Running touchup...");
         let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
 
-        manifest.run_touchup(path).await?;
+        if !slug.is_empty() {
+            if let Some(version) = manifest.version() {
+                install_info.version = Some(version);
+                install_info.save_to_json(&slug);
+            }
+        }
+
+        manifest.run_touchup(path, wine_prefix.as_deref()).await?;
         info!("Installation finished!");
 
         completed_bytes.fetch_add(1, Ordering::SeqCst);
-
-        notify.notify_one();
         Ok(())
     }
 
     pub fn cancel(&self) {
-        info!("Pausing installation of {}", self.offer_id);
+        info!("Stopping installation of {}", self.offer_id);
         self.cancel_token.cancel();
     }
 
+    /// Resolves once the download task has stopped — finished, failed or cancelled.
     pub async fn wait(&self) {
         self.notify.notified().await;
+    }
+
+    /// Why the install failed, once it has.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn is_done(&self) -> bool {
@@ -332,7 +416,7 @@ impl GameDownloader {
         // single retried file pushed the counter past `total_bytes` and
         // `is_done()` returned false forever — install hung silently
         // forever after "Installation finished!" landed in the log.
-        // Found while debugging a TF2 install where `general_stream_patch_2.mstr`
+        // Found while debugging an install where `general_stream_patch_2.mstr`
         // hit 6 retries and over-counted by ~25MB.
         self.completed_bytes.load(Ordering::SeqCst) >= self.total_bytes
     }
@@ -353,6 +437,11 @@ impl GameDownloader {
     pub fn offer_id(&self) -> &String {
         &self.offer_id
     }
+
+    async fn stop(self) {
+        self.cancel();
+        self.wait().await;
+    }
 }
 
 #[derive(Getters)]
@@ -360,45 +449,54 @@ pub struct ContentManager {
     queue: DownloadQueue,
     service: ContentService,
     current: Option<GameDownloader>,
+    #[getter(skip)]
+    resume: bool,
 }
 
 impl ContentManager {
-    pub async fn new(auth: LockedAuthStorage, _resume: bool) -> Result<Self, ContentManagerError> {
+    pub async fn new(auth: LockedAuthStorage, resume: bool) -> Result<Self, ContentManagerError> {
+        let mut queue = DownloadQueue::load().await?;
+        if !resume {
+            // An install interrupted by a previous exit waits at the front of
+            // the queue instead of restarting behind the user's back.
+            if let Some(stale) = queue.current.take() {
+                queue.queued.insert(0, stale);
+            }
+        }
         Ok(Self {
-            queue: DownloadQueue::load().await?,
+            queue,
             service: ContentService::new(auth),
             current: None,
+            resume,
         })
     }
 
+    /// Start `game` now if nothing is downloading, otherwise queue it.
     pub async fn add_install(&mut self, game: QueuedGame) -> Result<(), ContentManagerError> {
-        if self.queue.queued.is_empty() && self.queue.current == None && self.current.is_none() {
-            self.install_now(game).await?;
+        if self.current.is_none() {
+            self.queue.forget(&game.offer_id);
+            self.install_direct(game).await
         } else {
+            self.queue.queued.retain(|g| g.offer_id != game.offer_id);
             self.queue.queued.push(game);
-            self.queue.save().await?;
+            self.queue.save().await
         }
-
-        Ok(())
     }
 
+    /// Start `game` immediately. Whatever was downloading is stopped and goes
+    /// back to the front of the queue.
     pub async fn install_now(&mut self, game: QueuedGame) -> Result<(), ContentManagerError> {
-        if let Some(current) = &self.current {
-            current.cancel();
-            self.current = None;
+        if let Some(current) = self.current.take() {
+            current.stop().await;
         }
-
-        if let Some(current) = &self.queue.current {
-            if current == &game {
-                self.install_direct(game).await?;
-                return Ok(());
+        if let Some(previous) = self.queue.current.take() {
+            if previous.offer_id != game.offer_id {
+                self.queue.queued.insert(0, previous);
             }
-
-            self.queue.queued.push(current.clone());
         }
-
-        self.install_direct(game).await?;
-        Ok(())
+        self.queue.forget(&game.offer_id);
+        self.queue.paused = false;
+        self.install_direct(game).await
     }
 
     async fn install_direct(&mut self, game: QueuedGame) -> Result<(), ContentManagerError> {
@@ -415,48 +513,112 @@ impl ContentManager {
         Ok(())
     }
 
+    /// Stop the download of `offer_id` if it's running and drop it from the queue.
+    pub async fn cancel_install(&mut self, offer_id: &str) -> Result<(), ContentManagerError> {
+        if self.current.as_ref().is_some_and(|c| c.offer_id == offer_id) {
+            if let Some(current) = self.current.take() {
+                current.stop().await;
+            }
+        }
+        self.queue.forget(offer_id);
+        self.queue.save().await
+    }
+
+    /// Stop the running download and hold the queue until `resume_queue`.
+    /// The paused game stays first in line; files it already finished are skipped when it restarts.
+    pub async fn pause_install(&mut self) -> Result<(), ContentManagerError> {
+        if let Some(current) = self.current.take() {
+            current.stop().await;
+        }
+        if let Some(paused) = self.queue.current.take() {
+            self.queue.queued.insert(0, paused);
+        }
+        self.queue.paused = true;
+        self.queue.save().await
+    }
+
+    /// Lift a pause and start the next queued install, if any.
+    pub async fn resume_queue(&mut self) -> Result<(), ContentManagerError> {
+        self.queue.paused = false;
+        if self.current.is_none() {
+            if let Some(next) = self.queue.pop_next() {
+                return self.install_direct(next).await;
+            }
+        }
+        self.queue.save().await
+    }
+
+    /// Start a queued install right away, stopping (and requeueing) the
+    /// current one.
+    pub async fn move_install_to_top(&mut self, offer_id: &str) -> Result<(), ContentManagerError> {
+        if self.queue.current.as_ref().is_some_and(|g| g.offer_id == offer_id) {
+            return Ok(());
+        }
+        let Some(index) = self.queue.queued.iter().position(|g| g.offer_id == offer_id) else {
+            return Ok(());
+        };
+        let game = self.queue.queued.remove(index);
+        self.install_now(game).await
+    }
+
     pub(crate) async fn update(&mut self) -> Result<Option<MaximaEvent>, ContentManagerError> {
         let mut event = None;
 
         if let Some(current) = &self.current {
-            if current.is_done() {
-                // Snapshot the finished QueuedGame *before* clearing
-                // queue.current — we need its `path` to write the
-                // `FInstall.txt` marker, which Draconis (and any
-                // future external orchestrator) polls to detect
-                // truly-complete installs.
-                let finished = self.queue.current.clone();
+            let failure = current.failure();
+            if failure.is_none() && !current.is_done() {
+                return Ok(None);
+            }
 
-                event = Some(MaximaEvent::InstallFinished(current.offer_id.to_owned()));
-                self.current = None;
-                self.queue.current = None;
+            let offer_id = current.offer_id.to_owned();
+            let finished = self.queue.current.take();
+            self.current = None;
 
-                if let Some(game) = finished {
-                    // Best-effort: a missing marker isn't fatal (the
-                    // install itself succeeded — files are on disk).
-                    // External callers that depend on it will simply
-                    // not see the "done" signal and may need to
-                    // re-trigger or fall back to file-presence checks.
-                    if let Err(err) = write_install_marker(&game).await {
-                        warn!(
-                            "Failed to write {} for offer_id={} at {}: {}",
-                            INSTALL_MARKER_FILENAME,
-                            game.offer_id,
-                            game.path.display(),
-                            err
-                        );
+            match failure {
+                Some(message) => {
+                    event = Some(MaximaEvent::InstallFailed { offer_id, message });
+                }
+                None => {
+                    if let Some(game) = finished {
+                        // Best-effort: the files are on disk either way.
+                        if let Err(err) = write_install_marker(&game).await {
+                            warn!(
+                                "Failed to write {} for offer_id={} at {}: {}",
+                                INSTALL_MARKER_FILENAME,
+                                game.offer_id,
+                                game.path.display(),
+                                err
+                            );
+                        }
+                        self.queue.completed.retain(|g| g.offer_id != game.offer_id);
+                        self.queue.completed.push(game);
                     }
+                    event = Some(MaximaEvent::InstallFinished(offer_id));
                 }
+            }
 
-                if let Some(game) = self.queue.queued.pop() {
-                    self.install_now(game).await?;
-                }
-
-                self.queue.save().await?;
+            self.queue.save().await?;
+            self.advance().await?;
+        } else if self.resume {
+            self.resume = false;
+            if let Some(game) = self.queue.current.take() {
+                self.install_direct(game).await?;
+            } else {
+                self.advance().await?;
             }
         }
 
         Ok(event)
+    }
+
+    async fn advance(&mut self) -> Result<(), ContentManagerError> {
+        if self.current.is_some() || self.queue.paused {
+            return Ok(());
+        }
+        match self.queue.pop_next() {
+            Some(next) => self.install_direct(next).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -489,4 +651,112 @@ async fn write_install_marker(game: &QueuedGame) -> std::io::Result<()> {
     fs::write(&marker_path, body).await?;
     info!("Wrote install marker: {}", marker_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(id: &str) -> QueuedGame {
+        QueuedGame {
+            offer_id: id.into(),
+            build_id: "b".into(),
+            path: PathBuf::from("/g"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn queue_is_first_in_first_out() {
+        let mut queue = DownloadQueue::default();
+        queue.queued = vec![game("a"), game("b"), game("c")];
+        assert_eq!(queue.pop_next().unwrap().offer_id, "a");
+        assert_eq!(queue.pop_next().unwrap().offer_id, "b");
+    }
+
+    #[test]
+    fn interrupted_install_goes_back_to_the_front() {
+        let mut queue = DownloadQueue::default();
+        queue.queued = vec![game("b")];
+        queue.push_to_current(game("a"));
+        queue.push_to_current(game("c"));
+        assert_eq!(queue.current.as_ref().unwrap().offer_id, "c");
+        assert_eq!(queue.pop_next().unwrap().offer_id, "a");
+    }
+
+    #[test]
+    fn forget_drops_current_and_queued_entries() {
+        let mut queue = DownloadQueue::default();
+        queue.current = Some(game("a"));
+        queue.queued = vec![game("a"), game("b")];
+        queue.forget("a");
+        assert!(queue.current.is_none());
+        assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn queue_entries_saved_by_older_versions_still_load() {
+        // download_queue.json from before slugs / prefixes / exclusion existed.
+        let old = r#"{
+            "current": {"offer_id": "Origin.OFR.1", "build_id": "7", "path": "/g/one"},
+            "paused": false,
+            "queued": [{"offer_id": "Origin.OFR.2", "build_id": "8", "path": "/g/two"}],
+            "completed": []
+        }"#;
+        let queue: DownloadQueue = serde_json::from_str(old).unwrap();
+        let current = queue.current.unwrap();
+        assert_eq!(current.slug, "");
+        assert_eq!(current.wine_prefix, None);
+        assert!(current.exclude.is_empty());
+        assert_eq!(current.locale, None);
+        assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn two_games_queue_with_their_own_prefixes() {
+        let a = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.1".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/a".into())
+            .slug("game-a".to_owned())
+            .wine_prefix(Some("/prefixes/a".into()))
+            .exclude(vec!["*.bik".to_owned()])
+            .build()
+            .unwrap();
+        let b = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.2".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/b".into())
+            .slug("game-b".to_owned())
+            .wine_prefix(Some("/prefixes/b".into()))
+            .build()
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.wine_prefix(), &Some(PathBuf::from("/prefixes/a")));
+        assert_eq!(b.wine_prefix(), &Some(PathBuf::from("/prefixes/b")));
+
+        // They survive the on-disk queue round trip independently.
+        let queue = DownloadQueue {
+            current: Some(a.clone()),
+            paused: false,
+            queued: vec![b.clone()],
+            completed: vec![],
+        };
+        let back: DownloadQueue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert_eq!(back.current.as_ref(), Some(&a));
+        assert_eq!(back.queued, vec![b]);
+    }
+
+    #[test]
+    fn builder_defaults_keep_existing_call_sites_valid() {
+        let game = QueuedGameBuilder::default()
+            .offer_id("o".to_owned())
+            .build_id("b".to_owned())
+            .path("/p".into())
+            .build()
+            .unwrap();
+        assert_eq!(game.slug(), "");
+        assert_eq!(game.wine_prefix(), &None);
+    }
 }

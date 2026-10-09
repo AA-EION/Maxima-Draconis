@@ -1,9 +1,12 @@
 #![allow(non_snake_case)]
 
-use crate::{core::manifest::ManifestError, util::native::platform_path};
+use crate::core::manifest::{
+    bytes_to_string, collect_touchup_args,
+    ManifestError,
+};
 use derive_getters::Getters;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 macro_rules! predip_type {
     (
@@ -46,8 +49,31 @@ predip_type!(
     Executable;
     attr {},
     data {
+        #[serde(default)]
         file_path: String,
+        #[serde(default)]
         parameters: String,
+    }
+);
+
+predip_type!(
+    LocaleInfo;
+    attr {
+        #[serde(default)]
+        locale: String,
+    },
+    data {
+        #[serde(default)]
+        title: String,
+    }
+);
+
+predip_type!(
+    Metadata;
+    attr {},
+    data {
+        #[serde(default)]
+        localeInfo: Vec<PreDiPLocaleInfo>,
     }
 );
 
@@ -55,58 +81,61 @@ fn remove_leading_slash(path: &str) -> &str {
     path.strip_prefix('/').unwrap_or(path)
 }
 
+#[cfg(unix)]
 fn remove_trailing_slash(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
-}
-
-fn remove_trailing_backslash(path: &str) -> &str {
-    path.strip_suffix('\\').unwrap_or(path)
 }
 
 predip_type!(
     Manifest;
     attr {
+        #[serde(default, alias = "@GameVersion")]
         gameVersion: String,
+        #[serde(default, alias = "@ManifestVersion")]
         manifestVersion: String,
     },
     data {
+        #[serde(default)]
+        metadata: PreDiPMetadata,
         executable: PreDiPExecutable,
     }
 );
 
-/// https://www.reddit.com/r/rust/comments/11co87m/comment/ja4sy88
-fn bytes_to_string(bytes: Vec<u8>) -> Option<String> {
-    if let Ok(v) = String::from_utf8(bytes.clone()) {
-        return Some(v);
-    }
-
-    let u16_bytes: Vec<u16> = bytes
-        .chunks_exact(2)
-        .into_iter()
-        .map(|a| u16::from_ne_bytes([a[0], a[1]]))
-        .collect();
-
-    if let Ok(v) = String::from_utf16(&u16_bytes) {
-        return Some(v);
-    }
-
-    None
-}
-
 impl PreDiPManifest {
     pub async fn read(path: &PathBuf) -> Result<Self, ManifestError> {
-        let bytes = tokio::fs::read(path).await?;
-        let string = bytes_to_string(bytes).ok_or(ManifestError::Decode)?;
+        let bytes = crate::core::manifest::read_bytes(path).await?;
+        let string = bytes_to_string(&bytes).ok_or(ManifestError::Decode)?;
 
-        Ok(quick_xml::de::from_str(&string)?)
+        Self::parse(&string)
+    }
+
+    /// `executable` is required: it is what tells a pre-DiP manifest apart
+    /// from a DiP one. Everything else is optional.
+    pub fn parse(string: &str) -> Result<Self, ManifestError> {
+        Ok(quick_xml::de::from_str(string)?)
     }
 
     pub fn version(&self) -> Option<String> {
-        Some(self.attr_gameVersion.clone())
+        let version = self.attr_gameVersion.trim();
+        (!version.is_empty()).then(|| version.to_owned())
+    }
+
+    pub fn title(&self, locale: &str) -> Option<&str> {
+        let infos = &self.metadata.localeInfo;
+        infos
+            .iter()
+            .find(|l| l.attr_locale == locale)
+            .or_else(|| infos.iter().find(|l| l.attr_locale == "en_US"))
+            .or_else(|| infos.first())
+            .map(|l| l.title.as_str())
     }
 
     #[cfg(unix)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
         use log::warn;
 
         use crate::{
@@ -120,67 +149,61 @@ impl PreDiPManifest {
             },
         };
 
-        mx_linux_setup().await?;
+        if self.executable.file_path.trim().is_empty() {
+            return Ok(());
+        }
+
+        let prefix = match wine_prefix {
+            Some(prefix) => prefix.to_path_buf(),
+            None => crate::unix::prefix::ambient()?,
+        };
+        mx_linux_setup(&prefix).await?;
 
         // Clear any interrupted WiX Burn installs (e.g. vcredist killed mid-run)
         // so they start fresh rather than trying to resume from a corrupt checkpoint.
-        if let Err(err) = cleanup_interrupted_burn_installs().await {
+        if let Err(err) = cleanup_interrupted_burn_installs(&prefix).await {
             warn!("Burn cleanup check failed (proceeding with touchup anyway): {err:?}");
         }
 
         let install_path = PathBuf::from(remove_trailing_slash(
             install_path.to_str().ok_or(ManifestError::Decode)?,
         ));
-        let args = self.collect_touchup_args(&install_path)?;
+        let args = collect_touchup_args(&self.executable.parameters, &install_path)?;
 
         let path = install_path.join(remove_leading_slash(&self.executable.file_path));
         let path = case_insensitive_path(path);
-        run_wine_command(path, Some(args), None, true, CommandType::Run).await?;
+        run_wine_command(path, Some(args), None, true, CommandType::Run, &prefix).await?;
 
-        invalidate_mx_wine_registry().await;
+        invalidate_mx_wine_registry(&prefix).await;
         Ok(())
     }
 
     #[cfg(windows)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
-        use crate::util::{native::NativeError, registry::cleanup_interrupted_burn_installs};
-        use tokio::process::Command;
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        _wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
+        use crate::util::{
+            elevation, native::NativeError, registry::cleanup_interrupted_burn_installs,
+        };
+
+        if self.executable.file_path.trim().is_empty() {
+            return Ok(());
+        }
 
         // Clear any interrupted WiX Burn installs (e.g. vcredist killed mid-run)
         // so they start fresh rather than trying to resume from a corrupt checkpoint.
         cleanup_interrupted_burn_installs();
 
-        let args = self.collect_touchup_args(install_path)?;
-        let path = install_path.join(&self.executable.file_path);
+        let args = collect_touchup_args(&self.executable.parameters, install_path)?;
+        let path = install_path.join(remove_leading_slash(&self.executable.file_path));
 
-        let mut binding = Command::new(path);
-        let child = binding.args(args);
-
-        let status = child.spawn()?.wait().await?;
-        if !status.success() {
-            return Err(ManifestError::Native(NativeError::Command(
-                status.code().unwrap_or(0),
-            )));
+        let code = elevation::run_and_wait(&path, &args).await?;
+        if code != 0 {
+            return Err(ManifestError::Native(NativeError::Command(code)));
         }
 
         Ok(())
-    }
-
-    fn collect_touchup_args(&self, install_path: &PathBuf) -> Result<Vec<PathBuf>, ManifestError> {
-        let mut args = Vec::new();
-        for arg in self.executable.parameters.split(" ") {
-            let arg = arg.replace("{locale}", "en_US").replace(
-                "\"{installLocation}\"",
-                platform_path(
-                    remove_trailing_backslash(install_path.to_str().ok_or(ManifestError::Decode)?)
-                        .replace("/", "\\"),
-                )
-                .to_str()
-                .ok_or(ManifestError::Decode)?,
-            );
-
-            args.push(PathBuf::from(arg));
-        }
-        Ok(args)
     }
 }

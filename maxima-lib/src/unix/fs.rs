@@ -32,8 +32,10 @@ pub fn case_insensitive_path(path: PathBuf) -> PathBuf {
             continue;
         }
         let mut found = false;
-        for entry in path.read_dir().unwrap() {
-            if let Ok(entry) = entry {
+        // `path` can be a file (e.g. an exe path used as a folder) or unreadable;
+        // treat that as "not found" instead of panicking.
+        if let Ok(entries) = path.read_dir() {
+            for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().to_lowercase() == part.to_lowercase() {
                     found = true;
                     path.push(entry.file_name());

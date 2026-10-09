@@ -20,7 +20,7 @@ pub static LOGGER: SimpleLogger = SimpleLogger;
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// When true, the logger writes ONLY to the file sink — stdout stays clean.
-/// Used by `--json` subcommands so callers (Draconis, scripts) can parse
+/// Used by `--json` subcommands so callers (launchers, scripts) can parse
 /// stdout as a single JSON document without log noise. The file sink keeps
 /// receiving everything so debugging isn't affected.
 static SUPPRESS_STDOUT: AtomicBool = AtomicBool::new(false);
@@ -135,33 +135,16 @@ impl log::Log for SimpleLogger {
 
 /// Resolves where to write the log file. Precedence:
 /// 1. `$MAXIMA_LOG_FILE` (explicit override — must be an absolute path).
-/// 2. Per-OS sensible default under a `Maxima/Logs` namespace.
+/// 2. `native::maxima_logs_path()` — the shared per-OS log directory.
 /// 3. `None` if no writable location can be determined.
 fn resolve_log_file_path(binary_name: &str) -> Option<PathBuf> {
     if let Ok(p) = env::var("MAXIMA_LOG_FILE") {
         return Some(PathBuf::from(p));
     }
 
-    let dir: Option<PathBuf>;
-    #[cfg(windows)]
-    {
-        // %LOCALAPPDATA%\Maxima\Logs (per-user, always writable in a CrossOver
-        // bottle's drive_c/users/<user>/AppData/Local).
-        dir = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("APPDATA").map(PathBuf::from))
-            .map(|p| p.join("Maxima").join("Logs"));
-    }
-    #[cfg(unix)]
-    {
-        // $XDG_DATA_HOME/maxima/logs or ~/.local/share/maxima/logs
-        dir = env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-            .map(|p| p.join("maxima").join("logs"));
-    }
-
-    dir.map(|d| d.join(format!("{}.log", binary_name)))
+    crate::util::native::maxima_logs_path()
+        .ok()
+        .map(|d| d.join(format!("{}.log", binary_name)))
 }
 
 /// Initialize the logger. `binary_name` is used to derive the default log file

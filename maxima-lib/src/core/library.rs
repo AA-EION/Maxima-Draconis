@@ -13,11 +13,68 @@ use super::{
 };
 #[cfg(unix)]
 use crate::unix::fs::case_insensitive_path;
+use crate::gameinfo::{self, GameInstallInfo};
 use crate::util::native::{NativeError, SafeStr};
-use crate::util::registry::{parse_partial_registry_path, parse_registry_path, RegistryError};
+#[cfg(not(unix))]
+use crate::util::registry::{parse_partial_registry_path, parse_registry_path};
+use crate::util::registry::RegistryError;
 use derive_getters::Getters;
-use std::{collections::HashMap, path::PathBuf, time::SystemTimeError};
+use log::{debug, warn};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::SystemTimeError,
+};
 use thiserror::Error;
+
+/// How far above a registry-resolved path to look for `__Installer`; the
+/// path may name the game's exe (`<dir>/bin/x64/game.exe`) rather than its
+/// install dir.
+const MANIFEST_SEARCH_DEPTH: usize = 5;
+
+fn is_unresolved_registry_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with('[')
+}
+
+/// Resolve a manifest path against a known install root, with no registry
+/// involved: `[HKLM\...\Install Dir]bin\game.exe` becomes
+/// `<root>/bin/game.exe` (everything up to the last `]` is the registry
+/// placeholder the install root replaces); a plain relative path is joined
+/// as is.
+pub fn path_in_install_root(root: &Path, key: &str) -> PathBuf {
+    let relative = match key.rfind(']') {
+        Some(end) => &key[end + 1..],
+        None => key,
+    };
+    let relative = relative.trim_start_matches(['/', '\\']);
+    let relative = if cfg!(unix) {
+        relative.replace('\\', "/")
+    } else {
+        relative.to_owned()
+    };
+
+    let joined = root.join(relative);
+    #[cfg(unix)]
+    let joined = case_insensitive_path(joined);
+    joined
+}
+
+fn has_registry_placeholder(key: &str) -> bool {
+    key.contains('[') && key.contains(']')
+}
+
+fn find_manifest_near(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .take(MANIFEST_SEARCH_DEPTH)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            let candidate = dir.join(MANIFEST_RELATIVE_PATH);
+            #[cfg(unix)]
+            let candidate = case_insensitive_path(candidate);
+            candidate.is_file().then_some(candidate)
+        })
+}
 
 #[derive(Error, Debug)]
 pub enum LibraryError {
@@ -46,6 +103,16 @@ pub enum LibraryError {
     NoVersion(String),
 }
 
+/// The last component of a Windows or Unix style path, registry prefix
+/// (`[HKLM\...\Install Dir]\game.exe`) included.
+fn file_name_of(path: &str) -> Option<String> {
+    path.rsplit(['\\', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Getters)]
 pub struct OwnedOffer {
     slug: String,
@@ -54,36 +121,96 @@ pub struct OwnedOffer {
 }
 
 impl OwnedOffer {
+    /// The install record for this game (`gameinfo/<slug>.json`), if one was
+    /// written by an install or a locate. Independent of any Wine prefix.
+    pub fn install_info(&self) -> Option<GameInstallInfo> {
+        gameinfo::load_game_info(&self.slug)
+    }
+
+    /// The recorded install directory, when it still exists on disk.
+    pub fn install_dir(&self) -> Option<PathBuf> {
+        self.install_info()
+            .map(|info| info.path)
+            .filter(|path| path.is_dir())
+    }
+
+    /// The Wine prefix this game runs in (unix), without creating it.
+    #[cfg(unix)]
+    pub fn wine_prefix(&self) -> Option<PathBuf> {
+        crate::unix::prefix::prefix_for_game(&self.slug, None).ok()
+    }
+
+    /// Resolve a `[REGISTRY]relative` key for this game: against its
+    /// recorded install dir when there is one, otherwise through the
+    /// registry of THIS game's prefix (unix) or the machine registry
+    /// (Windows). `partial` asks for just the install directory.
+    async fn resolve_key(&self, key: &str, partial: bool) -> Result<PathBuf, RegistryError> {
+        if has_registry_placeholder(key) {
+            if let Some(dir) = self.install_dir() {
+                return Ok(if partial {
+                    dir
+                } else {
+                    path_in_install_root(&dir, key)
+                });
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let prefix = crate::unix::prefix::prefix_for_game(&self.slug, None)?;
+            if partial {
+                crate::unix::wine::parse_partial_registry_path_in(&prefix, key).await
+            } else {
+                crate::unix::wine::parse_registry_path_in(&prefix, key).await
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if partial {
+                parse_partial_registry_path(key).await
+            } else {
+                parse_registry_path(key).await
+            }
+        }
+    }
+
     pub async fn is_installed(&self) -> bool {
+        // A record of a successful install (or locate) settles it without
+        // touching any registry.
+        if self.install_dir().is_some() {
+            return true;
+        }
+
         // I would love to throw an error here but that's just not feasible.
         // If you can't grab the path it may as well not be installed.
         let Some(path) = &self.offer.install_check_override().as_ref() else {
             return false;
         };
-        let path = match parse_registry_path(path).await {
-            Ok(path) => path,
-            Err(_) => return false,
-        };
-        // If it wasn't replaced...
-        if path.starts_with("[") {
-            return false;
+
+        if let Ok(path) = self.resolve_key(path, false).await {
+            // If it wasn't replaced...
+            if !is_unresolved_registry_path(&path) {
+                #[cfg(unix)]
+                let path = case_insensitive_path(path);
+                if path.exists() {
+                    return true;
+                }
+            }
         }
-        #[cfg(unix)]
-        let path = case_insensitive_path(path);
-        path.exists()
+
+        // The exact file the override names can be missing (renamed exe, a
+        // different layout) while the game is still there; the installer
+        // manifest near the registered install dir is proof enough.
+        matches!(self.manifest_path().await, Ok(Some(_)))
     }
 
     pub async fn install_check_path(&self) -> Result<String, ManifestError> {
-        Ok(parse_registry_path(
-            &self
-                .offer
-                .install_check_override()
-                .as_ref()
-                .ok_or(ManifestError::NoInstallPath(self.slug.clone()))?,
-        )
-        .await?
-        .safe_str()?
-        .to_owned())
+        let check = self
+            .offer
+            .install_check_override()
+            .as_ref()
+            .ok_or(ManifestError::NoInstallPath(self.slug.clone()))?;
+        Ok(self.resolve_key(check, false).await?.safe_str()?.to_owned())
     }
 
     pub async fn execute_path(&self, trial: bool) -> Result<PathBuf, LibraryError> {
@@ -99,20 +226,46 @@ impl OwnedOffer {
         };
 
         if let Some(path) = path {
-            Ok(parse_registry_path(path).await?)
+            Ok(self.resolve_key(path, false).await?)
         } else {
             Err(LibraryError::NoPath(self.slug.clone()))
         }
     }
 
-    pub async fn installed_version(&self) -> Result<String, LibraryError> {
-        if !self.is_installed().await {
-            return Err(LibraryError::NotInstalled(self.slug.clone()));
+    /// The game executable's file name according to the offer's own data:
+    /// the catalog's execute path, else the local installer manifest. Needs
+    /// no install on disk, so it also works for copies EA has no record of.
+    pub async fn exe_file_name(&self) -> Option<String> {
+        if let Some(name) = self
+            .offer
+            .execute_path_override()
+            .as_deref()
+            .and_then(file_name_of)
+        {
+            return Some(name);
         }
+        self.execute_path(false)
+            .await
+            .ok()
+            .and_then(|path| path.to_str().and_then(file_name_of))
+    }
 
-        let manifest = match self.local_manifest().await? {
-            Some(manifest) => manifest,
-            None => return Err(LibraryError::NoManifest(self.slug.clone())),
+    pub async fn installed_version(&self) -> Result<String, LibraryError> {
+        // Deliberately not gated on `is_installed()`: that depends on the
+        // registry-named file, while the version only needs the manifest.
+        let manifest = match self.local_manifest().await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                return Err(if self.is_installed().await {
+                    LibraryError::NoManifest(self.slug.clone())
+                } else {
+                    LibraryError::NotInstalled(self.slug.clone())
+                })
+            }
+            Err(ManifestError::NoInstallPath(_)) => {
+                return Err(LibraryError::NotInstalled(self.slug.clone()))
+            }
+            Err(err) => return Err(err.into()),
         };
 
         if let Some(version) = manifest.version() {
@@ -122,36 +275,51 @@ impl OwnedOffer {
         }
     }
 
+    /// `Ok(None)` means no installer manifest could be located for this
+    /// offer; a manifest that exists but cannot be parsed is an error.
     pub async fn local_manifest(&self) -> Result<Option<Box<dyn GameManifest>>, ManifestError> {
-        let path = if self
-            .offer
-            .install_check_override()
-            .as_ref()
-            .ok_or(ManifestError::NoInstallPath(self.slug.clone()))?
-            .contains("installerdata.xml")
-        {
-            let ic_path = PathBuf::from(self.install_check_path().await?);
-            #[cfg(unix)]
-            let ic_path = case_insensitive_path(ic_path);
-            ic_path
-        } else {
-            let path = PathBuf::from(
-                parse_partial_registry_path(
-                    &self
-                        .offer
-                        .install_check_override()
-                        .as_ref()
-                        .ok_or(ManifestError::NoInstallPath(self.slug.clone()))?,
-                )
-                .await?
-                .safe_str()?
-                .to_owned(),
-            );
-
-            path.join(MANIFEST_RELATIVE_PATH)
+        let Some(path) = self.manifest_path().await? else {
+            debug!("no installer manifest found for `{}`", self.slug);
+            return Ok(None);
         };
 
         Ok(Some(manifest::read(path).await?))
+    }
+
+    async fn manifest_path(&self) -> Result<Option<PathBuf>, ManifestError> {
+        if let Some(dir) = self.install_dir() {
+            let candidate = dir.join(MANIFEST_RELATIVE_PATH);
+            #[cfg(unix)]
+            let candidate = case_insensitive_path(candidate);
+            if candidate.is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+
+        let check = self
+            .offer
+            .install_check_override()
+            .as_ref()
+            .ok_or(ManifestError::NoInstallPath(self.slug.clone()))?;
+
+        let names_manifest = check.contains("installerdata.xml");
+        let resolved = self.resolve_key(check, !names_manifest).await;
+        let resolved = match resolved {
+            Ok(path) if !is_unresolved_registry_path(&path) => path,
+            Ok(_) => return Ok(None),
+            Err(err) => {
+                warn!("could not resolve install path of `{}`: {err}", self.slug);
+                return Ok(None);
+            }
+        };
+
+        if names_manifest {
+            #[cfg(unix)]
+            let resolved = case_insensitive_path(resolved);
+            return Ok(resolved.is_file().then_some(resolved));
+        }
+
+        Ok(find_manifest_near(&resolved))
     }
 
     pub fn offer_id(&self) -> &String {
@@ -486,5 +654,83 @@ impl GameLibrary {
             ])
             .platforms(vec![ServicePlatform::Pc])
             .build()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_is_found_from_an_exe_path() {
+        let dir = std::env::temp_dir().join(format!("maxima-library-test-{}", std::process::id()));
+        let installer = dir.join("__Installer");
+        std::fs::create_dir_all(&installer).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(installer.join("installerdata.xml"), "<x/>").unwrap();
+
+        let from_dir = find_manifest_near(&dir);
+        let from_exe = find_manifest_near(&dir.join("bin").join("game.exe"));
+        let elsewhere = find_manifest_near(Path::new("nonexistent-maxima-dir/game.exe"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(from_dir.is_some());
+        assert_eq!(from_dir, from_exe);
+        assert!(elsewhere.is_none());
+    }
+
+    #[test]
+    fn manifest_paths_resolve_against_the_install_root() {
+        let root = Path::new("/nonexistent-maxima/games/g");
+        assert_eq!(
+            path_in_install_root(root, r"[HKEY_LOCAL_MACHINE\SOFTWARE\EA Games\G\Install Dir]bin\game.exe"),
+            PathBuf::from("/nonexistent-maxima/games/g/bin/game.exe")
+        );
+        assert_eq!(
+            path_in_install_root(root, r"[HKEY_LOCAL_MACHINE\SOFTWARE\X\Install Dir]\game.exe"),
+            PathBuf::from("/nonexistent-maxima/games/g/game.exe")
+        );
+        assert_eq!(
+            path_in_install_root(root, "Game/launcher.exe"),
+            PathBuf::from("/nonexistent-maxima/games/g/Game/launcher.exe")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_root_resolution_matches_existing_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Bin")).unwrap();
+        std::fs::write(dir.path().join("Bin").join("Game.EXE"), b"").unwrap();
+        assert_eq!(
+            path_in_install_root(dir.path(), r"[HKLM\X\Install Dir]bin\game.exe"),
+            dir.path().join("Bin").join("Game.EXE")
+        );
+    }
+
+    #[test]
+    fn only_bracketed_keys_count_as_registry_placeholders() {
+        assert!(has_registry_placeholder(r"[HKLM\X\Dir]a.exe"));
+        assert!(!has_registry_placeholder(r"C:\Games\a.exe"));
+    }
+
+    #[test]
+    fn unresolved_registry_paths_are_detected() {
+        assert!(is_unresolved_registry_path(Path::new(
+            r"[HKEY_LOCAL_MACHINE\SOFTWARE\X\Install Dir]\game.exe"
+        )));
+        assert!(!is_unresolved_registry_path(Path::new("/games/x")));
+    }
+
+    #[test]
+    fn file_name_of_handles_registry_and_plain_paths() {
+        assert_eq!(
+            file_name_of(r"[HKEY_LOCAL_MACHINE\SOFTWARE\X\Install Dir]\bin\game.exe"),
+            Some("game.exe".to_string())
+        );
+        assert_eq!(file_name_of("/games/x/run.exe"), Some("run.exe".to_string()));
+        assert_eq!(file_name_of("game.exe"), Some("game.exe".to_string()));
+        assert_eq!(file_name_of(r"C:\Games\"), None);
+        assert_eq!(file_name_of(""), None);
     }
 }

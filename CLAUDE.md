@@ -117,8 +117,8 @@ Key entry points:
 |-----------------------------------------------|--------------------------------------------------------------------|
 | `maxima-cli/src/main.rs`                      | CLI argparse + subcommand dispatch (Launch, Serve, ListGames, …)   |
 | `maxima-bootstrap/src/main.rs`                | Protocol URL parser + auth-server probe + HTTP forward / spawn     |
-| `maxima-lib/src/auth_server.rs`               | `GET /` + `POST /authorize?offer_id=X` over plain TCP, port 13219  |
-| `maxima-lib/src/steam.rs`                     | `STEAM_GAMES` table, Steam install path discovery (registry + VDF) |
+| `maxima-lib/src/auth_server.rs`               | token-checked `POST /authorize?offer_id=X` on a free loopback port |
+| `maxima-lib/src/steam.rs`                     | Steam app id → offer (`game-overrides.json`, `appmanifest_*.acf`), Steam library discovery |
 | `maxima-lib/src/core/launch.rs`               | `start_game()` — license preflight, env vars, spawn the game       |
 | `maxima-lib/src/core/auth/login.rs`           | OAuth flow + `remid`-cookie fallback for macOS/CrossOver           |
 | `maxima-lib/src/core/mod.rs`                  | `Maxima` struct, `start_lsx` (with probe), `start_auth_server`     |
@@ -133,6 +133,19 @@ Key entry points:
 
 ---
 
+## Instance isolation — how every client finds *its own* Maxima
+
+Every installation context runs its own Maxima: the host user, and each Wine prefix with Maxima installed inside it. Wine shares the host's loopback interface, so well-known ports would let a client in one bottle (or on the host, or a web page) drive another context's session. There are therefore **no well-known control ports**:
+
+- **`instance.json`** in the context's data dir (`maxima_data_path()`; inside a prefix that is the prefix's own `%APPDATA%\ArmchairDevelopers\Maxima\data`) holds the realm id, state (`awaiting-login` / `ready`), a random **per-run token** and the ports actually bound: `control_port`, `authorize_port`, `lsx_port`. Written atomically (0600 on unix) by `maxima_proto::instance::InstanceGuard`, removed on exit.
+- **`instance.lock`** — the server holds an exclusive lock on it for its lifetime. A second server of the same context exits at startup (no double login when two clients race to spawn one); a file left by a crash is ignored because the lock is free (`maxima_proto::discover`).
+- **Control protocol** — the first line of every connection must be `{"cmd":"hello","token":…,"proto":2}`; anything else gets `{"ok":false,"kind":"unauthorized"}` and the socket is closed. Responses carry `kind` (`unauthorized`, `login-pending`, `incompatible-version`, `invalid`, `busy`, `internal`).
+- **Login** — the server publishes its control port *before* the EA login and answers session requests with `login-pending` until it broadcasts `ready`; clients (`server_client::connect` + `MaximaClient::await_ready`) wait for that. The OAuth callback (31033, fixed by EA's redirect) is the one shared port: a second instance's login waits for the first instead of failing, and an echoed OAuth `state` that isn't ours is ignored (PKCE is the backstop).
+- **`/authorize`** binds a free port and requires the token in `X-Maxima-Token`; requests carrying an `Origin` header (browsers) are refused. The bootstrap reads port + token from its own context's `instance.json`; with no running server it spawns `maxima-cli launch`, which starts one.
+- **LSX** keeps 3216 when free (games launched outside Maxima expect it); when another instance or the EA app holds it, this instance takes a free port and passes it to the games it launches via `EALsxPort`. An explicit `MAXIMA_LSX_PORT` keeps the old "use whoever already serves it" behaviour.
+- **Overrides**: `MAXIMA_DATA_DIR` = a separate instance (own login, own server); `MAXIMA_SERVER_PORT` / `MAXIMA_AUTHORIZE_PORT` / `MAXIMA_LSX_PORT` pin ports (the token is still required).
+- Every frontend goes through this: CLI (`maxima-cli/src/server.rs`), TUI, egui (`server_client::ensure_running`), the Swift app (`Backend.swift` reads `instance.json`, checks the lock with `flock`, sends `hello`), the bootstrap, and `maxima-cli serve` (which takes the same lock and publishes its LSX/authorize ports). `installer/wine-smoke.sh` checks two prefixes on one host stay isolated.
+
 ## Current architecture: two launch paths
 
 A bottle running this fork can authenticate games **two ways**. They use the same underlying `maxima-lib` code; the difference is whether Maxima is treated as a long-running auth service or as an on-demand orchestrator.
@@ -145,9 +158,10 @@ A bottle running this fork can authenticate games **two ways**. They use the sam
 │                                                                      │
 │   maxima-cli                                                         │
 │     ├── log in (cached refresh token, or OAuth on first run)         │
-│     ├── start_lsx()  →  TCP listen 127.0.0.1:3216                    │
-│     └── start_auth_server() → TCP listen 127.0.0.1:13219             │
-│            (HTTP: GET / + POST /authorize?offer_id=X)                │
+│     ├── start_lsx()  →  TCP listen 127.0.0.1:3216 (or a free port)   │
+│     ├── start_auth_server() → TCP listen 127.0.0.1:<free port>       │
+│     │      (HTTP: POST /authorize?offer_id=X, X-Maxima-Token)        │
+│     └── publishes both ports + token in instance.json                │
 │                                                                      │
 │   maxima.playing() = None  (no game launched yet)                    │
 └──────────────────────────────────────────────────────────────────────┘
@@ -168,8 +182,8 @@ A bottle running this fork can authenticate games **two ways**. They use the sam
 │                                                                      │
 │   maxima-bootstrap                                                   │
 │     ├── parses URL, validates Origin.OFR.<digits>.<digits>           │
-│     ├── TCP probe 127.0.0.1:13219 with 200ms timeout                 │
-│     ├── alive → POST http://127.0.0.1:13219/authorize?offer_id=X     │
+│     ├── reads its own context's instance.json (port + token)        │
+│     ├── found → POST http://127.0.0.1:<port>/authorize?offer_id=X    │
 │     │             [&cmd_params=...] with 60s timeout                 │
 │     └── exits (logs outcome to %TEMP%/maxima_execution.log)          │
 └──────────────────────────────────────────────────────────────────────┘
@@ -228,8 +242,8 @@ server ready for the next launch.
 │ Anything emits link2ea:// (or user runs `maxima-cli launch X`)       │
 │                                                                      │
 │   bootstrap parses URL                                               │
-│     ├── TCP probe 127.0.0.1:13219                                    │
-│     └── DEAD → spawns `maxima-cli.exe launch <offer_id>`             │
+│     ├── reads instance.json                                          │
+│     └── no server → spawns `maxima-cli.exe launch <offer_id>`        │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -243,7 +257,7 @@ server ready for the next launch.
 │     │     │     NO → bind ourselves                                  │
 │     │     └── listening                                              │
 │     ├── resolve slug → offer_id (EA library / Origin pattern /       │
-│     │                            STEAM_GAMES table)                  │
+│     │              game-overrides.json / Steam appmanifest)          │
 │     ├── set SteamAppId / SteamGameId env vars if slug is numeric     │
 │     ├── launch::start_game(LaunchOptions { steam_launch })           │
 │     │     ├── request_and_save_license → .dlf on disk                │
@@ -287,13 +301,13 @@ maxima-cli launch titanfall-2    # licenses + launches through CrossOver wine
 
 How it works:
 
-- **Per-game bottles** (`maxima-lib/src/unix/crossover.rs`) — `ensure_game_bottle(slug)` creates/reuses a `Maxima-<slug>` bottle via CodeWeavers' `cxbottle --create --template win11_64|win10_64` (semi-documented CLI shipped with CrossOver). The bottle appears in the CrossOver UI; a custom bottle directory set in CrossOver's prefs is honored (`defaults read com.codeweavers.CrossOver BottleDir`). Selection precedence: explicit `MAXIMA_WINE_PREFIX` env always wins; else the per-game bottle is created and exported via that same env var, so the whole pipeline (license dir, regedit, spawned game) plus child processes follow. `install`/`launch` resolve whatever the user typed to the EA library's canonical slug (`canonical_slug` in `maxima-cli/src/main.rs`) so `titanfall-2`, `Origin.OFR.50.0001456` and `1237970` all land in the same bottle.
-- **Wine invocation** — `run_wine_command` (unix/wine.rs) auto-detects CrossOver's wine loader (`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`) when `MAXIMA_WINE_COMMAND` is unset, sets `CX_BOTTLE` from the prefix basename, and `wine_prefix_dir()` honors `MAXIMA_WINE_PREFIX`. Host env vars propagate through CrossOver's wine into the Windows environment (verified empirically) — that's how the EA-* auth env reaches the game.
+- **Per-game bottles** (`maxima-lib/src/unix/crossover.rs`) — `ensure_game_bottle(slug)` creates/reuses a `Maxima-<slug>` bottle via CodeWeavers' `cxbottle --create --template win11_64|win10_64` (semi-documented CLI shipped with CrossOver). The bottle appears in the CrossOver UI; a custom bottle directory set in CrossOver's prefs is honored (`defaults read com.codeweavers.CrossOver BottleDir`). Prefix selection is per request (`maxima-lib/src/unix/prefix.rs`): an explicit prefix on the request (`--wine-prefix`, proto `wine_prefix`) → `MAXIMA_WINE_PREFIX` (read, never written) → the prefix in the game's install record (`<data>/gameinfo/<slug>.json`) → the per-game default bottle. The chosen prefix is passed explicitly to everything that touches Wine (license dir, regedit, hardware hash, cloud saves, touchup, the spawned game), so one server can install game A into one bottle while launching game B from another. `install`/`launch` resolve whatever the user typed to the EA library's canonical slug (`canonical_slug` in `maxima-cli/src/main.rs`) so `titanfall-2`, `Origin.OFR.50.0001456` and `1237970` all land in the same bottle.
+- **Wine invocation** — `run_wine_command` (unix/wine.rs) auto-detects CrossOver's wine loader (`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`) when `MAXIMA_WINE_COMMAND` is unset, and sets `CX_BOTTLE` from the basename of the prefix it was given. Host env vars propagate through CrossOver's wine into the Windows environment (verified empirically) — that's how the EA-* auth env reaches the game.
 - **`mx_linux_setup` is split by OS** — the linux variant keeps the umu/Proton auto-install; the macOS variant requires a selected bottle and runs `setup_wine_registry` only.
 - **Registry: bare `Wow6432Node\Origin` is load-bearing** — real Origin is 32-bit, so Origin-era titles (TF2) read `HKLM\Software\Wow6432Node\Origin\ClientPath`. Upstream's `setup_wine_registry` didn't write it → "Failed to initialize Origin: The Origin installation couldn't be found [a0020008]" dialog at game boot. Now written (same key the NSIS installer sets for the in-bottle flow). Upstreambar.
 - **Apple Silicon hardware hash** (`core/auth/hardware.rs`) — no SMBIOS and no cpuid on arm64 Macs; both `.unwrap()`-panicked. SMBIOS values fall back to defaults (MAC + disk UUID + hostname keep the hash unique), cpu details come from `sysctl machdep.cpu.brand_string` with a same-shape `CpuidResult` stand-in. Guarded by a unit test (`hardware_info_builds_without_panicking`).
 - **OAuth login needs no bridge** — the native CLI binds the same host loopback `127.0.0.1:31033` that MaximaHelper already forwards `qrc://` to, so login works with Draconis's helper installed, or via the paste-redirect-URL fallback without it.
-- **Loopback is shared** — the game inside the bottle reaches the host's LSX (3216) and authorize (13219) listeners directly; wine does not virtualize networking.
+- **Loopback is shared** — the game inside the bottle reaches the host's LSX and authorize listeners directly; wine does not virtualize networking. That is also why every listener is found through `instance.json` + token rather than a fixed port (see "Instance isolation").
 - **`maxima-bootstrap` (native)** — upstream's half-finished cacao AppKit main now compiles; a failed launch terminates the app instead of hanging the parent's playing-state tracking. `bootstrap_path()` prefers a sibling binary (cargo layout) over the planned `.app` bundle layout.
 
 **Downloader hardening** (all-targets, motivated by a flaky route to EA's CDN — three distinct stall modes observed in one install): every network phase is now bounded and self-healing. Connect 15s; response headers 60s (`RESPONSE_HEADER_TIMEOUT` — a GET on a dead keepalive connection previously hung `send()` forever with no body for the stall guard to watch); body stall 30s without a byte (`DOWNLOAD_STALL_TIMEOUT` via `ByteCountingStream`'s deadline — tolerates any transfer speed, unlike a total cap which kept expiring on slow-but-alive manifest reads); 4-attempt retry with backoff on the manifest fetch (`ZipFile::fetch`, streamed body) and `download_url`; 60s total cap on ServiceLayer JSON calls. Manifests are **cached on disk** after first success (`maxima_dir/cache/manifests/<fnv1a-of-url-path>.json` — the URL path names the immutable build artifact; the `sauth` query token rotates and is excluded), so reruns and repairs skip the CDN's flakiest request entirely.
@@ -314,19 +328,19 @@ game in bottle emits link2ea://…
   → wine HKCR\link2ea → winebrowser.exe   (written by setup_wine_registry, macOS)
   → winebrowser hands the URL to the host's `open`
   → LaunchServices → MaximaBootstrap.app  (registered by `register-protocols`)
-  → bootstrap validates the offer id, probes 127.0.0.1:13219
+  → bootstrap validates the offer id, reads the host instance.json
   → forwards to a running `serve` — or spawns the sibling native `maxima-cli launch`
 ```
 
 `MaximaBootstrap.app` is assembled by `maxima-bootstrap/build-app.sh` from the native binary + an Info.plist claiming the three schemes, and **must be bundle-signed** (the script does `codesign --force --deep --sign -`; LaunchServices silently ignores claims from unsealed bundles — same gotcha as MaximaHelper). `registry.rs::set_up_registry` (macOS) registers it via `lsregister -f` — upstream's spawn-the-binary approach registered nothing. `qrc://` may resolve to Draconis's MaximaHelper.app when installed; that's fine — both forward to the same host loopback `:31033`. The bootstrap's `maxima-cli` fallback spawn walks ancestor dirs so it works from both the flat cargo layout and inside the `.app` bundle.
 
-**`maxima-ui` also runs natively** (smoke-validated 2026-07-04): one missing macOS stub (`check_desktop_icon`) was all the compile needed, and at runtime eframe/wgpu picks **Metal directly** on Apple Silicon — no Wine, no MoltenVK, none of the swapchain workarounds the in-bottle build needs. Login (shared token storage with the CLI), library, RTM, and the LSX server all come up. The UI's launch (`bridge/start_game.rs`) and both install handlers (`bridge_thread.rs`) ensure the per-game bottle the same way the CLI does. Bottle-selection nuance for long-lived processes: `ensure_game_bottle` snapshots a user-set `MAXIMA_WINE_PREFIX` at first use (`USER_PREFIX` OnceLock) so its own env exports for game A aren't mistaken for a user override when game B launches later. `canonical_slug` moved to `maxima-lib` (`GameLibrary::canonical_slug`) so CLI and UI share bottle-naming resolution.
+**`maxima-ui` also runs natively** (smoke-validated 2026-07-04): one missing macOS stub (`check_desktop_icon`) was all the compile needed, and at runtime eframe/wgpu picks **Metal directly** on Apple Silicon — no Wine, no MoltenVK, none of the swapchain workarounds the in-bottle build needs. Login (shared token storage with the CLI), library, RTM, and the LSX server all come up. The UI's launch (`bridge/start_game.rs`) and both install handlers (`bridge_thread.rs`) ensure the per-game bottle the same way the CLI does. Long-lived processes pick the bottle per request (see `unix/prefix.rs`), so switching games switches bottles. `canonical_slug` moved to `maxima-lib` (`GameLibrary::canonical_slug`) so CLI and UI share bottle-naming resolution.
 
-**`maxima-server` — the one process that does everything (added 2026-07-05; separated out of `maxima-cli`).** Its own binary ([maxima-server/](maxima-server/)). It holds the logged-in session, LSX server, `/authorize` endpoint and RTM presence, and serves **many concurrent clients** over loopback TCP (default `127.0.0.1:13220`, `MAXIMA_SERVER_PORT` to override). This is upstream PR [#23](https://github.com/ArmchairDevelopers/Maxima/pull/23)'s "Maxima Server" architecture — one server, frontends as thin clients, state synced. **Nothing interacts with it directly**: the CLI, TUI and GUI are its only clients, each over `maxima-proto`. `maxima-cli` used to *be* the server (`maxima-cli server`); that subcommand is gone — the CLI is now a client that spawns/talks to `maxima-server`. [maxima-cli/src/server.rs](maxima-cli/src/server.rs) is now client-only; the server lives in [maxima-server/src/server.rs](maxima-server/src/server.rs) + [main.rs](maxima-server/src/main.rs) (which owns login).
+**`maxima-server` — the one process that does everything (added 2026-07-05; separated out of `maxima-cli`).** Its own binary ([maxima-server/](maxima-server/)). It holds the logged-in session, LSX server, `/authorize` endpoint and RTM presence, and serves **many concurrent clients** over loopback TCP (a free port published in `instance.json`, or `MAXIMA_SERVER_PORT`; every connection authenticates with `hello` — see "Instance isolation"). This is upstream PR [#23](https://github.com/ArmchairDevelopers/Maxima/pull/23)'s "Maxima Server" architecture — one server, frontends as thin clients, state synced. **Nothing interacts with it directly**: the CLI, TUI and GUI are its only clients, each over `maxima-proto`. `maxima-cli` used to *be* the server (`maxima-cli server`); that subcommand is gone — the CLI is now a client that spawns/talks to `maxima-server`. [maxima-cli/src/server.rs](maxima-cli/src/server.rs) is now client-only; the server lives in [maxima-server/src/server.rs](maxima-server/src/server.rs) + [main.rs](maxima-server/src/main.rs) (which owns login).
 
 - **Wire protocol** (newline-delimited JSON): requests `{"id":N,"cmd":"list-games"|"friends"|"launch"|"install"|"status"|"shutdown",…}`; matched responses `{"id":N,"ok":bool,…}`; and **broadcast events** (no id) pushed to *every* client — `ready`, `presence` diffs, `install-progress`/`install-done`/`install-error`, `game-started`/`game-stopped`. Launch a game from the CLI and a connected UI sees `game-started`; a third-party `link2ea://` that hits `/authorize` broadcasts to all.
 - **CLI is a pure client**: every product command — `list-games`, `install` (incl. `--build-id` / `--replace-files` / `--only-listed-files`), `launch`, `verify` (+`--repair`), `download-specific-file`, `bottle-info`, `register-protocols`, `cloud-sync` — `ensure_server_running`s the `maxima-server` binary (spawning it if down) and forwards over the proto at the very top of startup, before any login/wine setup. The CLI holds no session of its own. Streaming commands (install/verify) translate the server's proto notifications back into the exact JSONL shapes Draconis parses, so its contract is unchanged (verified on macOS: forwarded bottle-info / list-games / register-protocols work). `server-stop` / `server-status` are login-free client commands. The generalized replace-files/verify are **not** TF2-specific — they refresh arbitrary files of any title (the Steam-CEG fix is one caller). Only developer/diagnostic subcommands (`account-info`, `get-user-by-id`, `test-rtm-connection`, …) and `launch --login` (self-contained manual login) remain in-process; the dormant in-process implementations of the forwarded commands are unreachable fallback to be pruned.
-- **Auto-start**: `server::ensure_server_running` (CLI) and `maxima_lib::server_client::ensure_running` (egui) probe the port and spawn the `maxima-server` binary detached if it's down. The CLI keeps waiting while the spawned server is alive (up to 5 min) because the server binds its control port only after login, and a first-run login waits on the user in the browser.
+- **Auto-start**: `maxima_lib::server_client::connect(name, spawn)` (CLI, TUI) and `ensure_running` (egui) check `instance.json` + lock and spawn the `maxima-server` binary detached if there's no server. The server publishes its port before login, so connecting is immediate; clients then wait for `ready` (up to 5 min for a first-run login in the browser).
 - **In a CrossOver bottle the server is never autostarted.** `MaximaSetup.exe` ships `maxima-server.exe` next to the CLI but skips the `HKCU\…\Run` entry when it detects Wine: wineboot replays Run keys whenever the bottle boots, so the server would be started by whatever host process booted the bottle and inherit its macOS responsibility / App Nap state — and every game the server launches would inherit it too (the GUI-launch freeze). Consumers must make their **first** `maxima-cli` call of a session from a disclaimed spawn (Draconis routes all of them through `CleanSpawn`).
 
 **`maxima-proto` — the real typed RPC layer (added 2026-07-05; PR #23's `maxima_proto`).** A standalone crate with **no `maxima-lib` dependency**, so a frontend can be a true thin client without linking the server's EA/auth/LSX/download logic. It carries the wire DTOs ([types.rs](maxima-proto/src/types.rs): `GameDto`, `FriendDto`, `GameDetailsDto`, `PresenceDto`, `StatusDto`), the typed request/response/notification envelopes ([message.rs](maxima-proto/src/message.rs)) that serialize to the **exact** newline-JSON the server always emitted (so the SwiftUI app is unaffected), and a real async [`MaximaClient`](maxima-proto/src/client.rs) — TCP connect, response↔request correlation by id, a broadcast notification stream, typed RPCs (`list_games`/`friends`/`status`/`game_details`/`launch`/`install`/`locate_game`/`cloud_sync`/`shutdown`), `await_ready`, and `connect_or_spawn`. The server ([server.rs](maxima-cli/src/server.rs)) now dispatches these typed requests against the real `Maxima` and maps its rich types onto the DTOs.
@@ -346,7 +360,7 @@ game in bottle emits link2ea://…
 
 **Feature parity between the two Maxima UIs**: the wine-engine picker also exists in the egui UI's settings view (persisted in `FrontendSettings.wine_command`, applied live via the same `MAXIMA_WINE_COMMAND`), along with an auto-detection status line and the CrossOver bottles-dir display. The egui (`maxima-ui`) path is maintained, not replaced — it remains the cross-platform launcher upstream ships; `maxima-native` is the macOS-first face.
 
-Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); Draconis not yet wired to the native binaries; `maxima-native` has no box art (list-games --json carries no image URLs yet) and no per-game settings sheet (launch args / exe override) — both natural next steps.
+Known gaps in native mode: mods that ship a proxy DLL are untested on this path (consumer-side: pass the override per launch, e.g. `--wine-dll-override wsock32=n,b` — Maxima's default overrides carry no game-specific DLLs); Draconis not yet wired to the native binaries; `maxima-native` has no box art (list-games --json carries no image URLs yet) and no per-game settings sheet (launch args / exe override) — both natural next steps.
 
 ---
 
@@ -359,7 +373,7 @@ Known gaps in native mode: Northstar untested on this path (consumer-side: `wsoc
 | `link2ea://` | `maxima-bootstrap.exe`                                   | Wine registry | Probe + HTTP forward to `/authorize`, else spawn `maxima-cli launch`  |
 | `origin2://` | `maxima-bootstrap.exe`                                   | Wine registry | Same as `link2ea://`. Reads real `offerIds` (no longer hardcoded BF2) |
 
-The `qrc://` listener on `127.0.0.1:31033` is **only up during an interactive OAuth login** (inside `core/auth/login.rs::begin_oauth_login_flow`). After the login completes that listener exits. It is **not** the same server as the `/authorize` HTTP endpoint, which lives on port `13219` and runs for the lifetime of `maxima-cli serve` / a UI session.
+The `qrc://` listener on `127.0.0.1:31033` is **only up during an interactive OAuth login** (inside `core/auth/login.rs::begin_oauth_login_flow`). After the login completes that listener exits. It is **not** the same server as the `/authorize` HTTP endpoint, which binds a free port (published in `instance.json`) and runs for the lifetime of the server / `maxima-cli serve`. Because the callback port is shared by every instance on the machine, a login waits while another instance's login holds it.
 
 MaximaHelper.app's bundle id is `com.armchairdevelopers.maxima.helper`. **The Draconis fork's Info.plist must remain signed-sealed** — see "Signing gotcha" below.
 
@@ -369,12 +383,12 @@ MaximaHelper.app's bundle id is `com.armchairdevelopers.maxima.helper`. **The Dr
 
 | Thing                     | TF2 value                               |
 |---------------------------|-----------------------------------------|
-| Steam App ID              | `1237970` (resolved via `STEAM_GAMES` table when EA library lookup fails) |
+| Steam App ID              | `1237970` (resolved via `game-overrides.json` or Steam's `appmanifest_1237970.acf` name when needed) |
 | EA Origin offer id        | `Origin.OFR.50.0001456` (real TF2 offer id, NOT `0002694` / `0002148` which are Apex / Battlefront 2) |
 | MaximaHelper bundle id    | `com.armchairdevelopers.maxima.helper`  |
 | MaximaHelper qrc port     | `127.0.0.1:31033` inside Wine            |
-| LSX port                  | `127.0.0.1:3216` (override via `MAXIMA_LSX_PORT`)            |
-| Authorize HTTP port       | `127.0.0.1:13219` (override via `MAXIMA_AUTHORIZE_PORT`)     |
+| LSX port                  | `127.0.0.1:3216` when free, else a free port passed as `EALsxPort` (pin with `MAXIMA_LSX_PORT`) |
+| Authorize / control ports | free ports published in `instance.json` (pin with `MAXIMA_AUTHORIZE_PORT` / `MAXIMA_SERVER_PORT`) |
 
 ---
 
@@ -396,7 +410,7 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 - `origin2://` reads real `offerIds` from the URL instead of hardcoded `Origin.OFR.50.0002148`. **(Generic — useful for every EA title.)**
 - `qrc://` no longer panics on URLs missing `login_successful.html?` (was indexing `[1]` on a split vec without bounds checking).
 - Both `link2ea` and `origin2` validate `offer_id` against `Origin.OFR.<digits>.<digits>` or `<1..=10 digits>` before invoking anything — defends against `link2ea://launchgame/--login=stolen_token` flag injection.
-- **NEW (Session 2026-05-18):** Both protocols probe `127.0.0.1:13219` and forward via HTTP `POST /authorize` when a Maxima auth server is running. Falls back to spawning `maxima-cli launch` only if no server answers.
+- Both protocols forward via HTTP `POST /authorize` to the server of their own context (port + token from `instance.json`). Falls back to spawning `maxima-cli launch` only if no server is running there.
 - `KYBER_INTERFACE_PORT` forwarded from parent env (was hardcoded `3005`).
 - Non-zero exits from spawned `maxima-cli` are surfaced as errors (used to be swallowed silently).
 - All protocol-handler invocations append a line to `%TEMP%/maxima_execution.log` — bootstrap is a GUI-subsystem binary with no console, this is its only feedback channel.
@@ -407,9 +421,9 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 - **NEW:** Panic hook writing to `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log` before unwinding — catches panics that fire before the regular logger is initialized.
 - **NEW:** `main()` is plain `fn`, builds tokio runtime manually with `Builder::new_multi_thread().enable_all()`. The previous `#[tokio::main]` macro built the runtime before user code, which defeated the panic hook.
 - **`Mode::Launch`** (legacy path B) now:
-  - Resolves slug via EA library lookup, then EA-offer passthrough, then `STEAM_GAMES` table fallback for Steam-only owners with unlinked accounts.
+  - Resolves slug via EA library lookup, then EA-offer passthrough, then (numeric Steam app ids) `game-overrides.json` / Steam's `appmanifest_<id>.acf` matched against library names.
   - Sets `SteamAppId` / `SteamGameId` / `SteamClientLaunch` / `SteamPath` env vars when slug matches `<1..=10 digits>` (Steam App ID pattern).
-  - Resolves Steam install path via `lookup_steam_game` + `resolve_steam_install_path` (registry + `libraryfolders.vdf` parse) when no `--game-path` is given.
+  - Resolves the Steam install path from Steam's own records (registry / `libraryfolders.vdf` / `appmanifest`, also inside a Wine prefix) when no `--game-path` is given.
   - Per-game launch args (e.g. `-noOriginStartup` for Northstar, `-multiple` for Source-engine titles) are NOT auto-injected. Callers pass them via `--game-args`, `MAXIMA_LAUNCH_ARGS`, or `cmd_params` on the `link2ea://` URL — Maxima stays universal.
 - `Mode::GetGameBySlug` actually prints slug/offer_id/content_id/display_name/installed (was a no-op stub upstream).
 - **`Mode::ListGames { json }`** — when `--json` is passed, emits a JSON array on stdout (slug, name, offer_id, content_id, installed, install_path, version, has_cloud_save, extra_offers) and suppresses the logger's stdout output for the duration of the command. Designed for Draconis pre-flight detection: "what does Maxima know about this user's library, in machine-readable form?". File-sink logging is unaffected, so debugging traces still land in `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.log`. Per-title-specific detection (TF2 binaries, Northstar markers, etc.) is intentionally kept out of Maxima — that's the consumer's job, since Maxima needs to remain universal across EA titles.
@@ -420,20 +434,18 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 
 #### Steam helpers — new module (`maxima-lib/src/steam.rs`)
 - Lifted from `maxima-cli/src/main.rs` so the auth server can use it too. Contains:
-  - `STEAM_GAMES` table (currently just TF2: app id `1237970` → `Origin.OFR.50.0001456`, `Titanfall2/Titanfall2.exe`).
-  - `lookup_steam_game(steam_app_id)`, `lookup_steam_game_by_offer(origin_offer_id)` (reverse lookup, used by `auth_server`).
-  - `resolve_steam_install_path(SteamGameEntry)` — Steam install discovery: registry (`HKLM\SOFTWARE\(Wow6432Node\)Valve\Steam\InstallPath`), then `Program Files (x86)\Steam` / `Program Files\Steam` defaults, then `libraryfolders.vdf` parse. **Windows only**; returns `None` on other targets (Wine builds use the cfg(windows) path).
+  - No per-title table: a Steam app id resolves through an optional `game-overrides.json` in the data dir (`MAXIMA_GAME_OVERRIDES`; entries `{offer_id, steam_app_id?, exe?, install_dir?}`), else Steam's `appmanifest_<id>.acf` name matched against the EA library. Unresolved ids get a 404 instead of being passed through as offer ids.
+  - Steam root discovery: registry, then the default install dirs, then `libraryfolders.vdf`; on non-Windows hosts the same lookup runs inside the game's Wine prefix.
   - `EA_OFFER_ID_PATTERN`, `STEAM_APP_ID_PATTERN` regexes.
 
 #### Authorize HTTP server — new module (`maxima-lib/src/auth_server.rs`)
 - Plain `tokio::net::TcpListener` + manual HTTP parsing (same pattern `core/auth/login.rs` uses for the OAuth callback — avoids pulling in `actix-web`).
-- `GET /` → `200 OK` body `maxima-auth-server`. Bootstrap's liveness probe.
-- `POST /authorize?offer_id=<id>` → resolve offer, refresh `.dlf` via `request_and_save_license`, return `200 OK {"status":"ok"}`. **Does not spawn the game** — that's the architectural distinction from `Mode::Launch`.
-- Errors map to HTTP status: `400` missing offer_id, `401` not logged in, `404` offer not in library or install path not found, `502` upstream EA / library failure.
-- Default port `13219`; override with `MAXIMA_AUTHORIZE_PORT`.
+- `POST /authorize?offer_id=<id>` → resolve offer and launch it through `launch::start_game` (license refresh, EA env, spawn). Requires the session token in `X-Maxima-Token`; requests with an `Origin` header are refused.
+- Errors map to HTTP status: `400` missing offer_id, `401` bad/missing token or not logged in, `404` offer not in library or install path not found, `502` upstream EA / library failure.
+- Binds a free port published in `instance.json`; pin with `MAXIMA_AUTHORIZE_PORT`.
 
 #### LSX server cooperation (`maxima-lib/src/core/mod.rs::Maxima::start_lsx`)
-- Probes `127.0.0.1:<port>` synchronously with 200ms timeout before binding. If a server is already listening (e.g. `serve` in another window, or the UI), logs and returns without trying to bind.
+- Default: bind 3216, or a free port when 3216 is taken (another instance, the EA app); the real port reaches launched games via `EALsxPort`. With an explicit `MAXIMA_LSX_PORT`, an already-served port is used as is (the old cooperate-with-`serve` behaviour).
 - Without this, the bootstrap-spawned `maxima-cli launch` would also bind 3216 (under Wine this can race the existing `serve` listener and steal the game's connection).
 
 #### LSX response handlers (`maxima-lib/src/lsx/`)
@@ -478,8 +490,9 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 
 #### Env-driven overrides
 - `MAXIMA_DENUVO_TOKEN` — short-circuits `RequestLicense` in the LSX handler and returns this token verbatim. Useful for offline debugging.
-- `MAXIMA_LSX_PORT` — overrides the LSX listen port (default 3216).
-- `MAXIMA_AUTHORIZE_PORT` — overrides the authorize HTTP port (default 13219).
+- `MAXIMA_LSX_PORT` — pins the LSX listen port (default: 3216 when free, else a free port).
+- `MAXIMA_AUTHORIZE_PORT` / `MAXIMA_SERVER_PORT` — pin the authorize / control ports (default: free ports published in `instance.json`; the token is still required).
+- `MAXIMA_DATA_DIR` — replaces the data dir, i.e. runs a fully separate instance.
 - `MAXIMA_LOG_FILE` — overrides the file logger destination.
 - `MAXIMA_DISABLE_WINE_VERIFICATION` — skips the Wine / runtime version check at startup.
 
@@ -506,10 +519,11 @@ This is the **currently recommended** flow on macOS/CrossOver. Use Path A from "
    stays alive until something answers.
 4. Wine routes the link2ea:// URL to maxima-bootstrap.exe.
 5. maxima-bootstrap parses the URL, validates the offer_id shape, then:
-     5a. Probes 127.0.0.1:13219 (auth server). 200ms timeout.
-     5b. If alive → POSTs http://127.0.0.1:13219/authorize?offer_id=…
-         with a 60s timeout, then exits.
-     5c. If dead → spawns `maxima-cli.exe launch Origin.OFR.50.0001456`
+     5a. Reads instance.json from its own data dir (inside this prefix).
+     5b. If a server publishes an authorize port → POSTs
+         http://127.0.0.1:<port>/authorize?offer_id=… with the token in
+         X-Maxima-Token and a 60s timeout, then exits.
+     5c. Otherwise → spawns `maxima-cli.exe launch Origin.OFR.50.0001456`
          (the upstream Path B behavior) and waits for it to finish.
 6. (Path A) The running maxima-cli serve handles the authorize POST:
      - Confirms it's still logged in (auth_storage.logged_in()).
@@ -583,7 +597,7 @@ If you ever change how `MaximaHelper.app` is signed at release time in this repo
 
 ## CI
 
-Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)]` in `maxima-ui/src/main.rs` and similar feature gates elsewhere — inherited from upstream).
+Two workflows. Both use **Rust nightly** (required by `#![feature(slice_pattern)]` in `maxima-ui/src/main.rs` and similar feature gates elsewhere — inherited from upstream). The nightly is **pinned by date in `rust-toolchain.toml`** and every job installs exactly that one (`rustup toolchain install`): nightlies from late September 2026 on reject `objc2 0.4.1`, which `eframe 0.28` pulls in on macOS, so an unpinned nightly broke the macOS `maxima-ui` build without any commit. Bump the pin deliberately and watch the macOS jobs.
 
 ### `build-ci.yml` — push CI
 
@@ -660,29 +674,26 @@ Inside the bottle, maxima-bootstrap appends to `%TEMP%/maxima_execution.log` on 
 
 ### Is the auth server up? Did bootstrap forward?
 
-When `serve` is running, the maxima-cli log file (`%LOCALAPPDATA%\Maxima\Logs\maxima-cli.log`) should contain `Authorize HTTP server listening on 127.0.0.1:13219`. When bootstrap forwards a request, the `maxima_execution.log` line is:
+`maxima-cli server-status --json` (run in the same context — inside the bottle for in-bottle Maxima) shows the realm, control port and login state; `instance.json` in the data dir shows the authorize and LSX ports. The server log contains `Authorize HTTP server listening on 127.0.0.1:<port>`. When bootstrap forwards a request, the `maxima_execution.log` line is:
 
 ```
-Forwarding link2ea offer=Origin.OFR.50.0001456 to auth server at http://127.0.0.1:13219/authorize?offer_id=…
+Forwarding link2ea offer=Origin.OFR.50.0001456 to auth server at http://127.0.0.1:<port>/authorize?offer_id=…
 Auth server accepted link2ea authorize for Origin.OFR.50.0001456 (body: {"status":"ok"})
 ```
 
-If you see `No auth server on 127.0.0.1:13219; falling back to maxima-cli launch …` instead, `serve` isn't running (or it crashed) and bootstrap fell through to Path B.
+If you see `No running Maxima serves /authorize here; falling back to maxima-cli launch …` instead, no server was running in that context and bootstrap fell through to Path B (which starts one).
 
 ### Quick port probe from inside the bottle
 
+Take the ports from the context's `instance.json` (`authorize_port`, `lsx_port`), then:
+
 ```cmd
 :: Bottle PowerShell / cmd
-Test-NetConnection 127.0.0.1 -Port 3216    :: LSX
-Test-NetConnection 127.0.0.1 -Port 13219   :: Authorize HTTP
+Test-NetConnection 127.0.0.1 -Port <lsx_port>
+Test-NetConnection 127.0.0.1 -Port <authorize_port>
 ```
 
-Or from the macOS host (works because Wine forwards ports to the host loopback):
-
-```bash
-nc -zv 127.0.0.1 3216
-nc -zv 127.0.0.1 13219
-```
+Or from the macOS host (Wine shares the host loopback): `nc -zv 127.0.0.1 <port>`.
 
 ### Capturing Wine debug logs in CrossOver
 
@@ -947,7 +958,6 @@ Tracked from PR #4 (Gemini review) and reaffirmed during the Session 2026-05-18 
 - **DLL injection on macOS / CrossOver** — `maxima-service`'s injector is Windows-only by design. Wine doesn't support `CreateRemoteThread`-style injection. The service is installed by NSIS but its injection path is never exercised in the Draconis flow.
 - **Cloud saves, downloads, friends** — implemented upstream and present in the codebase, but untested in the Draconis / CrossOver configuration.
 - **Offline mode after first launch** — `LaunchMode::Offline` path exists but Draconis doesn't expose it. License cache lives at `C:/ProgramData/Electronic Arts/EA Services/License/<content_id>.dlf` and is valid for approximately two weeks.
-- **`STEAM_GAMES` table is TF2-only** — `lookup_steam_game(steam_app_id)` only has an entry for `1237970`. Other EA-on-Steam titles would not resolve via the fallback. Extend per title we validate.
 - **No registry-driven UI-vs-CLI auth provider selector** — the user previously proposed `HKLM\Software\Maxima\AuthProvider = "UI"|"CLI"` that bootstrap would read when no auth server is running. Not implemented; the current fallback path simply spawns `maxima-cli launch` unconditionally. Becomes meaningful once we want bootstrap to auto-start `serve` if it can't find one running.
 - **Auth-server endpoint not on UI yet** — `maxima.exe` doesn't bring up `/authorize`. If a user runs the UI without `serve`, bootstrap falls through to Path B (spawn). Easy fix; just hasn't been wired.
 - **TF2's LSX-polling timeout, if any, is undocumented.** Path A relies on TF2 retrying indefinitely while bootstrap forwards. If TF2 has a finite timeout (we suspect it doesn't but haven't measured), `serve` cold-starts could miss the window.
@@ -984,8 +994,8 @@ After that the bottle has a persistent token. You never need to log in interacti
 # Terminal 1 (inside the bottle):
 maxima-cli.exe serve
 # Expected console lines (and the same go to %LOCALAPPDATA%\Maxima\Logs\maxima-cli.log):
-#   LSX server listening on port 3216
-#   Authorize HTTP server listening on 127.0.0.1:13219
+#   LSX server listening on port 3216          (or a free port if 3216 is taken)
+#   Authorize HTTP server listening on 127.0.0.1:<free port>   (see instance.json)
 #   Subscribed to N friends for presence       (omit with --no-rtm)
 #   Serving LSX. Launch your game externally; press Ctrl-C to stop.
 ```
@@ -1006,6 +1016,16 @@ When TF2 emits `link2ea://`, bootstrap forwards to the running `serve` and exits
 ## Changelog (most recent first)
 
 History of significant changes since this fork was forked. Not a substitute for `git log` but useful for "when did X land" questions.
+
+### 2026-10-09 — v0.15.0: instance isolation, per-game prefixes, presence backends, queue fixes, Linux packages
+
+- **Instance isolation** — no well-known control ports. Each installation context (host user, each Wine prefix) runs its own server, found through `instance.json` + `instance.lock` in its data dir; every control connection opens with a token `hello`; `/authorize` binds a free port and requires `X-Maxima-Token`; LSX keeps 3216 when free and otherwise takes a free port passed via `EALsxPort`; concurrent logins wait for the shared OAuth callback port and check an echoed `state`. The server listens before login (`login-pending` until `ready`), runs requests concurrently and returns typed error kinds — the useful parts of upstream PR 23's protocol. `wine-smoke.sh` checks two prefixes on one host stay isolated. See "Instance isolation" above.
+- **Per-request Wine prefixes** (upstream PR 46): `unix::prefix` resolves explicit request prefix → `MAXIMA_WINE_PREFIX` (never mutated now) → install record → per-game default (`Maxima-<slug>` CrossOver bottle / `<data>/wine/prefixes/<slug>`), passed explicitly to everything that touches Wine. Install records in `<data>/gameinfo/<slug>.json` (upstream layout); glob file exclusion (`<data>/exclude/<slug>`, `--exclude`); cloud saves use the prefix's real Wine user profile instead of a hardcoded `steamuser`; `--wine-prefix` on the CLI and proto. `list-games` / `bottle-info` JSON gained optional fields only.
+- **Presence backends** (upstream PRs 67 + 70): `presence::PresenceClient` behind `Maxima::rtm()`, `MAXIMA_PRESENCE_BACKEND=legacy|antelope|grpc|auto` (default legacy, wire-identical to before). Antelope is PR 70's renamed RTM protocol (payload dialect only); the social gRPC service from PR 67 is behind the off-by-default `presence-grpc` cargo feature. RTM gained reconnect backoff and bounded waits; QueryPresence for unknown users returns an empty success.
+- **Download queue** (from upstream PR 70, reworked): FIFO order, cancel / pause / resume / move-to-top, failed files fail the install (`MaximaEvent::InstallFailed` → `install-error`) instead of reporting success, corrupt `download_queue.json` kept as `.bak`.
+- **Windows hardening**: touchup elevates through the UAC consent prompt (`util/elevation.rs`) instead of PR 70's SYSTEM `/touchup` endpoint; the background service only answers requests with the `x-maxima-client` header and no browser `Origin`; registry reads fall back to `WOW6432Node`.
+- **No game- or launcher-specific code**: the `STEAM_GAMES` table, TF2 literals in `GetAllGameInfo` and the built-in `wsock32` DLL override are gone. Per-launch options replace them: `--wine-dll-override <dll=mode>` / `MAXIMA_WINE_DLL_OVERRIDES` (applied on both the wine and cxstart paths), `--steam-app-id` / `MAXIMA_STEAM_APP_ID`, `--entitlement-source ea|steam` / `MAXIMA_ENTITLEMENT_SOURCE` (one helper feeds the launch env, `GetAllGameInfo` and `GetProfile`; `IsSubscriber` is now always false), plus `game-overrides.json`. The Steam-library warning is neutral and only shown under Wine; per-message LSX logs are `debug!` again.
+- **Linux packages** (upstream PR 51): `packaging/linux/` (container build, AppImage, Flatpak + metainfo, shared launcher), `linux-packages` CI job; the qrc handler check accepts the packaged desktop file.
 
 ### 2026-10-08 — upstream fix ports
 

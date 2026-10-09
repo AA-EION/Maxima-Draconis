@@ -48,6 +48,28 @@ lazy_static! {
     static ref MANUAL_LOGIN_PATTERN: Regex = Regex::new(r"^(.*):(.*)$").unwrap();
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum EntitlementArg {
+    Ea,
+    Steam,
+}
+
+impl From<EntitlementArg> for launch::EntitlementSource {
+    fn from(arg: EntitlementArg) -> Self {
+        match arg {
+            EntitlementArg::Ea => Self::Ea,
+            EntitlementArg::Steam => Self::Steam,
+        }
+    }
+}
+
+fn proto_entitlement(source: launch::EntitlementSource) -> maxima_proto::EntitlementSource {
+    match source {
+        launch::EntitlementSource::Ea => maxima_proto::EntitlementSource::Ea,
+        launch::EntitlementSource::Steam => maxima_proto::EntitlementSource::Steam,
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Mode {
     Launch {
@@ -58,8 +80,8 @@ enum Mode {
 
         /// Extra arguments forwarded to the game executable. Repeated:
         /// `--game-args -noOriginStartup --game-args -vanilla`. Values
-        /// starting with `-` are common (Northstar's `-noOriginStartup`,
-        /// Source's `-novid`, etc.), so `allow_hyphen_values = true`
+        /// starting with `-` are common (e.g. `-novid`, `-windowed`,
+        /// etc.), so `allow_hyphen_values = true`
         /// stops clap from interpreting them as flags.
         ///
         /// For convenience, any args after a literal `--` are also
@@ -85,18 +107,42 @@ enum Mode {
         #[arg(last = true)]
         trailing_args: Vec<String>,
 
+        /// Wine DLL override for this launch, `dll[,dll]=mode` (repeatable),
+        /// e.g. `--wine-dll-override wsock32=n,b`. Layered on top of the
+        /// built-in defaults and `MAXIMA_WINE_DLL_OVERRIDES`.
+        #[arg(long = "wine-dll-override", value_name = "SPEC")]
+        wine_dll_override: Vec<String>,
+
+        /// Steam App ID exposed to the game (`SteamAppId` / `SteamGameId`);
+        /// also makes the entitlement source Steam unless
+        /// `--entitlement-source` says otherwise. Env: `MAXIMA_STEAM_APP_ID`.
+        #[arg(long)]
+        steam_app_id: Option<String>,
+
+        /// Where the game's entitlement is reported to come from. Defaults to
+        /// `steam` when a Steam App ID is set, else `ea`. Env:
+        /// `MAXIMA_ENTITLEMENT_SOURCE`.
+        #[arg(long, value_enum)]
+        entitlement_source: Option<EntitlementArg>,
+
         /// Emit structured launch lifecycle events as JSONL on stdout
         /// (log output suppressed): `{"event":"launched",...}` once the
         /// game process is spawned, `{"event":"exited","elapsed_secs":…}`
         /// when it stops, `{"event":"error","message":…}` on failure (plus
-        /// non-zero exit). For consumers like Draconis that drive launches
+        /// non-zero exit). For consumers that drive launches
         /// programmatically instead of scraping log lines.
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
-        /// of the human-readable `info!` lines. Intended for Draconis and
+        /// of the human-readable `info!` lines. Intended for launchers and
         /// other automation that needs to inspect what Maxima has in the
         /// user's EA library — per-game `slug`, `name`, `offer_id`,
         /// `content_id`, `installed`, `install_path`, `version`, plus the
@@ -104,13 +150,28 @@ enum Mode {
         #[arg(long)]
         json: bool,
     },
+    /// Register an existing install of a game: run its touchup in the right
+    /// Wine prefix and remember where it lives, so launch / verify / list-games
+    /// find it without any registry.
     LocateGame {
+        /// The game's install folder (the one containing `__Installer`).
         path: String,
+
+        /// Which game this folder is. Optional when Maxima already has an
+        /// install record for exactly this folder.
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     /// Install a game from the user's EA library to a local path,
     /// non-interactively. Equivalent to the interactive "Install Game"
     /// option in `maxima-cli` (no args) or to the maxima-ui install flow,
-    /// but driven entirely by CLI flags so Draconis / scripts can kick it
+    /// but driven entirely by CLI flags so launchers / scripts can kick it
     /// off headless.
     Install {
         /// Slug, offer_id, or content_id of the game to install. Resolved
@@ -134,7 +195,7 @@ enum Mode {
         /// Comma-separated list of file paths (relative to `--path`) to
         /// delete BEFORE the install runs, so the downloader sees them as
         /// missing and re-fetches them from EA's content servers. Designed
-        /// for the Steam-CEG fix flow: a Steam-installed `Titanfall2.exe`
+        /// for the Steam-CEG fix flow: a Steam-installed `game.exe`
         /// is the same size as the EA original (CEG patches bytes in
         /// place) so the size-only entry-state check in the downloader
         /// would skip it. Listing it here forces a clean replace.
@@ -148,19 +209,31 @@ enum Mode {
         /// alone. Without this flag, the full `install_now` flow runs
         /// after the delete step, which can re-download large chunks of
         /// the game when Steam-vs-EA file sizes legitimately differ
-        /// (~50% of the manifest in the TF2 case). With this flag, an
-        /// "Apply Maxima fix" against a Steam install touches only the
+        /// (~50% of the manifest in some cases). With this flag, replacing the
+        /// executables of a Steam-wrapped install touches only the
         /// exes you actually need to replace. Requires `--replace-files`
         /// to be non-empty.
         #[arg(long, requires = "replace_files")]
         only_listed_files: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+        /// Glob pattern of files to leave out (repeatable), on top of the
+        /// game's exclusion file `<data dir>/exclude/<slug>`. `*` crosses
+        /// directories, matching ignores case, a trailing `/` excludes a
+        /// folder: `--exclude "*.bik" --exclude "Movies/"`.
+        #[arg(long)]
+        exclude: Vec<String>,
 
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
         /// `{"event":"progress","percent":<0-100>}`; the terminator is
         /// `{"event":"done","elapsed_secs":<float>}` on success or
         /// `{"event":"error","message":"..."}` on failure (also exits
-        /// non-zero). Designed for Draconis to drive a real-time
+        /// non-zero). Designed for launchers to drive a real-time
         /// progress bar without scraping log lines.
         #[arg(long)]
         json: bool,
@@ -179,9 +252,10 @@ enum Mode {
         /// Slug / offer_id / content_id, resolved against the EA
         /// library the same way `install` and `launch` resolve theirs.
         slug: String,
-        /// Absolute path of the existing install dir.
+        /// Absolute path of the existing install dir. Defaults to where the
+        /// game's install record says it lives.
         #[arg(long)]
-        path: String,
+        path: Option<String>,
         /// After listing broken files, immediately re-download them
         /// via `install --replace-files --only-listed-files`. No-op
         /// if the verify pass finds nothing wrong.
@@ -195,12 +269,30 @@ enum Mode {
         ///   `{"event":"error","message":"..."}` (also exits non-zero)
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+        /// Glob pattern of files to leave out (repeatable), on top of the
+        /// game's exclusion file `<data dir>/exclude/<slug>`. `*` crosses
+        /// directories, matching ignores case, a trailing `/` excludes a
+        /// folder: `--exclude "*.bik" --exclude "Movies/"`.
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     CloudSync {
         game_slug: String,
 
         #[arg(long)]
         write: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     AccountInfo,
     CreateAuthCode {
@@ -235,18 +327,22 @@ enum Mode {
 
         #[arg(long)]
         file: String,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     /// Run as a passive LSX server — log in, start the LSX listener, optionally
     /// log in to RTM, and wait indefinitely (Ctrl-C to stop). This is the CLI
     /// equivalent of "open the Maxima UI and leave it running": no game is
     /// launched by this process, so when an externally-started game (Steam
-    /// `applaunch`, Northstar's `steam.exe -applaunch 1237970 -northstar`, or
-    /// a direct double-click on `Titanfall2.exe`) connects to LSX, the
-    /// connection's `playing()` is None — which exercises the
-    /// catornot/patch-external-lsx code path that the user reports works on
-    /// Windows. Use this when `maxima-cli launch` keeps tripping TF2's
-    /// "File corruption detected" tamper check: kick `serve` first, then
-    /// launch the game externally.
+    /// `applaunch`, a launcher, or a direct double-click on the game's exe)
+    /// connects to LSX, the connection's `playing()` is None - which
+    /// exercises the external-LSX code path. Use this when a launch through
+    /// `maxima-cli launch` is rejected by a game's integrity checks: kick
+    /// `serve` first, then launch the game externally.
     Serve {
         /// Skip RTM (Real-Time Messaging) login — useful in low-connectivity
         /// environments or when you only care about LSX auth, not friends
@@ -286,14 +382,14 @@ enum Mode {
     /// this registers MaximaBootstrap.app (built by
     /// maxima-bootstrap/build-app.sh) with LaunchServices for qrc://,
     /// link2ea:// and origin2:// — required for OAuth login redirects
-    /// without Draconis's MaximaHelper, and for catching link2ea:// from
+    /// without a MaximaHelper, and for catching link2ea:// from
     /// externally-launched games (routed out of the bottle via
     /// winebrowser). On Linux this writes the maxima-*.desktop handlers.
     /// No login required.
     RegisterProtocols,
     /// Report the wine prefix / CrossOver bottle and default install
     /// location Maxima would use for a game — WITHOUT creating anything.
-    /// Lets consumers (Draconis) place per-title files (e.g. Northstar)
+    /// Lets consumers place per-title files (e.g. mods)
     /// into the right game dir without re-deriving Maxima's bottle-naming
     /// policy. `exists` flags tell whether the bottle / game dir are
     /// actually present yet.
@@ -305,6 +401,12 @@ enum Mode {
         /// Emit a single JSON object on stdout instead of log lines.
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
 }
 
@@ -424,29 +526,14 @@ fn ensure_console_attached() {}
 /// disappear silently — exactly the failure mode that made the v0.2.1
 /// "nothing shows" bug so hard to diagnose.
 ///
-/// File location matches the rest of the file logging:
+/// File location matches the rest of the file logging
+/// (see `maxima::util::native::maxima_logs_path`):
 ///   - Windows: %LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log
-///   - Unix:    $XDG_DATA_HOME/maxima/logs/maxima-cli.panic.log (or ~/.local/share/...)
+///   - Unix:    <data dir>/logs/maxima-cli.panic.log
 fn install_panic_hook() {
-    let log_path: Option<std::path::PathBuf> = {
-        #[cfg(windows)]
-        {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("APPDATA"))
-                .map(std::path::PathBuf::from)
-                .map(|p| p.join("Maxima").join("Logs").join("maxima-cli.panic.log"))
-        }
-        #[cfg(unix)]
-        {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
-                })
-                .map(|p| p.join("maxima").join("logs").join("maxima-cli.panic.log"))
-        }
-    };
+    let log_path: Option<std::path::PathBuf> = maxima::util::native::maxima_logs_path()
+        .ok()
+        .map(|d| d.join("maxima-cli.panic.log"));
 
     std::panic::set_hook(Box::new(move |info| {
         // Best-effort: never let the panic hook itself panic.
@@ -509,7 +596,7 @@ fn main() {
 
     let args = Args::parse();
 
-    // For `--json` subcommands, mute stdout logging so callers (Draconis,
+    // For `--json` subcommands, mute stdout logging so callers (launchers,
     // scripts) can parse stdout as a single JSON document. The file sink
     // keeps receiving everything for debugging.
     if json_mode(&args) {
@@ -534,7 +621,7 @@ fn main() {
             Ok(_) => error!("{}:\n{}", e, e.backtrace().to_string()),
             Err(_) => error!("{}: {}", e, e.root_cause()),
         }
-        // Consumers (Draconis) key success off the exit status, and in
+        // Consumers key success off the exit status, and in
         // --json mode the logger's stdout sink is muted — so make the
         // failure visible on both channels a caller can see.
         eprintln!("error: {:#}", e);
@@ -627,10 +714,8 @@ async fn startup(args: Args) -> Result<()> {
     // no session of their own — short-circuit before any login / Maxima
     // setup so `server-stop` doesn't itself try to authenticate.
     match &args.mode {
-        Some(Mode::ServerStop) => return server::send_shutdown(server::server_port()).await,
-        Some(Mode::ServerStatus { json }) => {
-            return server::print_status(server::server_port(), *json).await
-        }
+        Some(Mode::ServerStop) => return server::send_shutdown().await,
+        Some(Mode::ServerStatus { json }) => return server::print_status(*json).await,
         Some(Mode::Service { action }) => return run_service(action),
         _ => {}
     }
@@ -641,37 +726,74 @@ async fn startup(args: Args) -> Result<()> {
     // developer/diagnostic subcommands fall through to the legacy in-process
     // path below. `launch --login` (manual/offline) is self-contained and
     // also stays in-process.
-    let port = server::server_port();
     match &args.mode {
-        Some(Mode::ListGames { json }) => return server::run_list_games(port, *json).await,
-        Some(Mode::LocateGame { path }) => return server::run_locate_game(port, path).await,
-        Some(Mode::BottleInfo { slug, json }) => {
-            return server::run_bottle_info(port, slug, *json).await
+        Some(Mode::ListGames { json }) => return server::run_list_games(*json).await,
+        Some(Mode::LocateGame { path, slug, wine_prefix }) => {
+            return server::run_locate_game(path, slug.clone(), wine_prefix.clone()).await
         }
-        Some(Mode::RegisterProtocols) => return server::run_register_protocols(port).await,
-        Some(Mode::CloudSync { game_slug, write }) => {
-            return server::run_cloud_sync(port, game_slug, *write).await
+        Some(Mode::BottleInfo { slug, json, wine_prefix }) => {
+            return server::run_bottle_info(slug, *json, wine_prefix.clone()).await
         }
-        Some(Mode::Verify { slug, path, repair, json }) => {
-            return server::run_verify(port, slug, Some(path.clone()), *repair, *json).await
+        Some(Mode::RegisterProtocols) => return server::run_register_protocols().await,
+        Some(Mode::CloudSync { game_slug, write, wine_prefix }) => {
+            return server::run_cloud_sync(game_slug, *write, wine_prefix.clone()).await
         }
-        Some(Mode::DownloadSpecificFile { offer_id, build_id, file }) => {
-            return server::run_download_file(port, offer_id, Some(build_id.clone()), file).await
-        }
-        Some(Mode::Install { slug, path, build_id, replace_files, only_listed_files, json }) => {
-            return server::run_install(
-                port,
+        Some(Mode::Verify { slug, path, repair, json, wine_prefix, exclude }) => {
+            return server::run_verify(
                 slug,
                 path.clone(),
-                build_id.clone(),
-                replace_files.clone(),
-                *only_listed_files,
+                *repair,
+                *json,
+                wine_prefix.clone(),
+                exclude.clone(),
+            )
+            .await
+        }
+        Some(Mode::DownloadSpecificFile { offer_id, build_id, file, wine_prefix }) => {
+            return server::run_download_file(
+                offer_id,
+                Some(build_id.clone()),
+                file,
+                wine_prefix.clone(),
+            )
+            .await
+        }
+        Some(Mode::Install {
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            json,
+            wine_prefix,
+            exclude,
+        }) => {
+            return server::run_install(
+                slug,
+                maxima_proto::InstallOptions {
+                    path: path.clone(),
+                    build_id: build_id.clone(),
+                    replace_files: replace_files.clone(),
+                    only_listed_files: *only_listed_files,
+                    wine_prefix: wine_prefix.clone(),
+                    exclude: exclude.clone(),
+                },
                 *json,
             )
             .await;
         }
-        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json }) => {
-            server::ensure_server_running(port).await?;
+        Some(Mode::Launch {
+            slug,
+            game_path,
+            game_args,
+            login: None,
+            trailing_args,
+            wine_dll_override,
+            steam_app_id,
+            entitlement_source,
+            json,
+            wine_prefix,
+        }) => {
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
             let req = maxima_proto::Request::Launch {
@@ -679,9 +801,16 @@ async fn startup(args: Args) -> Result<()> {
                 args: a,
                 exe_override: game_path.clone(),
                 cloud_saves: true,
+                wine_prefix: wine_prefix.clone(),
+                wine_dll_overrides: wine_dll_override.clone(),
+                steam_app_id: steam_app_id.clone().or_else(launch::steam_app_id_from_env),
+                entitlement_source: entitlement_source
+                    .map(launch::EntitlementSource::from)
+                    .or_else(launch::EntitlementSource::from_env)
+                    .map(proto_entitlement),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
-            return server::forward_streaming(port, req, &["game-stopped"], *json).await;
+            return server::forward_streaming(req, &["game-stopped"], *json).await;
         }
         _ => {}
     }
@@ -749,21 +878,42 @@ async fn startup(args: Args) -> Result<()> {
             game_args,
             login: Some(login),
             trailing_args,
+            wine_dll_override,
+            steam_app_id,
+            entitlement_source,
             json,
+            wine_prefix,
         } => {
             let mut game_args = game_args;
             game_args.extend(trailing_args);
             // offer_id must be a content id in this mode; pass the slug through.
-            start_game(&slug, game_path, game_args, Some(login), None, maxima_arc.clone(), json)
-                .await
+            start_game(
+                &slug,
+                game_path,
+                game_args,
+                Some(login),
+                steam_app_id,
+                entitlement_source.map(Into::into),
+                wine_prefix.map(PathBuf::from),
+                wine_dll_override,
+                maxima_arc.clone(),
+                json,
+            )
+            .await
         }
         Mode::Serve {
             no_rtm,
             wine_prefix,
         } => {
+            // `serve` has no game to pick a prefix from, so the one the user
+            // named is the process-wide choice — registered with the prefix
+            // module rather than exported through the environment.
+            #[cfg(unix)]
             if let Some(prefix) = wine_prefix {
-                std::env::set_var("MAXIMA_WINE_PREFIX", prefix);
+                maxima::unix::prefix::set_process_override(Some(PathBuf::from(prefix)));
             }
+            #[cfg(not(unix))]
+            let _ = wine_prefix;
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::AccountInfo => print_account_info(maxima_arc.clone()).await,
@@ -818,7 +968,7 @@ fn run_service(action: &ServiceAction) -> Result<()> {
             println!(
                 "Maxima service uninstalled{}. No autostart, protocol claims, or \
                  binaries left behind.",
-                if *purge { " and purged (tokens + logs removed)" } else { "" }
+                if *purge { " and purged (tokens, caches + logs removed)" } else { "" }
             );
         }
         ServiceAction::Status { json } => {
@@ -884,7 +1034,19 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone(), false).await?;
+    start_game(
+        &offer_id,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        maxima_arc.clone(),
+        false,
+    )
+    .await?;
 
     Ok(())
 }
@@ -892,7 +1054,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
 async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
     let mut maxima = maxima_arc.lock().await;
 
-    let offer_id = {
+    let (offer_id, slug) = {
         let mut owned_games = Vec::new();
         for game in maxima.mut_library().games().await? {
             if game.base_offer().is_installed().await {
@@ -910,7 +1072,10 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         let name =
             Select::new("What game would you like to install?", owned_games_strs).prompt()?;
         let game = owned_games.iter().find(|g| g.name() == name).unwrap();
-        game.base_offer().offer_id().to_owned()
+        (
+            game.base_offer().offer_id().to_owned(),
+            game.base_offer().slug().to_owned(),
+        )
     };
 
     let builds = maxima
@@ -935,10 +1100,20 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         return Ok(());
     }
 
+    // The game's own Wine prefix (unix), chosen the same way every other
+    // command chooses it.
+    #[cfg(unix)]
+    let wine_prefix = Some(maxima::unix::prefix::resolve_for_game(&slug, None).await?);
+    #[cfg(not(unix))]
+    let wine_prefix: Option<PathBuf> = None;
+
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build.build_id().to_owned())
         .path(path.clone())
+        .slug(slug)
+        .wine_prefix(wine_prefix)
+        .locale(Some(maxima.locale().full_str().to_owned()))
         .build()?;
 
     let start_time = Instant::now();
@@ -949,14 +1124,13 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
     loop {
         let mut maxima = maxima_arc.lock().await;
 
+        maxima.update().await;
+
         for event in maxima.consume_pending_events() {
-            match event {
-                MaximaEvent::ReceivedLSXRequest(_pid, _request) => (),
-                _ => {}
+            if let MaximaEvent::InstallFailed { message, .. } = event {
+                bail!("install failed: {message}");
             }
         }
-
-        maxima.update().await;
 
         if let Some(downloader) = maxima.content_manager().current() {
             info!("Downloading: {}%/100%", downloader.percentage_done());
@@ -1081,7 +1255,7 @@ async fn juno_token_refresh(maxima_arc: LockedMaxima) -> Result<()> {
 }
 
 async fn read_license_file(content_id: &str) -> Result<()> {
-    let path = ooa::get_license_dir()?.join(format!("{}.dlf", content_id));
+    let path = ooa::get_license_dir(None)?.join(format!("{}.dlf", content_id));
     let mut data = tokio::fs::read(path).await?;
     data.drain(0..65); // Signature
 
@@ -1234,12 +1408,16 @@ async fn list_games(maxima_arc: LockedMaxima) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_game(
     offer_id: &str,
     game_path_override: Option<String>,
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    entitlement_source: Option<launch::EntitlementSource>,
+    wine_prefix: Option<PathBuf>,
+    wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1252,6 +1430,9 @@ async fn start_game(
         game_args,
         login,
         steam_app_id,
+        entitlement_source,
+        wine_prefix,
+        wine_dll_overrides,
         maxima_arc,
         json,
     )
@@ -1280,12 +1461,16 @@ async fn start_game(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_game_inner(
     offer_id: &str,
     game_path_override: Option<String>,
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    entitlement_source: Option<launch::EntitlementSource>,
+    wine_prefix: Option<PathBuf>,
+    wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1319,6 +1504,9 @@ async fn start_game_inner(
         arguments: game_args,
         cloud_saves: true,
         steam_app_id,
+        entitlement_source,
+        wine_prefix,
+        wine_dll_overrides,
     };
 
     if login.is_none() {
@@ -1342,12 +1530,21 @@ async fn start_game_inner(
 
     if json {
         use std::io::Write;
+        // The prefix this launch actually used, not whatever the environment
+        // says.
+        let used_prefix = maxima_arc
+            .lock()
+            .await
+            .playing()
+            .as_ref()
+            .and_then(|p| p.wine_prefix().clone())
+            .map(|p| p.display().to_string());
         println!(
             "{}",
             serde_json::json!({
                 "event": "launched",
                 "offer_id": offer_id,
-                "wine_prefix": std::env::var("MAXIMA_WINE_PREFIX").ok(),
+                "wine_prefix": used_prefix,
             })
         );
         let _ = std::io::stdout().flush();
@@ -1385,18 +1582,17 @@ async fn start_game_inner(
 /// game connects a few seconds later the LSX handlers go down the
 /// "Some(context)" branch in `Connection::new` (Kyber PID lookup, RTM
 /// presence updates, real OOA license requests, etc.). On Windows that's
-/// fine; on macOS/CrossOver the user reports it triggers TF2's
-/// "Engine Error: File corruption detected" tamper dialog.
+/// fine; on macOS/CrossOver some games react badly to it.
 ///
 /// `maxima-cli serve` decouples the two halves of the launch:
 ///
 ///   1. Terminal 1: `maxima-cli.exe serve` — logs in, opens the LSX listener
 ///      on the configured port (`MAXIMA_LSX_PORT` or 3216), optionally logs
 ///      in to RTM, and parks.
-///   2. Terminal/Steam/Northstar: launch the game by any means that gets
+///   2. Terminal/Steam/launcher: launch the game by any means that gets
 ///      `EALsxPort=<that port>` into the process environment (Steam's
-///      `applaunch`, Draconis's vanilla / Northstar launch, or a `cxstart`
-///      against `Titanfall2.exe` after manually setting the env var).
+///      `applaunch`, a consumer launcher, or a `cxstart` against the game's
+///      exe after manually setting the env var).
 ///
 /// When the game connects, the server sees `playing=None`, takes the
 /// catornot external-LSX path (now correctly defended in
@@ -1406,24 +1602,45 @@ async fn start_game_inner(
 /// is a no-op when `playing` is None and we don't want the content manager
 /// poking at downloads from a serve session. Ctrl-C is the exit path.
 async fn serve_lsx(maxima_arc: LockedMaxima, no_rtm: bool) -> Result<()> {
+    use maxima_proto::instance::{GuardError, InstanceGuard, InstanceState};
+
+    // `serve` is this context's server for as long as it runs: it publishes
+    // its ports in instance.json so the bootstrap finds it, and it can't run
+    // next to a maxima-server, which already serves LSX and /authorize.
+    let mut guard = match InstanceGuard::acquire(&maxima::util::native::maxima_dir()?, env!("CARGO_PKG_VERSION")) {
+        Ok(guard) => guard,
+        Err(GuardError::AlreadyRunning(_)) => bail!(
+            "a Maxima server is already running here and already serves LSX and /authorize"
+        ),
+        Err(err) => return Err(err.into()),
+    };
+
     {
         let mut maxima = maxima_arc.lock().await;
         maxima.start_lsx(maxima_arc.clone()).await?;
-        info!("LSX server listening on port {}", maxima.lsx_port());
+        info!("LSX server listening on port {}", maxima.effective_lsx_port());
 
-        // Bring up the HTTP `/authorize` endpoint too. Bootstrap probes
-        // this when handling `link2ea://` / `origin2://` and forwards the
-        // offer here instead of spawning a duplicate `maxima-cli launch`.
-        // Failure to bind isn't fatal — LSX is what TF2 strictly needs,
-        // and bootstrap falls back to the legacy spawn path if the probe
-        // can't reach us.
-        if let Err(err) = maxima.start_auth_server(maxima_arc.clone()).await {
-            warn!(
-                "Authorize HTTP server failed to start ({}); bootstrap will fall back \
-                 to spawning maxima-cli launch on link2ea://.",
-                err
-            );
-        }
+        // Bring up the HTTP `/authorize` endpoint too. The bootstrap reads its
+        // port from instance.json when handling `link2ea://` / `origin2://`
+        // and forwards the offer here instead of spawning a duplicate
+        // `maxima-cli launch`. Failure to bind isn't fatal.
+        let token = guard.info().token.clone();
+        let authorize_port = match maxima.start_auth_server(maxima_arc.clone(), &token).await {
+            Ok(port) => Some(port),
+            Err(err) => {
+                warn!(
+                    "Authorize HTTP server failed to start ({}); bootstrap will fall back \
+                     to spawning maxima-cli launch on link2ea://.",
+                    err
+                );
+                None
+            }
+        };
+        guard.publish(|info| {
+            info.state = InstanceState::Ready;
+            info.lsx_port = maxima.lsx_bound_port();
+            info.authorize_port = authorize_port;
+        })?;
 
         if !no_rtm {
             // Best-effort RTM login: it's only needed for friends presence /
@@ -1449,7 +1666,7 @@ async fn serve_lsx(maxima_arc: LockedMaxima, no_rtm: bool) -> Result<()> {
     }
 
     info!(
-        "Serving LSX. Launch your game externally (Steam / Draconis / etc.); press Ctrl-C to stop."
+        "Serving LSX. Launch your game externally (Steam, a launcher, etc.); press Ctrl-C to stop."
     );
 
     // Park indefinitely. Tick `maxima.update()` so when a game launched

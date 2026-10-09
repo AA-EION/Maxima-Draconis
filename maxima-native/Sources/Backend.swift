@@ -1,9 +1,11 @@
 import Darwin
 import Foundation
 
-/// Client for the multi-client `maxima-cli server` (upstream PR #23's
-/// server/thin-client architecture). Connects over loopback TCP; if no server
-/// is running it spawns one (`maxima-cli server`) detached and waits for it.
+/// Client for the multi-client `maxima-server` (upstream PR #23's
+/// server/thin-client architecture). Finds the server through the
+/// `instance.json` it publishes in Maxima's data directory (its port and a
+/// per-run token), and opens every connection with a `hello` carrying that
+/// token. If no server is running it spawns one detached and waits for it.
 /// Because the game is responsibility-disclaimed at the cxstart hop inside the
 /// server, the server can be started any way — by this app, at logon, or by
 /// another frontend — and every client shares one synced session.
@@ -26,11 +28,42 @@ actor Backend {
         }
     }
 
-    static let port: UInt16 = {
-        if let s = ProcessInfo.processInfo.environment["MAXIMA_SERVER_PORT"],
-           let p = UInt16(s) { return p }
-        return 13220
-    }()
+    /// Maxima's data directory, shared with every Rust frontend
+    /// (`MAXIMA_DATA_DIR` overrides it, as it does for them).
+    nonisolated static var dataDir: URL {
+        if let dir = ProcessInfo.processInfo.environment["MAXIMA_DATA_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/com.ArmchairDevelopers.Maxima")
+    }
+
+    /// Control-protocol version this client speaks (`maxima_proto::PROTO_VERSION`).
+    static let protoVersion = 2
+
+    /// Where the running server listens and the token it expects.
+    struct Instance {
+        let port: UInt16
+        let token: String
+    }
+
+    /// The running server's `instance.json`, or nil when no server holds the
+    /// instance lock (a file left behind by a crash doesn't count).
+    nonisolated static func instance() -> Instance? {
+        let lock = Darwin.open(dataDir.appendingPathComponent("instance.lock").path, O_RDWR)
+        guard lock >= 0 else { return nil }
+        defer { Darwin.close(lock) }
+        if flock(lock, LOCK_EX | LOCK_NB) == 0 {
+            flock(lock, LOCK_UN)
+            return nil
+        }
+        guard let data = try? Data(contentsOf: dataDir.appendingPathComponent("instance.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let port = (obj["control_port"] as? NSNumber)?.uint16Value,
+              let token = obj["token"] as? String
+        else { return nil }
+        return Instance(port: port, token: token)
+    }
 
     private var writeHandle: FileHandle?
     private var nextId: UInt64 = 1
@@ -44,8 +77,7 @@ actor Backend {
     /// user starts it explicitly, so we don't spawn unless `force` is set (the
     /// "Start Server" action).
     nonisolated static func bootPolicy() -> String {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Maxima/config.json")
+        let url = dataDir.appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let p = obj["boot_policy"] as? String
@@ -57,23 +89,23 @@ actor Backend {
     /// `manual` and `force` is false), connect, and return the pushed-event
     /// stream. The stream ends if the connection drops.
     func start(force: Bool = false) async throws -> AsyncStream<[String: Any]> {
-        if !Self.probe() {
+        var found = Self.instance()
+        if found == nil {
             if !force && Self.bootPolicy() == "manual" {
                 // Manual policy: don't auto-spawn — surface as stopped so the UI
                 // can offer a "Start Server" action.
                 throw BackendError.serverUnavailable
             }
             try spawnServer()
-            // Wait for it to answer (login may run on first start).
-            var up = false
-            for _ in 0..<120 {
+            // The server publishes its port before logging in, so this is quick.
+            for _ in 0..<60 where found == nil {
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                if Self.probe() { up = true; break }
+                found = Self.instance()
             }
-            if !up { throw BackendError.serverUnavailable }
         }
+        guard let instance = found else { throw BackendError.serverUnavailable }
 
-        let fd = try Self.connect()
+        let fd = try Self.connect(port: instance.port)
         let readHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         // closeOnDealloc: true so the dup'd fd is closed when writeHandle is
         // released (handleDisconnect sets it to nil) — otherwise it leaks.
@@ -95,6 +127,11 @@ actor Backend {
             await self?.handleDisconnect()
         }
 
+        // The server answers nothing else until the connection identifies.
+        _ = try await request([
+            "cmd": "hello", "token": instance.token,
+            "client": "Maxima.app", "proto": Self.protoVersion,
+        ])
         return stream
     }
 
@@ -174,15 +211,8 @@ actor Backend {
 
     // Transport ----------------------------------------------------------
 
-    /// True if a server answers on the control port.
-    nonisolated static func probe() -> Bool {
-        guard let fd = try? connect() else { return false }
-        Darwin.close(fd)
-        return true
-    }
-
     /// Open a blocking TCP connection to 127.0.0.1:port; returns the fd.
-    nonisolated static func connect() throws -> Int32 {
+    nonisolated static func connect(port: UInt16) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw BackendError.notConnected }
         var addr = sockaddr_in()

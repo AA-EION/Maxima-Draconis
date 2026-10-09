@@ -1,6 +1,8 @@
 use egui::Context;
 use log::{error, info, warn};
 
+#[cfg(feature = "bg-videos")]
+use crate::bridge::get_games::get_game_bg_video_request;
 use crate::{
     bridge::{
         game_details::game_details_request, get_friends::get_friends_request,
@@ -81,9 +83,13 @@ pub enum MaximaLibRequest {
     GetGamesRequest,
     GetFriendsRequest,
     GetGameDetailsRequest(String),
+    /// Look up the background video URL for a game slug (`bg-videos` feature).
+    #[cfg(feature = "bg-videos")]
+    GetGameBgVideoRequest(String),
     StartGameRequest(GameInfo, Option<GameSettings>),
     InstallGameRequest(String, PathBuf),
-    LocateGameRequest(String),
+    /// Install folder, slug of the game it belongs to.
+    LocateGameRequest(String, String),
     ShutdownRequest,
     /// External-command auto-install (driven by `maxima --install <slug>
     /// --install-path <path>`). Resolves the slug to an offer_id via
@@ -101,6 +107,9 @@ pub enum MaximaLibResponse {
     GameInfoResponse(InteractThreadGameListResponse),
     FriendInfoResponse(InteractThreadFriendListResponse),
     GameDetailsResponse(InteractThreadGameDetailsResponse),
+    /// Slug and its background video URL, if the game has one (`bg-videos` feature).
+    #[cfg(feature = "bg-videos")]
+    GameBgVideoResponse(String, Option<String>),
     LocateGameResponse(InteractThreadLocateGameResponse),
     // Alerts, rather than responses:
     CriticalError(Box<BackendError>),
@@ -120,6 +129,8 @@ pub struct BridgeThread {
 
 #[derive(thiserror::Error, Debug)]
 pub enum BackendError {
+    #[error("install of {offer_id} failed: {message}")]
+    InstallFailed { offer_id: String, message: String },
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error(transparent)]
@@ -420,6 +431,12 @@ impl BridgeThread {
                                 .send(MaximaLibResponse::DownloadFinished(offer_id))?;
                             Self::update_queue(maxima.content_manager(), backend_responder.clone());
                         }
+                        maxima::core::MaximaEvent::InstallFailed { offer_id, message } => {
+                            backend_responder.send(MaximaLibResponse::NonFatalError(Box::new(
+                                BackendError::InstallFailed { offer_id, message },
+                            )))?;
+                            Self::update_queue(maxima.content_manager(), backend_responder.clone());
+                        }
                     }
                 }
             }
@@ -459,17 +476,50 @@ impl BridgeThread {
                     let context = ctx.clone();
                     async move { game_details_request(maxima, slug.clone(), channel, &context).await }.await
                 }
-                MaximaLibRequest::LocateGameRequest(path) => {
-                    #[cfg(unix)]
-                    maxima::core::launch::mx_linux_setup().await?;
+                #[cfg(feature = "bg-videos")]
+                MaximaLibRequest::GetGameBgVideoRequest(slug) => {
+                    let channel = backend_responder.clone();
+                    let maxima = maxima_arc.clone();
+                    let context = ctx.clone();
+                    async move { get_game_bg_video_request(maxima, slug, channel, &context).await }
+                        .await
+                }
+                MaximaLibRequest::LocateGameRequest(path, slug) => {
                     let mut path = path;
                     if path.ends_with("/") || path.ends_with("\\") {
                         path.remove(path.len() - 1);
                     }
                     let path = PathBuf::from(path);
+
+                    // The game's own Wine prefix (unix); the touchup and the
+                    // install record both use it.
+                    #[cfg(unix)]
+                    let wine_prefix: Result<Option<PathBuf>, NativeError> =
+                        maxima::unix::prefix::resolve_for_game(&slug, None)
+                            .await
+                            .map(Some);
+                    #[cfg(not(unix))]
+                    let wine_prefix: Result<Option<PathBuf>, NativeError> = Ok(None);
+
                     let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await;
                     if let Ok(manifest) = manifest {
-                        let guh = manifest.run_touchup(&path).await;
+                        let guh = match wine_prefix {
+                            Ok(wine_prefix) => {
+                                let touched =
+                                    manifest.run_touchup(&path, wine_prefix.as_deref()).await;
+                                if touched.is_ok() {
+                                    let mut info = maxima::gameinfo::GameInstallInfo::new(
+                                        path.clone(),
+                                        wine_prefix,
+                                    )
+                                    .with_slug(&slug);
+                                    info.version = manifest.version();
+                                    info.save_to_json(&slug);
+                                }
+                                touched
+                            }
+                            Err(err) => Err(ManifestError::Native(err)),
+                        };
                         if let Err(err) = guh {
                             let _ = backend_responder.send(MaximaLibResponse::LocateGameResponse(
                                 InteractThreadLocateGameResponse::Error(
@@ -509,14 +559,16 @@ impl BridgeThread {
                 MaximaLibRequest::InstallGameRequest(offer, path) => {
                     let mut maxima = maxima_arc.lock().await;
 
-                    // macOS: pick/create the per-game CrossOver bottle before
-                    // the install — the touchup steps run through wine and
-                    // resolve the prefix via wine_prefix_dir().
-                    #[cfg(target_os = "macos")]
-                    {
-                        let slug = maxima.mut_library().canonical_slug(&offer).await;
-                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
-                    }
+                    // This game's own Wine prefix (unix; on macOS the
+                    // per-game CrossOver bottle is created here) — the
+                    // touchup steps run through wine inside it, and it is
+                    // recorded with the install.
+                    let slug = maxima.mut_library().canonical_slug(&offer).await;
+                    #[cfg(unix)]
+                    let wine_prefix =
+                        Some(maxima::unix::prefix::resolve_for_game(&slug, None).await?);
+                    #[cfg(not(unix))]
+                    let wine_prefix: Option<PathBuf> = None;
 
                     let builds =
                         maxima.content_manager().service().available_builds(&offer).await?;
@@ -530,6 +582,9 @@ impl BridgeThread {
                         .offer_id(offer)
                         .build_id(build.build_id().to_owned())
                         .path(path.to_owned())
+                        .slug(slug)
+                        .wine_prefix(wine_prefix)
+                        .locale(Some(maxima.locale().full_str().to_owned()))
                         .build()?;
                     let add_result = maxima.content_manager().add_install(game).await;
                     // Surface the new queue state to the UI immediately
@@ -582,11 +637,15 @@ impl BridgeThread {
                             slug, offer_id
                         );
 
-                        // macOS: per-game bottle before install (touchup
-                        // runs through wine). The input slug is already the
-                        // base slug game_by_base_slug matched on.
-                        #[cfg(target_os = "macos")]
-                        maxima::unix::crossover::ensure_game_bottle(&slug).await?;
+                        // This game's own Wine prefix (unix; on macOS the
+                        // per-game bottle) before install — the touchup
+                        // runs through wine inside it. The input slug is
+                        // already the base slug game_by_base_slug matched on.
+                        #[cfg(unix)]
+                        let wine_prefix =
+                            Some(maxima::unix::prefix::resolve_for_game(&slug, None).await?);
+                        #[cfg(not(unix))]
+                        let wine_prefix: Option<PathBuf> = None;
 
                         // 2. Pick the live build (network call —
                         //    `available_builds` hits EA's CDN).
@@ -612,6 +671,8 @@ impl BridgeThread {
                             .offer_id(offer_id.clone())
                             .build_id(build_id)
                             .path(path.clone())
+                            .slug(slug.clone())
+                            .wine_prefix(wine_prefix)
                             .build()?;
                         {
                             let mut maxima = maxima_arc.lock().await;

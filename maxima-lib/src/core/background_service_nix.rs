@@ -4,8 +4,13 @@ use log::debug;
 use regex::Regex;
 use serde::Serialize;
 
+use std::path::Path;
+
 use crate::{
-    unix::wine::{run_wine_command, CommandType},
+    unix::{
+        prefix,
+        wine::{run_wine_command, CommandType},
+    },
     util::native::{module_path, NativeError, SafeParent, SafeStr},
 };
 
@@ -25,8 +30,17 @@ pub struct WineInjectArgs {
     pub path: String,
 }
 
-pub async fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32, NativeError> {
+/// `wine_prefix` is the prefix the game runs in; `None` means the ambient one.
+pub async fn wine_get_pid(
+    launch_id: &str,
+    name: &str,
+    wine_prefix: Option<&Path>,
+) -> Result<u32, NativeError> {
     debug!("Searching for wine PID for {}", name);
+    let prefix = match wine_prefix {
+        Some(prefix) => prefix.to_path_buf(),
+        None => prefix::ambient()?,
+    };
 
     let launch_args = WineGetPidArgs {
         launch_id: launch_id.to_owned(),
@@ -43,6 +57,7 @@ pub async fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32, NativeErro
         None,
         true,
         CommandType::RunInPrefix,
+        &prefix,
     )
     .await?;
 
@@ -63,8 +78,16 @@ pub async fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32, NativeErro
     Ok(pid.as_str().parse()?)
 }
 
-pub async fn request_library_injection(pid: u32, path: &str) -> Result<(), NativeError> {
+pub async fn request_library_injection(
+    pid: u32,
+    path: &str,
+    wine_prefix: Option<&Path>,
+) -> Result<(), NativeError> {
     debug!("Injecting {}", path);
+    let prefix = match wine_prefix {
+        Some(prefix) => prefix.to_path_buf(),
+        None => prefix::ambient()?,
+    };
 
     let launch_args = WineInjectArgs {
         pid,
@@ -81,6 +104,7 @@ pub async fn request_library_injection(pid: u32, path: &str) -> Result<(), Nativ
         None,
         false,
         CommandType::RunInPrefix,
+        &prefix,
     )
     .await?;
 

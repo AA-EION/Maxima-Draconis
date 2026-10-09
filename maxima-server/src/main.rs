@@ -17,9 +17,10 @@ use anyhow::{bail, Result};
 use log::{error, info, warn};
 use maxima::core::{
     auth::{context::AuthContext, login::begin_oauth_login_flow, nucleus_token_exchange},
-    Maxima, MaximaOptionsBuilder,
+    LockedMaxima, Maxima, MaximaOptionsBuilder,
 };
-use maxima::util::log::init_logger_named;
+use maxima::util::{log::init_logger_named, native::maxima_dir};
+use maxima_proto::instance::{GuardError, InstanceGuard};
 
 fn main() {
     // Logger before the runtime so early failures land in the file sink.
@@ -37,7 +38,18 @@ fn main() {
 }
 
 async fn run() -> Result<()> {
-    info!("Starting Maxima server...");
+    // One server per installation context (this user, or this Wine prefix).
+    // Taking the lock first means two frontends racing to spawn a server
+    // can't end up with two servers or two logins.
+    let guard = match InstanceGuard::acquire(&maxima_dir()?, env!("CARGO_PKG_VERSION")) {
+        Ok(guard) => guard,
+        Err(GuardError::AlreadyRunning(dir)) => {
+            info!("A Maxima server is already running for {}; exiting", dir.display());
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    info!("Starting Maxima server (realm {})...", guard.info().realm);
 
     // Sync our sibling binaries into the stable App Support dir (macOS) so
     // launchd / game-spawned bootstrap / every frontend can find us at the
@@ -63,29 +75,26 @@ async fn run() -> Result<()> {
         .build()?;
     let maxima_arc = Maxima::new_with_options(options).await?;
 
-    // Log in — OAuth on first run (opens the browser via qrc://), cached
-    // refresh token afterwards. This is why the frontends never handle login:
-    // the server owns it.
-    {
-        let maxima = maxima_arc.lock().await;
-        let mut auth_storage = maxima.auth_storage().lock().await;
-        if !auth_storage.logged_in().await? {
-            info!("Logging in...");
-            let mut ctx = AuthContext::new()?;
-            begin_oauth_login_flow(&mut ctx).await?;
-            if ctx.code().is_none() {
-                bail!("Login failed!");
-            }
-            let token = nucleus_token_exchange(&ctx).await?;
-            auth_storage.add_account(&token).await?;
-        }
-    }
+    server::run_server(maxima_arc, guard).await
+}
 
-    if let Ok(user) = maxima_arc.lock().await.local_user().await {
-        if let Some(player) = user.player().as_ref() {
-            info!("Logged in as {}!", player.display_name());
-        }
+/// Log in — OAuth on first run (opens the browser via qrc://), cached refresh
+/// token afterwards. The server owns login; frontends only wait for `ready`.
+/// Runs while the control port is already serving, so it must not hold the
+/// `Maxima` lock for the minutes a user can spend in the browser.
+pub(crate) async fn log_in(maxima_arc: &LockedMaxima) -> Result<()> {
+    let auth_storage = maxima_arc.lock().await.auth_storage().clone();
+    let mut auth_storage = auth_storage.lock().await;
+    if auth_storage.logged_in().await? {
+        return Ok(());
     }
-
-    server::run_server(maxima_arc).await
+    info!("Logging in...");
+    let mut ctx = AuthContext::new()?;
+    begin_oauth_login_flow(&mut ctx).await?;
+    if ctx.code().is_none() {
+        bail!("Login failed!");
+    }
+    let token = nucleus_token_exchange(&ctx).await?;
+    auth_storage.add_account(&token).await?;
+    Ok(())
 }

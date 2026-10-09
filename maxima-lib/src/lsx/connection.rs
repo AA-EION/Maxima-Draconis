@@ -1,20 +1,22 @@
 use derive_getters::Getters;
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use quick_xml::DeError;
 use regex::Regex;
-use std::{
-    io::{ErrorKind, Read, Write},
-    net::TcpStream,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{io::ErrorKind, path::PathBuf, sync::Arc};
 use sysinfo::{Pid, PidExt, ProcessExt, System, SystemExt};
 use thiserror::Error;
-use tokio::sync::{MutexGuard, RwLock};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        MutexGuard, RwLock,
+    },
+};
 
 use super::{
+    frame::FrameReader,
     request::{
         account::handle_query_entitlements_request,
         auth::handle_auth_code_request,
@@ -37,8 +39,8 @@ use super::{
         voip::handle_voip_status_request,
     },
     types::{
-        create_lsx_message, LSXChallenge, LSXEvent, LSXEventType, LSXMessageType, LSXRequest,
-        LSXResponse, LSX,
+        create_lsx_message, LSXChallenge, LSXErrorSuccess, LSXEvent, LSXEventType, LSXMessageType,
+        LSXRequest, LSXResponse, LSXResponseType, LSX,
     },
 };
 use crate::{
@@ -77,23 +79,108 @@ const CHALLENGE_BUILD: &str = "release";
 const CHALLENGE_KEY: &str = "cacf897a20b6d612ad0c05e011df52bb"; // Need to figure out how to generate this
 const CHALLENGE_VERSION: &str = "10,5,30,15625";
 
+/// `ErrorSuccess` code for a request we can't answer (no handler, or the XML
+/// doesn't map onto a request type we know). Code 0 is the success ack.
+pub const LSX_ERROR_GENERIC: i64 = -1;
+
 lazy_static! {
-    static ref LSX_PATTERN: Regex = Regex::new(r"<LSX>.*?</LSX>").unwrap();
+    static ref LSX_PATTERN: Regex = Regex::new(r"(?s)<LSX>.*?</LSX>").unwrap();
 }
 
+/// Dispatches an LSX request to its handler. Any request type without a
+/// handler arm (a variant added to `LSXRequestType` before its handler
+/// exists) gets the generic error response instead of failing the connection.
 macro_rules! lsx_message_matcher {
     (
-        $connection_var:expr, $message_var:expr, $message_type:ty;
+        $connection_var:expr, $message_var:expr, $message_type:ident;
         $($name:ident $handler:ident),* $(,)?
     ) => {
-        paste::paste! {
-            match $message_var {
-                $(
-                    $message_type::$name(msg) => $handler($connection_var, msg).await,
-                )*
-            }?
-        }
+        match $message_var {
+            $(
+                $message_type::$name(msg) => $handler($connection_var, msg).await,
+            )*
+            #[allow(unreachable_patterns)]
+            other => Ok(Some(unhandled_request_response(<&'static str>::from(&other)))),
+        }?
     };
+}
+
+fn generic_error_response(description: String) -> LSXResponseType {
+    LSXResponseType::ErrorSuccess(LSXErrorSuccess {
+        attr_Code: LSX_ERROR_GENERIC,
+        attr_Description: description,
+    })
+}
+
+fn unhandled_request_response(request_name: &str) -> LSXResponseType {
+    warn!(
+        "LSX request `{}` has no handler; replying with a generic error",
+        request_name
+    );
+    generic_error_response(format!("{} is not implemented", request_name))
+}
+
+/// What could be recovered from a request whose body didn't map onto any
+/// request type we know, enough to answer it.
+#[derive(Debug, PartialEq, Eq)]
+struct UnmappedRequest {
+    recipient: String,
+    id: String,
+    name: String,
+}
+
+/// Pulls the envelope attributes and the request element name out of
+/// `<LSX><Request recipient=".." id=".."><Name .../></Request></LSX>` without
+/// needing the body to deserialize.
+fn describe_unmapped_request(xml: &str) -> Option<UnmappedRequest> {
+    use quick_xml::{events::Event as XmlEvent, Reader};
+
+    let mut reader = Reader::from_str(xml);
+    let mut envelope: Option<(String, String)> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Start(element)) | Ok(XmlEvent::Empty(element)) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                match &envelope {
+                    None if name == "LSX" => {}
+                    None if name == "Request" => {
+                        let mut recipient = None;
+                        let mut id = None;
+                        for attr in element.attributes().flatten() {
+                            let Ok(value) = attr.unescape_value() else {
+                                continue;
+                            };
+                            match attr.key.local_name().as_ref() {
+                                b"recipient" => recipient = Some(value.into_owned()),
+                                b"id" => id = Some(value.into_owned()),
+                                _ => {}
+                            }
+                        }
+                        envelope = Some((recipient.unwrap_or_default(), id?));
+                    }
+                    None => return None,
+                    Some((recipient, id)) => {
+                        return Some(UnmappedRequest {
+                            recipient: recipient.clone(),
+                            id: id.clone(),
+                            name,
+                        })
+                    }
+                }
+            }
+            Ok(XmlEvent::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+fn preview(text: &str) -> String {
+    const LIMIT: usize = 200;
+    match text.char_indices().nth(LIMIT) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 pub enum EncryptionState {
@@ -111,17 +198,17 @@ pub struct ConnectionState {
     pid: u32,
     /// Game version reported by the client in the LSX challenge response.
     /// Captured during challenge so subsequent handlers (e.g. GetAllGameInfo)
-    /// can reflect the real version back instead of the hardcoded "0" /
-    /// "1.0.1.3" — TF2 reads InstalledVersion / AvailableVersion to verify
-    /// its install isn't tampered with, and mismatches trigger an "Engine
-    /// Error: File corruption detected" dialog.
+    /// can reflect the real version back; some games compare
+    /// InstalledVersion / AvailableVersion against their own and treat a
+    /// mismatch as a tampered install.
     game_version: Option<String>,
-    /// Title reported by the client in the LSX challenge response (e.g.
-    /// "Titanfall2"). Used for diagnostic output and reflected in
+    /// Title reported by the client in the LSX challenge response. Used for diagnostic output and reflected in
     /// GetAllGameInfoResponse.
     game_title: Option<String>,
-    /// Message responses that are waiting to be sent
-    queued_messages: Vec<String>,
+    /// Encoded (serialized, encrypted if enabled, NUL-terminated) messages
+    /// for this connection's writer task.
+    #[getter(skip)]
+    outbound: UnboundedSender<String>,
 }
 
 pub type LockedConnectionState = Arc<RwLock<ConnectionState>>;
@@ -151,18 +238,24 @@ impl ConnectionState {
 
     pub fn queue_message(&mut self, message: LSX) -> Result<(), LSXConnectionError> {
         let mut str = quick_xml::se::to_string(&message)?;
-        // Same rationale as the `info!("Received LSX Message: …")` log
-        // above — paired here so the trace shows the request/response
-        // sequence in order.
-        info!("Queuing LSX Message: {}", str);
+        debug!("Queuing LSX Message: {}", str);
 
         if let EncryptionState::Enabled(key) = self.encryption {
             str = simple_encrypt(str.as_bytes(), &key)
         };
 
         str += "\0";
-        self.queued_messages.push(str);
-        Ok(())
+        self.outbound
+            .send(str)
+            .map_err(|_| LSXConnectionError::Closed)
+    }
+
+    /// Ready -> Enabled once the reply that is still sent in the clear (the
+    /// `ChallengeAccepted`) has been queued.
+    fn activate_pending_encryption(&mut self) {
+        if let EncryptionState::Ready(key) = self.encryption {
+            self.encryption = EncryptionState::Enabled(key);
+        }
     }
 }
 
@@ -202,29 +295,45 @@ pub fn get_os_pid(context: &ActiveGameContext) -> Result<u32, NativeError> {
 }
 
 #[cfg(target_os = "windows")]
-pub async fn get_wine_pid(_launch_id: &str, _name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    _launch_id: &str,
+    _name: &str,
+    _wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     Ok(0)
 }
 
 #[cfg(target_os = "linux")]
-pub async fn get_wine_pid(launch_id: &str, name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    launch_id: &str,
+    name: &str,
+    wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     use crate::core::background_service::wine_get_pid;
 
-    wine_get_pid(launch_id, name).await
+    wine_get_pid(launch_id, name, wine_prefix).await
 }
 
 // macOS: no wine-helper.exe / background service; PID lookup is only used for
 // Kyber DLL injection, which Wine on macOS can't do anyway. 0 = "not found",
 // same contract as the windows stub above.
 #[cfg(target_os = "macos")]
-pub async fn get_wine_pid(_launch_id: &str, _name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    _launch_id: &str,
+    _name: &str,
+    _wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     Ok(0)
 }
 
+
+/// One accepted LSX client. Owns the socket, and runs on its own task
+/// (see [`Connection::run`]); nothing here is shared with other connections
+/// except the `Maxima` behind [`LockedMaxima`].
 pub struct Connection {
-    maxima: LockedMaxima,
     stream: TcpStream,
     state: LockedConnectionState,
+    outbound: UnboundedReceiver<String>,
 }
 
 impl Connection {
@@ -233,23 +342,21 @@ impl Connection {
         stream: TcpStream,
     ) -> Result<Self, LSXConnectionError> {
         stream.set_nodelay(true)?;
-        stream.set_nonblocking(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
 
         let mut pid: Result<u32, NativeError> = Ok(0);
 
         let maxima: MutexGuard<'_, Maxima> = maxima_arc.lock().await;
         match maxima.playing() {
             None => {
-                // Game was launched externally (e.g. Steam Northstar mode via
-                // `steam.exe -applaunch 1237970 -northstar`) rather than
-                // through `maxima-cli launch`. Accept the connection anyway —
+                // Game was launched externally (e.g. through Steam's
+                // `applaunch` or a launcher) rather than through
+                // `maxima-cli launch`. Accept the connection anyway —
                 // LSX only needs the TCP socket; the PID/Kyber path is skipped
                 // because there is no ActiveGameContext to interrogate.
                 //
-                // Without this, TF2 + Northstar launched via Steam would have
-                // its LSX connection rejected immediately, preventing online
-                // play even when Maxima is running in the background.
+                // Without this, a game launched via Steam would have its LSX
+                // connection rejected immediately, preventing online play
+                // even when Maxima is running in the background.
                 //
                 // Ported from catornot/Maxima@patch-external-lsx, which itself
                 // originated as upstream PR #42 (p0358).
@@ -274,7 +381,12 @@ impl Connection {
                             .ok_or(NativeError::Stringify)?
                             .to_owned();
 
-                            pid = get_wine_pid(&context.launch_id(), &filename).await;
+                            pid = get_wine_pid(
+                                &context.launch_id(),
+                                &filename,
+                                context.wine_prefix().as_deref(),
+                            )
+                            .await;
                         } else {
                             warn!(
                                 "Failed to find game process while looking for PID {}",
@@ -291,28 +403,24 @@ impl Connection {
                 }
             }
         };
+        drop(maxima);
 
+        let (outbound_tx, outbound) = unbounded_channel();
         let state = Arc::new(RwLock::new(ConnectionState {
-            maxima: maxima_arc.clone(),
+            maxima: maxima_arc,
             challenge: CHALLENGE_KEY.to_string(),
             encryption: EncryptionState::Disabled,
             pid: pid.unwrap_or(0),
             game_version: None,
             game_title: None,
-            queued_messages: Vec::new(),
+            outbound: outbound_tx,
         }));
 
         Ok(Self {
-            maxima: maxima_arc.clone(),
             stream,
             state,
+            outbound,
         })
-    }
-
-    // State
-
-    pub async fn maxima(&self) -> MutexGuard<Maxima> {
-        self.maxima.lock().await
     }
 
     // Initialization
@@ -331,121 +439,155 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn listen(&mut self) -> Result<(), LSXConnectionError> {
-        let mut buffer = [0; 1024 * 8];
+    /// Serves the connection until the peer goes away: a writer task drains
+    /// the outbound queue to the socket while this task reads frames and
+    /// dispatches them. Returns `Closed` for a clean EOF, anything else is
+    /// the transport failure that ended the connection.
+    pub async fn run(self) -> Result<(), LSXConnectionError> {
+        let Connection {
+            stream,
+            state,
+            mut outbound,
+        } = self;
+        let (read_half, mut write_half) = stream.into_split();
 
-        let n = match self.stream.read(&mut buffer) {
-            Ok(n) if n == 0 => {
-                return Err(LSXConnectionError::Closed);
+        let mut writer = tokio::spawn(async move {
+            while let Some(message) = outbound.recv().await {
+                write_half.write_all(message.as_bytes()).await?;
+                write_half.flush().await?;
             }
-            Ok(n) => n,
-            Err(err) => {
-                let kind = err.kind();
-                if kind == ErrorKind::WouldBlock {
-                    return Ok(());
+            Ok::<(), std::io::Error>(())
+        });
+
+        let mut frames = FrameReader::new(read_half);
+        let result = loop {
+            tokio::select! {
+                outcome = &mut writer => {
+                    break match outcome {
+                        Ok(Ok(())) => Err(LSXConnectionError::Closed),
+                        Ok(Err(err)) => Err(err.into()),
+                        Err(_) => Err(LSXConnectionError::Internal(ErrorKind::Other)),
+                    };
                 }
-                return Err(LSXConnectionError::Internal(kind));
+                frame = frames.next_frame() => match frame {
+                    Ok(Some(frame)) => Connection::process_frame(&state, frame).await,
+                    Ok(None) => break Err(LSXConnectionError::Closed),
+                    Err(err) => break Err(err.into()),
+                },
             }
         };
 
-        let state = self.state.write().await;
-
-        let trimmed_buffer = &buffer[..n];
-        let message = if let EncryptionState::Enabled(key) = state.encryption {
-            simple_decrypt(trimmed_buffer, &key)
-        } else {
-            String::from_utf8_lossy(trimmed_buffer).trim().to_owned()
-        };
-
-        drop(state);
-
-        for mat in LSX_PATTERN.find_iter(message.as_str()) {
-            if let Err(err) = self.process_message(mat.as_str()).await {
-                error!("Failed to process message: {}", err);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn process_queue(&mut self) -> Result<(), LSXConnectionError> {
-        let mut state = self.state.write().await;
-        for message in &state.queued_messages {
-            if let Err(err) = self.stream.write(message.as_bytes()) {
-                error!("Failed to send LSX message: {}", err);
-            }
-        }
-
-        if !state.queued_messages.is_empty() {
-            self.stream.flush()?;
-        }
-
-        state.queued_messages.clear();
-        Ok(())
+        writer.abort();
+        result
     }
 
     // Message Processing
 
-    async fn process_message(&mut self, message: &str) -> Result<(), LSXConnectionError> {
-        // Promoted from `debug!` to `info!` so the per-launch LSX trace
-        // is captured in `maxima-cli.log` by default. The XML payload is
-        // typically <500 bytes per message and we receive ~15 messages
-        // per TF2 launch, so the volume is fine. Lets us diagnose exactly
-        // which LSX request TF2 sends last before disconnecting (the
-        // "File corruption" symptom kills the connection mid-flow and
-        // the last successful request tells us where to look next).
-        info!("Received LSX Message: {}", message);
+    async fn process_frame(state: &LockedConnectionState, frame: Vec<u8>) {
+        let message = match state.read().await.encryption {
+            EncryptionState::Enabled(key) => simple_decrypt(&frame, &key),
+            _ => String::from_utf8_lossy(&frame).trim().to_owned(),
+        };
 
-        let mut message = message.to_string();
-        message.remove_matches("version=\"\" ");
-        let lsx_message: LSX = quick_xml::de::from_str(message.as_str())?;
+        let mut found = false;
+        for mat in LSX_PATTERN.find_iter(message.as_str()) {
+            found = true;
+            Connection::process_message(state, mat.as_str()).await;
+        }
 
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let reply: Result<Option<LSXMessageType>, LSXConnectionError> = match lsx_message.value
-            {
-                LSXMessageType::Event(msg) => Connection::process_event_message(&state, msg).await,
-                LSXMessageType::Request(msg) => {
-                    Connection::process_request_message(&state, msg).await
-                }
-                LSXMessageType::Response(_) => {
-                    warn!("Ignoring unexpected LSX response message from the game");
-                    Ok(None)
-                }
-            };
-
-            let reply: Option<LSXMessageType> = match reply {
-                Ok(reply) => reply,
-                Err(err) => {
-                    error!("Failed to process LSX message: {}", err);
-                    return;
-                }
-            };
-
-            if let Some(reply) = reply {
-                let mut state = state.write().await;
-                let result = state.queue_message(LSX { value: reply });
-
-                if let Err(err) = result {
-                    error!("Failed to queue LSX message: {}", err);
-                    return;
-                }
-            }
-
-            let mut state = state.write().await;
-            if let EncryptionState::Ready(key) = state.encryption {
-                state.encryption = EncryptionState::Enabled(key);
-            }
-        });
-
-        Ok(())
+        if !found && !frame.iter().all(|b| b.is_ascii_whitespace()) {
+            warn!(
+                "Ignoring LSX frame without a message ({} bytes): {}",
+                frame.len(),
+                preview(&message)
+            );
+        }
     }
 
-    async fn process_event_message(
-        _: &LockedConnectionState,
-        _: LSXEvent,
-    ) -> Result<Option<LSXMessageType>, LSXConnectionError> {
-        Ok(None)
+    async fn process_message(state: &LockedConnectionState, message: &str) {
+        debug!("Received LSX Message: {}", message);
+
+        let cleaned = message.replace("version=\"\" ", "");
+        let lsx_message: LSX = match quick_xml::de::from_str(cleaned.as_str()) {
+            Ok(lsx_message) => lsx_message,
+            Err(err) => {
+                Connection::reply_unmapped(state, message, err).await;
+                return;
+            }
+        };
+
+        match lsx_message.value {
+            LSXMessageType::Event(_) => {}
+            LSXMessageType::Response(_) => {
+                warn!("Ignoring unexpected LSX response message from the game");
+            }
+            LSXMessageType::Request(request) => {
+                // The challenge response switches the codec for everything
+                // after it, so it has to be fully handled before the next
+                // frame is decoded. Everything else runs concurrently so a
+                // slow handler (EA network calls) doesn't hold up the rest.
+                if matches!(request.value, LSXRequestType::ChallengeResponse(_)) {
+                    Connection::handle_request(state, request).await;
+                } else {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        Connection::handle_request(&state, request).await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// A request we couldn't deserialize (a type we don't implement, e.g.
+    /// `QueryAchievements`, or attributes that don't fit our types) still
+    /// gets an answer if we can tell which request it was, so the game isn't
+    /// left waiting on a reply that never comes.
+    async fn reply_unmapped(state: &LockedConnectionState, message: &str, cause: DeError) {
+        let Some(request) = describe_unmapped_request(message) else {
+            warn!(
+                "Ignoring unparseable LSX message ({}): {}",
+                cause,
+                preview(message)
+            );
+            return;
+        };
+
+        warn!(
+            "LSX request `{}` (id {}) is not implemented or could not be mapped ({}); \
+             replying with a generic error",
+            request.name, request.id, cause
+        );
+
+        let reply = LSX {
+            value: LSXMessageType::Response(LSXResponse {
+                sender: request.recipient,
+                id: request.id,
+                value: generic_error_response(format!("{} is not implemented", request.name)),
+            }),
+        };
+        Connection::queue_reply(state, reply).await;
+    }
+
+    async fn handle_request(state: &LockedConnectionState, request: LSXRequest) {
+        match Connection::process_request_message(state, request).await {
+            Ok(Some(reply)) => {
+                Connection::queue_reply(state, LSX { value: reply }).await;
+            }
+            Ok(None) => {}
+            Err(err) => error!("Failed to process LSX message: {}", err),
+        }
+
+        state.write().await.activate_pending_encryption();
+    }
+
+    async fn queue_reply(state: &LockedConnectionState, reply: LSX) {
+        match state.write().await.queue_message(reply) {
+            Ok(()) => {}
+            Err(LSXConnectionError::Closed) => {
+                debug!("Dropping LSX reply, the connection is already closed")
+            }
+            Err(err) => error!("Failed to queue LSX message: {}", err),
+        }
     }
 
     async fn process_request_message(
@@ -453,11 +595,12 @@ impl Connection {
         message: LSXRequest,
     ) -> Result<Option<LSXMessageType>, LSXConnectionError> {
         {
-            let pid = *state.read().await.pid();
-            state
-                .write()
-                .await
-                .maxima()
+            let (maxima, pid) = {
+                let state = state.read().await;
+                (state.maxima.clone(), *state.pid())
+            };
+            maxima
+                .lock()
                 .await
                 .call_event(MaximaEvent::ReceivedLSXRequest(pid, message.value.clone()));
         }
@@ -489,13 +632,64 @@ impl Connection {
             SetDownloaderUtilization handle_set_downloader_util_request,
         );
 
-        Ok(match result {
-            Some(result) => Some(LSXMessageType::Response(LSXResponse {
+        Ok(result.map(|result| {
+            LSXMessageType::Response(LSXResponse {
                 sender: message.recipient,
                 id: message.id,
                 value: result,
-            })),
-            None => None,
-        })
+            })
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_a_request_with_an_unknown_body() {
+        let xml = r#"<LSX><Request recipient="EALS" id="42"><QueryAchievements version="" UserId="1" AchievementSet="x"/></Request></LSX>"#;
+        assert_eq!(
+            describe_unmapped_request(xml),
+            Some(UnmappedRequest {
+                recipient: "EALS".into(),
+                id: "42".into(),
+                name: "QueryAchievements".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn describes_a_request_with_a_nested_body() {
+        let xml = r#"<LSX><Request recipient="EALS" id="7"><Foo><Bar/></Foo></Request></LSX>"#;
+        let request = describe_unmapped_request(xml).unwrap();
+        assert_eq!((request.id.as_str(), request.name.as_str()), ("7", "Foo"));
+    }
+
+    #[test]
+    fn cannot_describe_anything_that_is_not_a_request() {
+        assert_eq!(
+            describe_unmapped_request(r#"<LSX><Event sender="EALS"><Challenge/></Event></LSX>"#),
+            None
+        );
+        assert_eq!(
+            describe_unmapped_request(r#"<LSX><Request recipient="EALS"><Foo/></Request></LSX>"#),
+            None,
+            "without an id there is nothing to correlate a reply with"
+        );
+        assert_eq!(describe_unmapped_request("<LSX><Request"), None);
+        assert_eq!(describe_unmapped_request("not xml"), None);
+    }
+
+    #[test]
+    fn generic_error_is_a_nonzero_error_success() {
+        match unhandled_request_response("QueryAchievements") {
+            LSXResponseType::ErrorSuccess(error) => {
+                assert_eq!(error.attr_Code, LSX_ERROR_GENERIC);
+                assert_ne!(error.attr_Code, 0);
+                assert!(error.attr_Description.contains("QueryAchievements"));
+            }
+            other => panic!("unexpected response {:?}", other),
+        }
     }
 }

@@ -1,43 +1,48 @@
-//! `maxima-cli server` — the multi-client Maxima server.
+//! The multi-client Maxima server.
 //!
 //! One process holds the logged-in session, the LSX server, the `/authorize`
 //! HTTP endpoint and the RTM connection, and serves **many** concurrent
-//! clients over a loopback TCP socket (default `127.0.0.1:13220`, override
-//! with `MAXIMA_SERVER_PORT`). Every client sees the same state.
+//! clients over a loopback TCP socket. Every client sees the same state.
 //!
-//! This is upstream PR #23's "Maxima Server": one server, frontends as thin
-//! clients. The wire protocol and the client live in the `maxima-proto`
-//! crate (typed [`maxima_proto::Request`] / [`ResponseEnvelope`] /
-//! [`Notification`]); this module is the server side — it dispatches those
-//! requests against the real `maxima-lib` `Maxima` and broadcasts
+//! The control port is OS-assigned (or `MAXIMA_SERVER_PORT`) and published,
+//! together with a per-run token, in `instance.json` in this installation
+//! context's data directory (see `maxima_proto::instance`). A connection must
+//! open with a `hello` carrying that token; nothing else is answered. Wine
+//! prefixes share the host loopback, so this is what keeps a client in one
+//! prefix, on the host, or a web page from driving another context's session.
+//!
+//! The wire protocol and the client live in `maxima-proto`; this module
+//! dispatches requests against the real `maxima-lib` `Maxima` and broadcasts
 //! notifications to every client.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{error, info, warn};
 use maxima::core::{
     cloudsync::CloudSyncLockMode,
-    launch::{self, LaunchMode, LaunchOptions},
+    launch::{self, EntitlementSource, LaunchMode, LaunchOptions},
     manifest, LockedMaxima, Maxima, MaximaEvent,
 };
-use maxima_proto::types::{ExtraOfferDto, GameDto};
 use maxima::rtm::client::RichPresence;
-use maxima_proto::message::{Notification, Request, RequestEnvelope, ResponseEnvelope};
-use maxima_proto::types::{FriendDto, GameDetailsDto, StatusDto};
+use maxima_proto::instance::{token_matches, InstanceGuard, InstanceState, PROTO_VERSION};
+use maxima_proto::message::{
+    ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
+};
+use maxima_proto::types::{ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, StatusDto};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
-pub fn server_port() -> u16 {
-    maxima_proto::server_port()
-}
-
 struct ServerState {
     maxima: LockedMaxima,
+    realm: String,
+    token: String,
+    /// The EA login has finished and the session services are up.
+    ready: AtomicBool,
     installing: Mutex<Option<String>>,
     /// Serialized [`Notification`] lines, broadcast to every client.
     events: broadcast::Sender<String>,
@@ -53,30 +58,106 @@ impl ServerState {
             let _ = self.events.send(line);
         }
     }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
-pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
-    let port = server_port();
+/// A request that conflicts with work already running.
+#[derive(Debug)]
+struct Busy(String);
 
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            anyhow::bail!(
-                "a Maxima server is already running on 127.0.0.1:{} (stop it with \
-                 `maxima-cli server-stop`)",
-                port
-            );
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> Result<()> {
+    let requested_port = std::env::var("MAXIMA_SERVER_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", requested_port)).await?;
+    let port = listener.local_addr()?.port();
+
+    let (events_tx, _) = broadcast::channel::<String>(256);
+    let state = Arc::new(ServerState {
+        maxima: maxima_arc.clone(),
+        realm: guard.info().realm.clone(),
+        token: guard.info().token.clone(),
+        ready: AtomicBool::new(false),
+        installing: Mutex::new(None),
+        events: events_tx,
+        shutdown: Notify::new(),
+        persona: Mutex::new(String::new()),
+        clients: AtomicUsize::new(0),
+    });
+
+    // Serve before logging in: a first-run login waits on the user in the
+    // browser, and clients should see `login-required` instead of a closed
+    // port they'd mistake for "no server".
+    guard.publish(|info| info.control_port = Some(port))?;
+    info!("Maxima server listening on 127.0.0.1:{}", port);
+
+    let accept_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let s = accept_state.clone();
+                    tokio::spawn(async move { handle_client(s, stream).await });
+                }
+                Err(err) => warn!("accept failed: {}", err),
+            }
         }
-        Err(err) => return Err(err.into()),
-    };
+    });
 
-    // --- Session setup: LSX + authorize + RTM, like `serve`. ---
-    let persona = {
+    // The server owns its status-bar icon on every OS (Windows tray / macOS
+    // menu-bar host / Linux SNI behind a feature). Menu: Open Maxima / Stop.
+    let stop_state = state.clone();
+    crate::status_icon::spawn(Arc::new(move || stop_state.shutdown.notify_one()));
+
+    tokio::select! {
+        result = start_session(&state, &mut guard) => {
+            if let Err(err) = result {
+                error!("Maxima session failed to start: {}", err);
+                return Err(err);
+            }
+        }
+        _ = state.shutdown.notified() => {
+            info!("Shutdown requested before login finished — Maxima server stopping");
+            return Ok(());
+        }
+    }
+
+    let tick_state = state.clone();
+    tokio::spawn(async move { tick_loop(tick_state).await });
+
+    state.shutdown.notified().await;
+    info!("Shutdown requested — Maxima server stopping");
+    Ok(())
+}
+
+/// Log in, then bring up LSX, `/authorize` and RTM, and announce `ready`.
+async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> Result<()> {
+    let maxima_arc = &state.maxima;
+    crate::log_in(maxima_arc).await?;
+
+    let (persona, lsx_port, authorize_port) = {
         let mut maxima = maxima_arc.lock().await;
         maxima.start_lsx(maxima_arc.clone()).await?;
-        if let Err(err) = maxima.start_auth_server(maxima_arc.clone()).await {
-            warn!("Authorize HTTP server failed to start: {}", err);
-        }
+        let authorize_port = match maxima.start_auth_server(maxima_arc.clone(), &state.token).await
+        {
+            Ok(port) => Some(port),
+            Err(err) => {
+                warn!("Authorize HTTP server failed to start: {}", err);
+                None
+            }
+        };
         if let Err(err) = maxima.rtm().login().await {
             warn!("RTM login failed (continuing without presence): {}", err);
         } else {
@@ -94,49 +175,23 @@ pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
             }
         }
         let user = maxima.local_user().await?;
-        user.player()
+        let persona = user
+            .player()
             .as_ref()
             .map(|p| p.display_name().to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (persona, maxima.lsx_bound_port(), authorize_port)
     };
 
-    let (events_tx, _) = broadcast::channel::<String>(256);
-    let state = Arc::new(ServerState {
-        maxima: maxima_arc.clone(),
-        installing: Mutex::new(None),
-        events: events_tx,
-        shutdown: Notify::new(),
-        persona: Mutex::new(persona.clone()),
-        clients: AtomicUsize::new(0),
-    });
-
-    info!("Maxima server listening on 127.0.0.1:{} (persona: {})", port, persona);
-
-    // The server owns its status-bar icon on every OS (Windows tray / macOS
-    // menu-bar host / Linux SNI behind a feature). Menu: Open Maxima / Stop.
-    crate::status_icon::spawn(port);
-
-    let tick_state = state.clone();
-    tokio::spawn(async move { tick_loop(tick_state).await });
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _addr)) => {
-                        let s = state.clone();
-                        tokio::spawn(async move { handle_client(s, stream).await; });
-                    }
-                    Err(err) => warn!("accept failed: {}", err),
-                }
-            }
-            _ = state.shutdown.notified() => {
-                info!("Shutdown requested — Maxima server stopping");
-                break;
-            }
-        }
-    }
-
+    guard.publish(|info| {
+        info.state = InstanceState::Ready;
+        info.lsx_port = lsx_port;
+        info.authorize_port = authorize_port;
+    })?;
+    *state.persona.lock().await = persona.clone();
+    state.ready.store(true, Ordering::Release);
+    state.notify(Notification::Ready { persona: persona.clone() });
+    info!("Logged in as {}; session ready", persona);
     Ok(())
 }
 
@@ -152,16 +207,25 @@ async fn tick_loop(state: Arc<ServerState>) {
         tick.tick().await;
         let mut maxima = state.maxima.lock().await;
 
-        for event in maxima.consume_pending_events() {
-            if let MaximaEvent::InstallFinished(_offer_id) = event {
-                let slug = state.installing.lock().await.take();
-                state.notify(Notification::InstallDone { slug });
-                state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
-                last_percent = -1.0;
-            }
-        }
-
         maxima.update().await;
+
+        // After update(), so an install that ended this tick is reported by its
+        // event, never mistaken for success by the "download vanished" check below.
+        for event in maxima.consume_pending_events() {
+            let notification = match event {
+                MaximaEvent::InstallFinished(_) => {
+                    Notification::InstallDone { slug: state.installing.lock().await.take() }
+                }
+                MaximaEvent::InstallFailed { message, .. } => Notification::InstallError {
+                    slug: state.installing.lock().await.take(),
+                    message,
+                },
+                MaximaEvent::ReceivedLSXRequest(..) => continue,
+            };
+            state.notify(notification);
+            state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
+            last_percent = -1.0;
+        }
 
         let playing_now = maxima.playing().is_some();
         if was_playing && !playing_now {
@@ -184,7 +248,10 @@ async fn tick_loop(state: Arc<ServerState>) {
                 }
                 None => {
                     *state.installing.lock().await = None;
-                    state.notify(Notification::InstallDone { slug: Some(slug) });
+                    state.notify(Notification::InstallError {
+                        slug: Some(slug),
+                        message: "the download stopped before it finished".into(),
+                    });
                     state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
                     last_percent = -1.0;
                 }
@@ -215,6 +282,21 @@ async fn tick_loop(state: Arc<ServerState>) {
 async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    // The first line must be a valid `hello`; anything else gets one error
+    // reply and the connection is closed.
+    let hello = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        _ => return,
+    };
+    if let Err(reply) = check_hello(&state, &hello) {
+        if let Ok(line) = serde_json::to_string(&reply) {
+            let _ = write_half.write_all(format!("{line}\n").as_bytes()).await;
+        }
+        return;
+    }
+
     let n = state.clients.fetch_add(1, Ordering::SeqCst) + 1;
     info!("client connected ({} total)", n);
 
@@ -230,7 +312,21 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     });
 
+    // Subscribe before replying so no notification can fall in between.
     let mut events_rx = state.events.subscribe();
+    let hello_id = id_hint(&hello);
+    let reply = ResponseEnvelope::ok(
+        hello_id,
+        json!({ "realm": state.realm, "server": env!("CARGO_PKG_VERSION"), "proto": PROTO_VERSION }),
+    );
+    send(&out_tx, &reply);
+    if state.is_ready() {
+        let persona = state.persona.lock().await.clone();
+        send(&out_tx, &Notification::Ready { persona });
+    } else {
+        send(&out_tx, &Notification::LoginRequired);
+    }
+
     let ev_tx = out_tx.clone();
     let forwarder = tokio::spawn(async move {
         loop {
@@ -246,46 +342,34 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     });
 
-    // Greet with a ready snapshot.
-    let persona = state.persona.lock().await.clone();
-    if let Ok(line) = serde_json::to_string(&Notification::Ready { persona }) {
-        let _ = out_tx.send(line);
-    }
-
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<RequestEnvelope>(&line) {
-                    Ok(env) => {
-                        let id = env.id;
-                        let is_shutdown = matches!(env.request, Request::Shutdown);
-                        let response = dispatch(&state, id, env.request).await;
-                        if let Ok(line) = serde_json::to_string(&response) {
-                            let _ = out_tx.send(line);
-                        }
-                        if is_shutdown {
-                            state.shutdown.notify_waiters();
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let resp = ResponseEnvelope::err(
-                            id_hint(&line),
-                            format!("bad request: {}", err),
-                        );
-                        if let Ok(line) = serde_json::to_string(&resp) {
-                            let _ = out_tx.send(line);
-                        }
-                    }
-                }
-            }
-            _ => break,
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
         }
+        let env = match serde_json::from_str::<RequestEnvelope>(&line) {
+            Ok(env) => env,
+            Err(err) => {
+                let reply = ResponseEnvelope::fail(
+                    id_hint(&line),
+                    ErrorKind::Invalid,
+                    format!("bad request: {}", err),
+                );
+                send(&out_tx, &reply);
+                continue;
+            }
+        };
+        // Each request runs on its own task, so a long verify or download
+        // doesn't hold up this client's other requests.
+        let state = state.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let is_shutdown = matches!(env.request, Request::Shutdown);
+            let response = dispatch(&state, env.id, env.request).await;
+            send(&out_tx, &response);
+            if is_shutdown {
+                state.shutdown.notify_one();
+            }
+        });
     }
 
     forwarder.abort();
@@ -293,6 +377,38 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     let _ = writer.await;
     let remaining = state.clients.fetch_sub(1, Ordering::SeqCst) - 1;
     info!("client disconnected ({} remaining)", remaining);
+}
+
+fn send<T: serde::Serialize>(out: &mpsc::UnboundedSender<String>, message: &T) {
+    if let Ok(line) = serde_json::to_string(message) {
+        let _ = out.send(line);
+    }
+}
+
+fn check_hello(state: &ServerState, line: &str) -> Result<(), ResponseEnvelope> {
+    let id = id_hint(line);
+    match serde_json::from_str::<RequestEnvelope>(line).map(|env| env.request) {
+        Ok(Request::Hello { token, client, proto }) => {
+            if !token_matches(&state.token, &token) {
+                warn!("rejected a client with a wrong token ({})", client);
+                return Err(ResponseEnvelope::fail(id, ErrorKind::Unauthorized, "bad token"));
+            }
+            if proto != PROTO_VERSION {
+                return Err(ResponseEnvelope::fail(
+                    id,
+                    ErrorKind::IncompatibleVersion,
+                    format!(
+                        "client speaks protocol {proto}, this server (Maxima {}) speaks {PROTO_VERSION}; \
+                         restart the server after updating",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                ));
+            }
+            info!("client identified as {}", if client.is_empty() { "unnamed" } else { &client });
+            Ok(())
+        }
+        _ => Err(ResponseEnvelope::fail(id, ErrorKind::Unauthorized, "send hello first")),
+    }
 }
 
 fn id_hint(line: &str) -> u64 {
@@ -305,7 +421,23 @@ fn id_hint(line: &str) -> u64 {
 /// Handle one request, returning the response for the requesting client.
 /// Notifications (broadcast to all) are emitted as a side effect.
 async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> ResponseEnvelope {
+    match request {
+        Request::Hello { .. } => {
+            return ResponseEnvelope::fail(id, ErrorKind::Invalid, "already identified")
+        }
+        Request::Status | Request::Shutdown => {}
+        _ if !state.is_ready() => {
+            return ResponseEnvelope::fail(
+                id,
+                ErrorKind::LoginPending,
+                "the Maxima server is waiting for the EA login to finish",
+            )
+        }
+        _ => {}
+    }
+
     let result: Result<serde_json::Value> = match request {
+        Request::Hello { .. } => unreachable!("handled above"),
         Request::Status => Ok(json!({ "status": status(state).await })),
         Request::Shutdown => Ok(json!({ "stopping": true })),
         Request::ListGames => {
@@ -340,46 +472,93 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
         Request::GameImages { slug } => {
             game_images(state, &slug).await.map(|i| json!({ "images": i }))
         }
-        Request::Launch { slug, args, exe_override, cloud_saves } => cmd_launch(
-            state, slug, args, exe_override, cloud_saves,
+        Request::Launch {
+            slug,
+            args,
+            exe_override,
+            cloud_saves,
+            wine_prefix,
+            wine_dll_overrides,
+            steam_app_id,
+            entitlement_source,
+        } => cmd_launch(
+            state,
+            slug,
+            args,
+            exe_override,
+            cloud_saves,
+            wine_prefix,
+            wine_dll_overrides,
+            steam_app_id,
+            entitlement_source,
         )
         .await
         .map(|_| json!({})),
-        Request::Install { slug, path, build_id, replace_files, only_listed_files } => {
-            cmd_install(state, slug, path, build_id, replace_files, only_listed_files)
+        Request::Install {
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            wine_prefix,
+            exclude,
+        } => cmd_install(
+            state,
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            wine_prefix,
+            exclude,
+        )
+        .await
+        .map(|_| json!({})),
+        Request::LocateGame { path, slug, wine_prefix } => {
+            cmd_locate(state, &path, slug, wine_prefix).await.map(|_| json!({}))
+        }
+        Request::CloudSync { slug, write, wine_prefix } => {
+            cmd_cloud_sync(state, &slug, write, wine_prefix).await.map(|_| json!({}))
+        }
+        Request::Verify { slug, path, repair, wine_prefix, exclude } => {
+            cmd_verify(state, slug, path, repair, wine_prefix, exclude)
                 .await
                 .map(|_| json!({}))
         }
-        Request::LocateGame { path } => cmd_locate(state, &path).await.map(|_| json!({})),
-        Request::CloudSync { slug, write } => {
-            cmd_cloud_sync(state, &slug, write).await.map(|_| json!({}))
+        Request::DownloadFile { slug, build_id, file, wine_prefix } => {
+            cmd_download_file(state, &slug, build_id, &file, wine_prefix)
+                .await
+                .map(|_| json!({}))
         }
-        Request::Verify { slug, path, repair } => {
-            cmd_verify(state, slug, path, repair).await.map(|_| json!({}))
-        }
-        Request::DownloadFile { slug, build_id, file } => {
-            cmd_download_file(state, &slug, build_id, &file).await.map(|_| json!({}))
-        }
-        Request::BottleInfo { slug } => {
-            cmd_bottle_info(state, &slug).await.map(|b| json!({ "bottle": b }))
+        Request::BottleInfo { slug, wine_prefix } => {
+            cmd_bottle_info(state, &slug, wine_prefix).await.map(|b| json!({ "bottle": b }))
         }
         Request::RegisterProtocols => cmd_register_protocols().await.map(|_| json!({})),
     };
 
     match result {
         Ok(data) => ResponseEnvelope::ok(id, data),
+        Err(err) if err.is::<Busy>() => ResponseEnvelope::fail(id, ErrorKind::Busy, err.to_string()),
         Err(err) => ResponseEnvelope::err(id, err.to_string()),
     }
 }
 
 async fn status(state: &Arc<ServerState>) -> StatusDto {
-    let maxima = state.maxima.lock().await;
+    let logged_in = state.is_ready();
+    let (playing, lsx_port) = if logged_in {
+        let maxima = state.maxima.lock().await;
+        (maxima.playing().is_some(), maxima.effective_lsx_port())
+    } else {
+        (false, 0)
+    };
     StatusDto {
         persona: state.persona.lock().await.clone(),
-        playing: maxima.playing().is_some(),
+        playing,
         installing: state.installing.lock().await.clone(),
-        lsx_port: *maxima.lsx_port(),
+        lsx_port,
         clients: state.clients.load(Ordering::SeqCst) as u64,
+        realm: state.realm.clone(),
+        logged_in,
     }
 }
 
@@ -537,6 +716,10 @@ async fn game_details(state: &Arc<ServerState>, slug: &str) -> Result<GameDetail
     })
 }
 
+/// Resolve whatever the client typed to the library's canonical
+/// `(slug, offer_id)`. Pure lookup: choosing (and creating) the game's Wine
+/// prefix is a separate, per-request step ([`prepare_prefix`] /
+/// [`peek_prefix`]), so two games never share a selection.
 async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String, String)> {
     let mut maxima = maxima_arc.lock().await;
     let slug = maxima.mut_library().canonical_slug(typed).await;
@@ -546,17 +729,66 @@ async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String,
         .await?
         .map(|o| o.offer_id().clone())
         .ok_or_else(|| anyhow::anyhow!("`{}` is not in this EA library", typed))?;
-    drop(maxima);
-
-    #[cfg(target_os = "macos")]
-    maxima::unix::crossover::ensure_game_bottle(&slug).await?;
-
     Ok((slug, offer_id))
 }
 
-fn conventional_game_dir(slug: &str) -> Option<String> {
-    let prefix = std::env::var("MAXIMA_WINE_PREFIX").ok()?;
-    let dir = std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug);
+fn explicit_prefix(wine_prefix: &Option<String>) -> Option<std::path::PathBuf> {
+    wine_prefix
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The Wine prefix `slug` runs in for this request, created if it is Maxima's
+/// to create (the per-game CrossOver bottle on macOS). Done before any lock
+/// on the session is taken: creating a bottle can take a minute. `None` on
+/// Windows, which has no prefixes.
+#[cfg(unix)]
+async fn prepare_prefix(
+    slug: &str,
+    wine_prefix: &Option<String>,
+) -> Result<Option<std::path::PathBuf>> {
+    let explicit = explicit_prefix(wine_prefix);
+    Ok(Some(
+        maxima::unix::prefix::resolve_for_game(slug, explicit.as_deref()).await?,
+    ))
+}
+
+#[cfg(not(unix))]
+async fn prepare_prefix(
+    _slug: &str,
+    _wine_prefix: &Option<String>,
+) -> Result<Option<std::path::PathBuf>> {
+    Ok(None)
+}
+
+/// Like [`prepare_prefix`] but creates nothing — for read-only commands.
+#[cfg(unix)]
+fn peek_prefix(
+    slug: &str,
+    wine_prefix: &Option<String>,
+) -> Option<(std::path::PathBuf, maxima::unix::prefix::PrefixSource)> {
+    let explicit = explicit_prefix(wine_prefix);
+    maxima::unix::prefix::peek_for_game(slug, explicit.as_deref()).ok()
+}
+
+#[cfg(not(unix))]
+fn peek_prefix(_slug: &str, _wine_prefix: &Option<String>) -> Option<(std::path::PathBuf, ())> {
+    None
+}
+
+fn peeked_prefix_path(slug: &str, wine_prefix: &Option<String>) -> Option<std::path::PathBuf> {
+    peek_prefix(slug, wine_prefix).map(|(path, _)| path)
+}
+
+fn recorded_install_dir(slug: &str) -> Option<std::path::PathBuf> {
+    maxima::gameinfo::load_game_info(slug)
+        .map(|info| info.path)
+        .filter(|path| path.is_dir())
+}
+
+fn conventional_game_dir(slug: &str, prefix: Option<&std::path::Path>) -> Option<String> {
+    let dir = prefix?.join("drive_c").join("Games").join(slug);
     dir.exists().then(|| dir.to_string_lossy().to_string())
 }
 
@@ -566,14 +798,32 @@ async fn cmd_launch(
     args: Vec<String>,
     exe_override: Option<String>,
     cloud_saves: bool,
+    wine_prefix: Option<String>,
+    wine_dll_overrides: Vec<String>,
+    steam_app_id: Option<String>,
+    entitlement_source: Option<maxima_proto::EntitlementSource>,
 ) -> Result<()> {
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let path_override = exe_override.or_else(|| conventional_game_dir(&slug));
+    let prefix = prepare_prefix(&slug, &wine_prefix).await?;
+    let path_override = exe_override
+        .or_else(|| recorded_install_dir(&slug).map(|d| d.to_string_lossy().to_string()))
+        .or_else(|| conventional_game_dir(&slug, prefix.as_deref()));
 
     launch::start_game(
         state.maxima.clone(),
         LaunchMode::Online(offer_id),
-        LaunchOptions { path_override, arguments: args, cloud_saves, steam_app_id: None },
+        LaunchOptions {
+            path_override,
+            arguments: args,
+            cloud_saves,
+            steam_app_id,
+            entitlement_source: entitlement_source.map(|s| match s {
+                maxima_proto::EntitlementSource::Ea => EntitlementSource::Ea,
+                maxima_proto::EntitlementSource::Steam => EntitlementSource::Steam,
+            }),
+            wine_prefix: prefix,
+            wine_dll_overrides,
+        },
     )
     .await?;
 
@@ -581,17 +831,22 @@ async fn cmd_launch(
     Ok(())
 }
 
-/// Resolve the install path for a game — explicit, or the conventional
-/// per-bottle dir.
-fn install_dir_for(slug: &str, path: Option<String>) -> Result<std::path::PathBuf> {
-    match path {
-        Some(p) => Ok(std::path::PathBuf::from(p)),
-        None => {
-            let prefix = std::env::var("MAXIMA_WINE_PREFIX")
-                .map_err(|_| anyhow::anyhow!("no path and no bottle selected for {}", slug))?;
-            Ok(std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug))
-        }
+/// Resolve the install path for a game: explicit, else where its install
+/// record says it lives, else the conventional per-prefix dir.
+fn install_dir_for(
+    slug: &str,
+    path: Option<String>,
+    prefix: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
+    if let Some(p) = path {
+        return Ok(std::path::PathBuf::from(p));
     }
+    if let Some(dir) = recorded_install_dir(slug) {
+        return Ok(dir);
+    }
+    let prefix = prefix
+        .ok_or_else(|| anyhow::anyhow!("no path and no wine prefix known for {}", slug))?;
+    Ok(prefix.join("drive_c").join("Games").join(slug))
 }
 
 /// Reject `..` / absolute segments so a bad replace-files entry can't escape
@@ -607,6 +862,7 @@ fn safe_relative(relative: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_install(
     state: &Arc<ServerState>,
     typed: String,
@@ -614,12 +870,21 @@ async fn cmd_install(
     build_id_override: Option<String>,
     replace_files: Vec<String>,
     only_listed_files: bool,
+    wine_prefix: Option<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
     use maxima::content::manager::QueuedGameBuilder;
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let install_path = install_dir_for(&slug, path)?;
+    // A surgical refresh of a few files neither installs the game nor needs
+    // its prefix to exist; a real install creates the prefix up front.
+    let prefix = if only_listed_files {
+        peeked_prefix_path(&slug, &wine_prefix)
+    } else {
+        prepare_prefix(&slug, &wine_prefix).await?
+    };
+    let install_path = install_dir_for(&slug, path, prefix.as_deref())?;
 
     // Pre-install replace step: delete listed files so the downloader
     // re-fetches them (works for ANY file of ANY game — the Steam-CEG fix
@@ -686,13 +951,18 @@ async fn cmd_install(
 
     // Full install: queue it; the tick loop broadcasts progress.
     if state.installing.lock().await.is_some() {
-        anyhow::bail!("another install is already running");
+        return Err(Busy("another install is already running".into()).into());
     }
     let mut maxima = state.maxima.lock().await;
+    let locale = maxima.locale().full_str().to_owned();
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build_id)
         .path(install_path)
+        .slug(slug.clone())
+        .wine_prefix(prefix)
+        .exclude(exclude)
+        .locale(Some(locale))
         .build()?;
     maxima.content_manager().install_now(game).await?;
     drop(maxima);
@@ -710,12 +980,23 @@ async fn cmd_verify(
     typed: String,
     path: Option<String>,
     repair: bool,
+    wine_prefix: Option<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
-    use maxima::content::{downloader::ZipDownloader, ContentService};
+    use maxima::content::{downloader::ZipDownloader, exclusion::get_exclusion_list, ContentService};
     use tokio::fs;
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let install_path = install_dir_for(&slug, path.clone())?;
+    let prefix = peeked_prefix_path(&slug, &wine_prefix);
+    let install_path = install_dir_for(&slug, path.clone(), prefix.as_deref())?;
+
+    // Files the user excluded from the download are not "missing": the
+    // game's exclusion file, what the install recorded, and this request.
+    let mut patterns = maxima::gameinfo::load_game_info(&slug)
+        .map(|info| info.exclude)
+        .unwrap_or_default();
+    patterns.extend(exclude);
+    let exclusion = get_exclusion_list(&slug, &patterns);
     if !fs::try_exists(&install_path).await.unwrap_or(false) {
         anyhow::bail!("install path '{}' doesn't exist", install_path.display());
     }
@@ -733,9 +1014,18 @@ async fn cmd_verify(
     };
 
     let downloader = ZipDownloader::new(&offer_id, &manifest_url, &install_path).await?;
-    let entries = downloader.manifest().entries();
+    let entries: Vec<_> = downloader
+        .manifest()
+        .entries()
+        .iter()
+        .filter(|entry| !exclusion.is_match(entry.name()))
+        .collect();
+    let skipped = downloader.manifest().entries().len() - entries.len();
     let total = entries.len() as u64;
     info!("Verifying {} files for '{}' (build {})", total, offer_id, build_id);
+    if skipped > 0 {
+        info!("Skipping {} excluded file(s)", skipped);
+    }
 
     let mut broken: Vec<String> = Vec::new();
     let progress_every = std::cmp::max(entries.len() / 20, 100);
@@ -783,6 +1073,8 @@ async fn cmd_verify(
             None,
             broken_clone,
             true,
+            wine_prefix,
+            Vec::new(),
         ))
         .await?;
         state.notify(Notification::VerifyDone {
@@ -809,11 +1101,13 @@ async fn cmd_download_file(
     typed: &str,
     build_id: Option<String>,
     file: &str,
+    wine_prefix: Option<String>,
 ) -> Result<()> {
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, typed).await?;
-    let install_path = install_dir_for(&slug, None)?;
+    let prefix = peeked_prefix_path(&slug, &wine_prefix);
+    let install_path = install_dir_for(&slug, None, prefix.as_deref())?;
 
     let auth = { state.maxima.lock().await.auth_storage().clone() };
     let content_service = ContentService::new(auth);
@@ -846,31 +1140,51 @@ async fn cmd_download_file(
 async fn cmd_bottle_info(
     state: &Arc<ServerState>,
     typed: &str,
+    wine_prefix: Option<String>,
 ) -> Result<maxima_proto::types::BottleInfoDto> {
     let slug = {
         let mut maxima = state.maxima.lock().await;
         maxima.mut_library().canonical_slug(typed).await
     };
 
-    let env_prefix = std::env::var("MAXIMA_WINE_PREFIX").ok().map(std::path::PathBuf::from);
-
-    #[cfg(target_os = "macos")]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
-        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
-        None => {
-            let name = format!("Maxima-{}", slug);
-            let p = maxima::unix::crossover::bottles_dir().ok().map(|d| d.join(&name));
-            (Some(name), p)
+    #[cfg(unix)]
+    let (bottle_name, prefix, prefix_source): (
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+    ) = {
+        use maxima::unix::prefix::PrefixSource;
+        match peek_prefix(&slug, &wine_prefix) {
+            Some((path, source)) => {
+                // CrossOver addresses a bottle by name; elsewhere a name only
+                // means something when the user chose the prefix themselves.
+                let named = cfg!(target_os = "macos")
+                    || matches!(source, PrefixSource::Explicit | PrefixSource::Override);
+                let name = named
+                    .then(|| maxima::unix::prefix::bottle_name(&path))
+                    .flatten();
+                let source = match source {
+                    PrefixSource::Explicit => "explicit",
+                    PrefixSource::Override => "override",
+                    PrefixSource::Recorded => "recorded",
+                    PrefixSource::Default => "default",
+                };
+                (name, Some(path), Some(source.to_owned()))
+            }
+            None => (None, None, None),
         }
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
-        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
-        None => (None, maxima::unix::wine::wine_prefix_dir().ok()),
-    };
     #[cfg(windows)]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = (None, None);
+    let (bottle_name, prefix, prefix_source): (
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+    ) = {
+        let _ = &wine_prefix;
+        (None, None, None)
+    };
 
+    let record = maxima::gameinfo::load_game_info(&slug);
     let game_dir = prefix.as_ref().map(|p| p.join("drive_c").join("Games").join(&slug));
     let wine_prefix_exists = prefix.as_ref().map(|p| p.join("system.reg").exists()).unwrap_or(false);
     let game_dir_exists = game_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -882,6 +1196,12 @@ async fn cmd_bottle_info(
         wine_prefix_exists,
         default_game_dir: game_dir.as_ref().map(|p| p.display().to_string()),
         game_dir_exists,
+        prefix_source,
+        install_dir: record.as_ref().map(|r| r.path.display().to_string()),
+        build_id: record.as_ref().and_then(|r| r.build_id.clone()),
+        version: record.as_ref().and_then(|r| r.version.clone()),
+        locale: record.as_ref().and_then(|r| r.locale.clone()),
+        installed_at: record.as_ref().and_then(|r| r.installed_at.clone()),
     })
 }
 
@@ -895,16 +1215,78 @@ async fn cmd_register_protocols() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_locate(state: &Arc<ServerState>, path: &str) -> Result<()> {
-    let path = std::path::PathBuf::from(path);
-    let man = manifest::read(path.join(maxima::core::manifest::MANIFEST_RELATIVE_PATH)).await?;
-    man.run_touchup(&path).await?;
+/// Register an existing install: run its touchup in the right prefix and
+/// write the install record, so every later command finds it without a
+/// registry.
+async fn cmd_locate(
+    state: &Arc<ServerState>,
+    path: &str,
+    slug: Option<String>,
+    wine_prefix: Option<String>,
+) -> Result<()> {
+    use maxima::core::manifest::MANIFEST_RELATIVE_PATH;
+    use maxima::gameinfo::GameInstallInfo;
+
+    let path = std::path::PathBuf::from(path.trim_end_matches(['/', '\\']));
+
+    // Which game is this folder? Either the client says, or we already have a
+    // record for exactly this folder.
+    let game = match slug {
+        Some(typed) => Some(resolve_game(&state.maxima, &typed).await?),
+        None => match maxima::gameinfo::find_slug_by_path(&path) {
+            Some(known) => Some(resolve_game(&state.maxima, &known).await?),
+            None => None,
+        },
+    };
+
+    let prefix = match &game {
+        Some((slug, _)) => prepare_prefix(slug, &wine_prefix).await?,
+        None => {
+            #[cfg(unix)]
+            {
+                explicit_prefix(&wine_prefix)
+                    .or_else(maxima::unix::prefix::explicit_override)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "can't tell which Wine prefix `{}` belongs to — pass the game's \
+                             slug (locate-game --slug) or --wine-prefix",
+                            path.display()
+                        )
+                    })
+                    .map(Some)?
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        }
+    };
+
+    let man = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
+    man.run_touchup(&path, prefix.as_deref()).await?;
+
+    if let Some((slug, offer_id)) = game {
+        let locale = state.maxima.lock().await.locale().full_str().to_owned();
+        let mut info = GameInstallInfo::new(path.clone(), prefix)
+            .with_slug(&slug)
+            .with_offer(&offer_id, None)
+            .with_locale(&locale);
+        info.version = man.version();
+        info.save(&slug)?;
+    }
+
     // Refresh library so the located game shows as installed to every client.
     let _ = state.maxima.lock().await.mut_library().games().await;
     Ok(())
 }
 
-async fn cmd_cloud_sync(state: &Arc<ServerState>, slug: &str, write: bool) -> Result<()> {
+async fn cmd_cloud_sync(
+    state: &Arc<ServerState>,
+    slug: &str,
+    write: bool,
+    wine_prefix: Option<String>,
+) -> Result<()> {
+    let explicit = explicit_prefix(&wine_prefix);
     let mut maxima = state.maxima.lock().await;
     let offer = maxima
         .mut_library()
@@ -913,7 +1295,10 @@ async fn cmd_cloud_sync(state: &Arc<ServerState>, slug: &str, write: bool) -> Re
         .ok_or_else(|| anyhow::anyhow!("`{}` not in library", slug))?
         .clone();
     let mode = if write { CloudSyncLockMode::Write } else { CloudSyncLockMode::Read };
-    let lock = maxima.cloud_sync().obtain_lock(&offer, mode).await?;
+    let lock = maxima
+        .cloud_sync()
+        .obtain_lock(&offer, mode, explicit.as_deref())
+        .await?;
     let res = lock.sync_files().await;
     lock.release().await?;
     res?;
@@ -942,6 +1327,7 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
         } else {
             None
         };
+        let record = base.install_info();
         let extra_offers = title
             .extra_offers()
             .iter()
@@ -963,6 +1349,11 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
             extra_offers,
             image_url: None,
             hero_url: None,
+            install_dir: record.as_ref().map(|r| r.path.display().to_string()),
+            wine_prefix: record
+                .as_ref()
+                .and_then(|r| r.wine_prefix.as_ref())
+                .map(|p| p.display().to_string()),
         });
     }
     Ok(out)

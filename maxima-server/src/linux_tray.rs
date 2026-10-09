@@ -10,8 +10,10 @@
 use ksni::menu::StandardItem;
 use ksni::{MenuItem, Tray, TrayService};
 
+use crate::status_icon::StopServer;
+
 struct MaximaTray {
-    port: u16,
+    stop: StopServer,
 }
 
 impl Tray for MaximaTray {
@@ -37,7 +39,7 @@ impl Tray for MaximaTray {
             .into(),
             StandardItem {
                 label: "Stop Server".into(),
-                activate: Box::new(|this: &mut Self| send_shutdown(this.port)),
+                activate: Box::new(|this: &mut Self| (this.stop)()),
                 ..Default::default()
             }
             .into(),
@@ -45,18 +47,9 @@ impl Tray for MaximaTray {
     }
 }
 
-/// Send `{"cmd":"shutdown"}` to the control port — same as `server-stop`.
-fn send_shutdown(port: u16) {
-    use std::io::Write;
-    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-        let _ = s.write_all(b"{\"id\":1,\"cmd\":\"shutdown\"}\n");
-        let _ = s.flush();
-    }
-}
-
 /// Start the SNI tray on a background thread. Best-effort.
-pub fn spawn_sni(port: u16) {
-    let service = TrayService::new(MaximaTray { port });
+pub fn spawn_sni(stop: StopServer) {
+    let service = TrayService::new(MaximaTray { stop });
     service.spawn();
     log::info!("Linux SNI status icon started.");
 }

@@ -14,7 +14,9 @@ message CommunicationV1 {
 
     oneof body {
         PresenceSubscribeV1 presenceSubscribe = 2;
+        PresenceSubscriptionErrorV1 presenceSubscriptionError = 4;
         PresenceUpdateV1 presenceUpdate = 5;
+        PresenceUpdateErrorV1 presenceUpdateError = 6;
         PresenceV1 presence = 7;
         ErrorV1 error = 13;
         ReconnectRequestV1 reconnectRequest = 14;
@@ -22,5 +24,7 @@ message CommunicationV1 {
         HeartbeatV1 heartbeat = 20;
         LoginRequestV3 loginRequestV3 = 46;
         SessionCleanupV1 sessionCleanupV1 = 49;
+        PresenceSubscribeAllFriendsV1 presenceSubscribeAllFriendsV1 = 51;
+        PresenceSubscriptionAllFriendsErrorV1 presenceSubscriptionAllFriendsErrorV1 = 52;
     }
 }

@@ -20,7 +20,9 @@ use windows_service::{
 
 use crate::service::error::ServerError;
 use crate::service::hash::get_sha256_hash_of_pid;
-use maxima::core::background_service::{ServiceLibraryInjectionRequest, BACKGROUND_SERVICE_PORT};
+use maxima::core::background_service::{
+    ServiceLibraryInjectionRequest, BACKGROUND_SERVICE_CLIENT_HEADER, BACKGROUND_SERVICE_PORT,
+};
 use maxima::util::dll_injector::{DllInjector, InjectionError};
 use maxima::util::native::SafeParent;
 
@@ -132,12 +134,24 @@ fn run_service(shutdown_rx: Receiver<()>) -> Result<(), self::ServerError> {
     thread::spawn(|| {
         actix_web::rt::System::new()
             .block_on(async || -> std::io::Result<()> {
-                use actix_web::{App, HttpServer};
+                use actix_web::{guard, App, HttpServer};
 
                 let _ = HttpServer::new(|| {
-                    App::new()
-                        .service(req_set_up_registry)
-                        .service(req_inject_library)
+                    // Only Maxima's own clients: they send the client header,
+                    // and never an Origin header (browsers always do on
+                    // cross-site requests). Anything else gets a 404.
+                    App::new().service(
+                        web::scope("")
+                            .guard(guard::Header(
+                                BACKGROUND_SERVICE_CLIENT_HEADER.0,
+                                BACKGROUND_SERVICE_CLIENT_HEADER.1,
+                            ))
+                            .guard(guard::fn_guard(|ctx| {
+                                !ctx.head().headers().contains_key("origin")
+                            }))
+                            .service(req_set_up_registry)
+                            .service(req_inject_library),
+                    )
                 })
                 .bind(("127.0.0.1", BACKGROUND_SERVICE_PORT))?
                 .run()

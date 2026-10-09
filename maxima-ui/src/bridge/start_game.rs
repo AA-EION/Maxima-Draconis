@@ -36,11 +36,14 @@ pub async fn start_game_request(
 
     drop(maxima);
 
-    // macOS: select/create the per-game CrossOver bottle before anything
-    // touches wine — license dir, regedit and the spawned game all resolve
-    // the prefix via wine_prefix_dir().
-    #[cfg(target_os = "macos")]
-    maxima::unix::crossover::ensure_game_bottle(&game_info.slug).await?;
+    // Pick (and, on macOS, create) THIS game's Wine prefix before anything
+    // touches wine. It is carried explicitly in the launch options — license
+    // dir, regedit and the spawned game all use it — rather than being
+    // exported through the environment.
+    #[cfg(unix)]
+    let wine_prefix = Some(maxima::unix::prefix::resolve_for_game(&game_info.slug, None).await?);
+    #[cfg(not(unix))]
+    let wine_prefix: Option<std::path::PathBuf> = None;
 
     launch::start_game(
         maxima_arc.clone(),
@@ -53,6 +56,9 @@ pub async fn start_game_request(
             // receives a Steam App ID. Steam-Play handoffs come through
             // `link2ea://` to the bootstrap, not the UI's Play button.
             steam_app_id: None,
+            entitlement_source: None,
+            wine_prefix,
+            wine_dll_overrides: Vec::new(),
         },
     )
     .await

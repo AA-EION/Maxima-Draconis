@@ -5,9 +5,9 @@
 //! doesn't collide with `util::service` — the Windows KYBER OS-service — or the
 //! `maxima-service` crate).
 //!
-//! The discovery/spawn half is std-only (no async, no `maxima-proto`) so any
-//! frontend can call it from any startup path. A frontend's own `start_lsx`
-//! probe defers to the server when the port is already bound, so they coexist.
+//! Discovery goes through the `instance.json` the server publishes in this
+//! context's data directory (see `maxima_proto::instance`), so a client inside
+//! one Wine prefix can never reach the server of another prefix or the host.
 //!
 //! Boot policy (persisted in `config.json`, read by every frontend incl. the
 //! Swift app which reads the JSON directly):
@@ -21,10 +21,11 @@
 //! doesn't work), Windows `HKCU\…\Run`, Linux systemd `--user` unit. See
 //! docs/MACOS_BUNDLING.md.
 
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use maxima_proto::{ClientError, Discovery, MaximaClient};
 use serde::{Deserialize, Serialize};
 
 /// Boxed-error result — maxima-lib keeps typed errors, but service management
@@ -35,42 +36,40 @@ type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sy
 /// launchd label / Windows Run value / systemd unit stem.
 pub const SERVICE_LABEL: &str = "com.armchairdevelopers.maxima.server";
 
+/// How long a client waits for a server it spawned to publish its ports.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 // =========================================================================
-// Discovery + spawn (std-only; callable from any frontend)
+// Discovery + spawn
 // =========================================================================
 
-/// Control port (matches `maxima_proto::DEFAULT_PORT`); honors `MAXIMA_SERVER_PORT`.
-pub fn server_port() -> u16 {
-    std::env::var("MAXIMA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(13220)
+/// The server of *this* installation context (this user, or this Wine prefix
+/// when running inside one), found through `instance.json` in our own data
+/// directory — never by probing a well-known port, which every Wine prefix on
+/// the machine would share.
+pub fn discover() -> Discovery {
+    match crate::util::native::maxima_data_path() {
+        Ok(dir) => maxima_proto::discover(&dir),
+        Err(_) => Discovery::Stopped,
+    }
 }
 
-/// True if a server answers on the control port.
-pub fn is_running(port: u16) -> bool {
-    let addr = match ("127.0.0.1", port).to_socket_addrs() {
-        Ok(mut a) => match a.next() {
-            Some(a) => a,
-            None => return false,
-        },
-        Err(_) => return false,
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+pub fn is_running() -> bool {
+    !matches!(discover(), Discovery::Stopped)
 }
 
 /// The stable, registerable install dir for Maxima's native binaries on macOS:
-/// `~/Library/Application Support/Maxima/bin`. Every caller that needs to find
-/// or spawn `maxima-server` — launchd, game-spawned bootstrap, and every
-/// frontend — agrees on this path. It's stable across app moves/updates and
-/// app-translocation (a quarantined `.app` runs from a randomized read-only
-/// path, so a path *inside the bundle* would be unstable). See
-/// docs/MACOS_BUNDLING.md. `None` on non-macOS.
+/// `<data dir>/bin`, i.e.
+/// `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin`. Every
+/// caller that needs to find or spawn `maxima-server` — launchd, game-spawned
+/// bootstrap, and every frontend — agrees on this path. It's stable across app
+/// moves/updates and app-translocation (a quarantined `.app` runs from a
+/// randomized read-only path, so a path *inside the bundle* would be
+/// unstable). See docs/MACOS_BUNDLING.md. `None` on non-macOS.
 pub fn app_support_bin_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/Maxima/bin"))
+        crate::util::native::maxima_data_path().ok().map(|d| d.join("bin"))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -176,20 +175,9 @@ fn copy_if_newer(src: &std::path::Path, dest: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
-/// Ensure the Maxima server is running: if the control port doesn't answer,
-/// spawn `maxima-server` detached so it outlives this frontend. Returns
-/// immediately after spawning (does not wait for the server to finish
-/// booting). Best-effort. Respects the boot policy — under `Manual` the user
-/// starts the server themselves, so a frontend must not auto-spawn it.
-pub fn ensure_running() {
-    let port = server_port();
-    if is_running(port) {
-        return;
-    }
-    if !boot_policy().auto_spawn_on_open() {
-        return;
-    }
-
+/// Spawn `maxima-server` detached, in its own session, so it outlives the
+/// frontend that started it.
+pub fn spawn_server() -> std::io::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(locate_server());
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -198,10 +186,8 @@ pub fn ensure_running() {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // New session → the server is independent of this frontend's lifecycle
-        // (a GUI/TUI that quits, or the launchd app-job it belongs to). A plain
-        // process group isn't enough on macOS: children stay in the app's
-        // launchd job and get reaped on quit. SETSID fully detaches.
+        // A process group isn't enough on macOS: children stay in the app's
+        // launchd job and get reaped when it quits. setsid fully detaches.
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
@@ -216,7 +202,50 @@ pub fn ensure_running() {
         cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
 
-    let _ = cmd.spawn();
+    cmd.spawn()
+}
+
+/// Start the server if it isn't running and the boot policy lets a frontend
+/// do so. Returns without waiting for it. Best-effort.
+pub fn ensure_running() {
+    if !is_running() && boot_policy().auto_spawn_on_open() {
+        let _ = spawn_server();
+    }
+}
+
+/// Connect to this context's server. With `spawn`, start it first when it
+/// isn't running. Returns once the connection is authenticated; the session
+/// may still be waiting for the EA login (see [`MaximaClient::await_ready`]).
+pub async fn connect(client_name: &str, spawn: bool) -> Result<Arc<MaximaClient>, ClientError> {
+    let deadline = tokio::time::Instant::now() + SPAWN_TIMEOUT;
+    let mut child: Option<std::process::Child> = None;
+    loop {
+        match discover() {
+            Discovery::Running(info) => return MaximaClient::connect(&info, client_name).await,
+            Discovery::Stopped if child.is_none() => {
+                if !spawn {
+                    return Err(ClientError::NotRunning);
+                }
+                log::info!("No Maxima server running; starting {}", locate_server().display());
+                child = Some(spawn_server()?);
+            }
+            _ => {}
+        }
+        if let Some(status) = child.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+            // Losing the lock race to another starting server is fine; anything
+            // else means it failed to start.
+            if matches!(discover(), Discovery::Stopped) {
+                return Err(std::io::Error::other(format!(
+                    "maxima-server exited ({status}) before it started; see the maxima-server log"
+                ))
+                .into());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 // =========================================================================
@@ -264,24 +293,10 @@ struct Config {
     boot_policy: Option<BootPolicy>,
 }
 
-/// The Maxima config directory (holds `config.json`). Same location Swift/egui
-/// read for the boot policy.
+/// The Maxima config directory (holds `config.json`): the shared data dir on
+/// every OS. Same location Swift/egui read for the boot policy.
 pub fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Maxima"))
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Maxima"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|c| c.join("maxima"))
-    }
+    crate::util::native::maxima_data_path().ok()
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -348,7 +363,7 @@ pub fn install(policy: BootPolicy) -> BoxResult<()> {
 /// Remove **everything** — the autostart registration, the protocol handler
 /// registration, the installed binaries, and the config — so no trace is left
 /// that could interfere with the official EA launcher. With `purge`, also
-/// removes cached auth tokens and logs (`maxima_dir`). Game bottles are left
+/// removes cached auth tokens, caches and logs (the data, cache and log dirs). Game bottles are left
 /// alone (they're large and separate); remove them from CrossOver manually.
 pub fn uninstall(purge: bool) -> BoxResult<()> {
     // Stop a running server first (best-effort).
@@ -360,11 +375,17 @@ pub fn uninstall(purge: bool) -> BoxResult<()> {
         let _ = std::fs::remove_file(path);
     }
     if purge {
-        if let Ok(dir) = crate::util::native::maxima_dir() {
+        if let Ok(dir) = crate::util::native::maxima_data_path() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Ok(dir) = crate::util::native::maxima_cache_path() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Ok(dir) = crate::util::native::maxima_logs_path() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
-    log::info!("Maxima server uninstalled{}", if purge { " (purged tokens + logs)" } else { "" });
+    log::info!("Maxima server uninstalled{}", if purge { " (purged tokens, caches + logs)" } else { "" });
     Ok(())
 }
 
@@ -372,18 +393,22 @@ pub fn status() -> ServiceStatus {
     ServiceStatus {
         policy: boot_policy().as_str().to_string(),
         autostart_installed: autostart_installed(),
-        running: is_running(server_port()),
+        running: is_running(),
     }
 }
 
 fn stop_running_server() {
     use std::io::Write;
-    let port = server_port();
-    if is_running(port) {
-        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
-            let _ = s.write_all(b"{\"id\":1,\"cmd\":\"shutdown\"}\n");
-            let _ = s.flush();
-        }
+    let Discovery::Running(info) = discover() else { return };
+    let Some(port) = info.control_port else { return };
+    let hello = serde_json::json!({
+        "id": 1, "cmd": "hello", "token": info.token,
+        "client": "maxima-service", "proto": maxima_proto::PROTO_VERSION,
+    });
+    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = writeln!(stream, "{hello}");
+        let _ = writeln!(stream, r#"{{"id":2,"cmd":"shutdown"}}"#);
+        let _ = stream.flush();
     }
 }
 

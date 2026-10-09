@@ -14,6 +14,7 @@ use sha2_const::Sha256;
 pub struct AuthContext<'a> {
     code_verifier: String,
     code_challenge: String,
+    state: String,
     code: Option<String>,
     scopes: Vec<String>,
     access_token: Option<String>,
@@ -31,6 +32,7 @@ impl AuthContext<'_> {
         Ok(Self {
             code_verifier: verifier,
             code_challenge: challenge,
+            state: URL_SAFE_NO_PAD.encode(random::<[u8; 16]>()),
             code: None,
             scopes: Vec::new(),
             access_token: None,
@@ -62,6 +64,13 @@ impl AuthContext<'_> {
 
     pub fn code_verifier(&self) -> &str {
         &self.code_verifier
+    }
+
+    /// OAuth `state` sent with the login URL. Several Maxima instances (the
+    /// host and Wine prefixes) can only receive the redirect on the same
+    /// loopback port; this tells a redirect meant for another login apart.
+    pub fn state(&self) -> &str {
+        &self.state
     }
 
     pub fn code(&self) -> Option<&str> {
@@ -125,6 +134,7 @@ impl AuthContext<'_> {
         if client_id == JUNO_PC_CLIENT_ID {
             query.push(("code_challenge_method", Cow::Borrowed("S256")));
             query.push(("code_challenge", Cow::Borrowed(&self.code_challenge)));
+            query.push(("state", Cow::Borrowed(&self.state)));
         }
 
         if let Some(access_token) = &self.access_token {

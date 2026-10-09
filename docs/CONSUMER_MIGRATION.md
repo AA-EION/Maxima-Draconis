@@ -43,8 +43,9 @@ runtime model in ways a good consumer accounts for:
    from the server process, not the per-command CLI.
 
 2. **A background process outlives your command.** `maxima-cli list-games --json`
-   returns, but `maxima-server` keeps running (holding LSX :3216, authorize
-   :13219, RTM, and the control port :13220). This is intended — it's what lets a
+   returns, but `maxima-server` keeps running (holding LSX, `/authorize`, RTM
+   and the control port; their real ports are in `instance.json` in the
+   context's data directory, and LSX prefers :3216). This is intended — it's what lets a
    subsequent `launch` reuse the logged-in session and what serves the LSX auth
    when the game emits `link2ea://`. A consumer that wants to stop it calls
    `maxima-cli server-stop`; to check it, `maxima-cli server-status [--json]`.
@@ -60,7 +61,7 @@ runtime model in ways a good consumer accounts for:
 The in-bottle mode (MaximaSetup.exe inside the CrossOver bottle + MaximaHelper.app
 on the host) still ships and still works — **you do not have to migrate**. To use
 the native host-side server, install these on the host at a **stable path**
-(recommended `~/Library/Application Support/Maxima/bin/`, see
+(recommended `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`, see
 [MACOS_BUNDLING.md](MACOS_BUNDLING.md) for the rationale — app-translocation makes
 `.app`-internal paths unstable):
 
@@ -91,7 +92,7 @@ Draconis → maxima-cli launch <slug> --json
              → server: license preflight + EA env + cxstart-disclaimed spawn
              → {"event":"launched","offer_id":…,"wine_prefix":…}
    game emits link2ea:// → winebrowser → host `open` → MaximaBootstrap.app
-             → probes :13219 → forwards to the *same* server's /authorize
+             → reads instance.json → forwards to the *same* server's /authorize
    game exits → server detects (pgrep) → {"event":"exited","elapsed_secs":…}
 ```
 
@@ -105,7 +106,7 @@ public API. Consumers target the stable `maxima-cli --json` surface.
 - [ ] No parser changes — the `--json` shapes are identical. Verify against the
       existing `list-games` / `install` / `launch` / `bottle-info` handling.
 - [ ] (Native mode) Fetch + install `maxima-server`, `maxima-cli`,
-      `maxima-bootstrap`, `MaximaBootstrap.app` into `~/Library/Application Support/Maxima/bin/`.
+      `maxima-bootstrap`, `MaximaBootstrap.app` into `~/Library/Application Support/com.ArmchairDevelopers.Maxima/bin/`.
 - [ ] (Native mode) Optionally install + `launchctl load` the launchd agent for
       autostart + persistent status icon.
 - [ ] Keep MaximaHelper.app for `qrc://` (unchanged; coexists with MaximaBootstrap.app).

@@ -3,7 +3,7 @@ import Foundation
 /// Bridge to the native `maxima-cli` binary. All game state and actions go
 /// through the CLI's machine-readable surface (`list-games` / `install` /
 /// `launch` `--json`, `bottle-info`, `register-protocols`) — the exact
-/// contract Draconis consumes. This app is deliberately just another
+/// contract other launchers consume. This app is deliberately just another
 /// consumer of that contract; nothing here talks to EA directly.
 enum MaximaCLIError: LocalizedError {
     case cliNotFound
@@ -48,7 +48,7 @@ enum MaximaCLI {
         }
         // Stable App Support copy — see docs/MACOS_BUNDLING.md.
         let appSupport = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Maxima/bin/maxima-cli")
+            .appendingPathComponent("Library/Application Support/com.ArmchairDevelopers.Maxima/bin/maxima-cli")
         if fm.isExecutableFile(atPath: appSupport.path) {
             return appSupport
         }
@@ -77,7 +77,7 @@ enum MaximaCLI {
         }
         // Stable App Support copy — see docs/MACOS_BUNDLING.md.
         let appSupport = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Maxima/bin/maxima-server")
+            .appendingPathComponent("Library/Application Support/com.ArmchairDevelopers.Maxima/bin/maxima-server")
         if fm.isExecutableFile(atPath: appSupport.path) {
             return appSupport
         }

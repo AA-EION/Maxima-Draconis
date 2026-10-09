@@ -5,6 +5,6 @@
 
 ## What does this PR do?
 
-## Is this related to the macOS/CrossOver support or Draconis integration?
+## Is this related to the macOS/CrossOver support or consumer-launcher integration?
 
 ## Testing done

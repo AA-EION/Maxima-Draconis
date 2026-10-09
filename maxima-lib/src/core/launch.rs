@@ -17,14 +17,15 @@ use crate::{
         },
         clients::JUNO_PC_CLIENT_ID,
         cloudsync::{CloudSyncError, CloudSyncLockMode},
-        library::{LibraryError, OwnedOffer},
+        library::{path_in_install_root, LibraryError, OwnedOffer},
+        manifest::{self, MANIFEST_RELATIVE_PATH},
         service_layer::ServiceLayerError,
         Maxima,
     },
     ooa::{needs_license_update, request_and_save_license, LicenseAuth, LicenseError},
-    steam::lookup_steam_game_by_offer,
+    steam::{load_game_overrides, override_for_offer, STEAM_APP_ID_PATTERN},
     util::{
-        native::{NativeError, SafeParent, SafeStr},
+        native::{is_wine_environment, NativeError, SafeParent, SafeStr},
         registry::bootstrap_path,
         simple_crypto,
     },
@@ -84,6 +85,78 @@ pub struct LibraryInjection {
     pub stage: StartupStage,
 }
 
+/// Where the game's entitlement is considered to come from. Reported to the
+/// game through the `EA*Source` environment variables and the LSX
+/// `EntitlementSource` / `IsSteamSubscriber` attributes, which all read it
+/// from [`ActiveGameContext::entitlement_source`] so they cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntitlementSource {
+    Ea,
+    Steam,
+}
+
+impl EntitlementSource {
+    /// Explicit choice if there is one, else Steam when the launch carries a
+    /// Steam App ID, else EA.
+    pub fn resolve(explicit: Option<Self>, steam_app_id: Option<&str>) -> Self {
+        explicit.unwrap_or(if steam_app_id.is_some() {
+            Self::Steam
+        } else {
+            Self::Ea
+        })
+    }
+
+    /// `ea` / `steam`, case-insensitive.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ea" => Some(Self::Ea),
+            "steam" => Some(Self::Steam),
+            _ => None,
+        }
+    }
+
+    /// `MAXIMA_ENTITLEMENT_SOURCE`, if set to a valid value.
+    pub fn from_env() -> Option<Self> {
+        let value = env::var("MAXIMA_ENTITLEMENT_SOURCE").ok()?;
+        let parsed = Self::parse(&value);
+        if parsed.is_none() {
+            warn!(
+                "Ignoring MAXIMA_ENTITLEMENT_SOURCE='{}' (expected 'ea' or 'steam')",
+                value
+            );
+        }
+        parsed
+    }
+
+    /// Value for the `EAEntitlementSource` / `EAExternalSource` /
+    /// `EALaunchOwner` environment variables.
+    pub fn env_tag(self) -> &'static str {
+        match self {
+            Self::Ea => "EA",
+            Self::Steam => "Steam",
+        }
+    }
+
+    /// Value for the LSX `EntitlementSource` attribute.
+    pub fn lsx_tag(self) -> &'static str {
+        match self {
+            Self::Ea => "EA",
+            Self::Steam => "STEAM",
+        }
+    }
+}
+
+/// `MAXIMA_STEAM_APP_ID`, if set to a plausible Steam App ID.
+pub fn steam_app_id_from_env() -> Option<String> {
+    let value = env::var("MAXIMA_STEAM_APP_ID").ok()?;
+    if STEAM_APP_ID_PATTERN.is_match(&value) {
+        Some(value)
+    } else {
+        warn!("Ignoring MAXIMA_STEAM_APP_ID='{}' (expected digits only)", value);
+        None
+    }
+}
+
 pub struct LaunchOptions {
     pub path_override: Option<String>,
     pub arguments: Vec<String>,
@@ -91,13 +164,16 @@ pub struct LaunchOptions {
     /// When set, the game is being launched from Steam context. Steam
     /// emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
     /// expecting the link2ea handler to take over the launch entirely
-    /// (Steam does NOT spawn the exe itself for older EA-on-Steam titles
-    /// like TF2 — it delegates to whatever owns the link2ea protocol).
+    /// (older EA-on-Steam titles delegate to whatever owns the link2ea
+    /// protocol instead of spawning the exe themselves). Falls back to
+    /// `MAXIMA_STEAM_APP_ID`.
     ///
     /// Passing `Some(steam_app_id)` causes `start_game` to:
-    ///   1. Set `EAEntitlementSource` / `EAExternalSource` / `EALaunchOwner`
-    ///      to `"Steam"` instead of `"EA"` so the DRM stub sees a launch
-    ///      context consistent with where it's being run from.
+    ///   1. Report the entitlement source as Steam (unless
+    ///      `entitlement_source` says otherwise): `EAEntitlementSource` /
+    ///      `EAExternalSource` / `EALaunchOwner` become `"Steam"` instead of
+    ///      `"EA"` so the DRM stub sees a launch context consistent with
+    ///      where it's being run from.
     ///   2. Set `SteamAppId` / `SteamGameId` env vars on the spawned game
     ///      (required by the Steam DRM stub — without these the game exits
     ///      immediately with code 100010 "Steam not detected").
@@ -107,11 +183,23 @@ pub struct LaunchOptions {
     /// `None` (the default) is the EA-Desktop-style launch path — env
     /// vars stay `"EA"` and no Steam-specific setup happens.
     ///
-    /// Note: per-game launch args (e.g. `-noOriginStartup` for Northstar,
-    /// `-multiple` for Source-engine titles) are NOT auto-injected. Callers
-    /// who need them pass them via `arguments`, `MAXIMA_LAUNCH_ARGS`, or
-    /// `cmd_params` on the `link2ea://` URL.
+    /// Note: per-game launch args are NOT auto-injected. Callers who need
+    /// them pass them via `arguments`, `MAXIMA_LAUNCH_ARGS`, or `cmd_params`
+    /// on the `link2ea://` URL.
     pub steam_app_id: Option<String>,
+    /// Overrides the entitlement source otherwise derived from
+    /// `steam_app_id` (Steam when set, EA when not). Falls back to
+    /// `MAXIMA_ENTITLEMENT_SOURCE`.
+    pub entitlement_source: Option<EntitlementSource>,
+    /// Wine prefix (unix) to run this one game in, overriding both the
+    /// `MAXIMA_WINE_PREFIX` setting and the prefix recorded at install time
+    /// (see `unix::prefix` for the precedence). `None` lets the platform
+    /// pick per game. Ignored on Windows.
+    pub wine_prefix: Option<PathBuf>,
+    /// Extra Wine DLL overrides for this launch, each `dll[,dll]=mode`
+    /// (e.g. `wsock32=n,b`), layered on top of the built-in defaults and
+    /// `MAXIMA_WINE_DLL_OVERRIDES`. Ignored by hosts that don't use Wine.
+    pub wine_dll_overrides: Vec<String>,
 }
 
 pub enum LaunchMode {
@@ -144,17 +232,21 @@ pub struct ActiveGameContext {
     injections: Vec<LibraryInjection>,
     cloud_saves: bool,
     /// The Steam App ID this launch came from, if any. Threaded through
-    /// from `LaunchOptions.steam_app_id` so the LSX request handlers
-    /// (specifically `GetProfile` and `GetAllGameInfo`) can return
-    /// consistent values for `IsSteamSubscriber` / `EntitlementSource`
-    /// without resorting to reading `env::var("SteamAppId")` from the
-    /// serve process (which doesn't have it — those env vars are set
-    /// directly on the spawned game's `Command`, not on the parent).
+    /// from `LaunchOptions.steam_app_id` (the env vars it sets live on the
+    /// spawned game's `Command`, not on this process).
     ///
-    /// `None` means this is an EA-Desktop-style launch (TF2 emitting
+    /// `None` means this is an EA-Desktop-style launch (a game emitting
     /// `link2ea://launchgame/Origin.OFR.…` mid-run, or maxima-cli launch
     /// with an Origin offer ID slug).
     steam_app_id: Option<String>,
+    /// The game's slug, when the launch is tied to a library offer.
+    slug: Option<String>,
+    /// The Wine prefix this game was launched into (unix). Everything that
+    /// later acts on behalf of this game (cloud-save upload, PID lookup,
+    /// license requests over LSX) uses it instead of any process-wide
+    /// selection.
+    wine_prefix: Option<PathBuf>,
+    entitlement_override: Option<EntitlementSource>,
     process: Child,
     started: bool,
 }
@@ -168,6 +260,9 @@ impl ActiveGameContext {
         offer: Option<OwnedOffer>,
         mode: LaunchMode,
         steam_app_id: Option<String>,
+        slug: Option<String>,
+        wine_prefix: Option<PathBuf>,
+        entitlement_override: Option<EntitlementSource>,
         process: Child,
     ) -> Self {
         Self {
@@ -179,9 +274,18 @@ impl ActiveGameContext {
             injections: Vec::new(),
             cloud_saves,
             steam_app_id,
+            slug,
+            wine_prefix,
+            entitlement_override,
             process,
             started: false,
         }
+    }
+
+    /// The single source of truth for what the game is told about where its
+    /// entitlement comes from.
+    pub fn entitlement_source(&self) -> EntitlementSource {
+        EntitlementSource::resolve(self.entitlement_override, self.steam_app_id.as_deref())
     }
 
     pub fn set_started(&mut self) {
@@ -197,6 +301,13 @@ impl ActiveGameContext {
 pub struct BootstrapLaunchArgs {
     pub path: String,
     pub args: Vec<String>,
+    /// Wine prefix the bootstrap must run the game in (unix). Absent in
+    /// payloads from older launchers, in which case the bootstrap falls back
+    /// to its ambient prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_prefix: Option<String>,
+    #[serde(default)]
+    pub wine_dll_overrides: Vec<String>,
 }
 
 impl Display for LaunchMode {
@@ -275,19 +386,12 @@ pub async fn start_game(
     let path = if let Some(game_path_override) = options.path_override {
         let p = PathBuf::from(&game_path_override);
         if p.is_dir() {
-            // User passed an install directory, not the executable. Resolve
-            // the exe filename via the STEAM_GAMES table — it's the only
-            // place Maxima carries reliable per-title exe-name mappings for
-            // non-Origin installs (Steam install dirs don't have an Origin
-            // manifest we could otherwise read).
-            match offer
-                .as_ref()
-                .and_then(|o| lookup_steam_game_by_offer(o.offer_id().as_str()))
-            {
-                Some(entry) => {
-                    let exe = p.join(entry.exe_name);
+            // An install directory instead of the executable: find the exe
+            // from the offer's own data or the installer manifest.
+            match exe_in_install_dir(&p, offer.as_ref()).await {
+                Some(exe) => {
                     info!(
-                        "game_path '{}' is a directory; resolved exe to '{}' via STEAM_GAMES",
+                        "game_path '{}' is a directory; resolved exe to '{}'",
                         p.display(),
                         exe.display()
                     );
@@ -295,8 +399,8 @@ pub async fn start_game(
                 }
                 None => {
                     error!(
-                        "game_path '{}' is a directory but offer '{}' is not in the \
-                         STEAM_GAMES table — pass the full path to the .exe instead.",
+                        "game_path '{}' is a directory and the executable could not be \
+                         determined for offer '{}' — pass the full path to the .exe instead.",
                         p.display(),
                         offer.as_ref().map(|o| o.offer_id().as_str()).unwrap_or("?")
                     );
@@ -321,31 +425,47 @@ pub async fn start_game(
     let path = path.safe_str()?;
     info!("Game path: {}", path);
 
-    // Heads-up for users hitting Steam CEG (Custom Executable Generation)
-    // failures under Wine. The exe Steam ships for EA-on-Steam titles like
-    // Titanfall 2 is signed per-user with CEG, and CEG's filesystem
-    // verification trips wine-staging's `ntdll-Junction_Points` patch —
-    // which CrossOver inherits — surfacing in-game as
-    // "Engine Error: File corruption detected". Maxima can't fix that from
-    // its layer: the validation runs inside the game exe against `ntdll`
-    // before the LSX `RequestLicense` request we control. NorthstarProton
-    // works around it by reverting that wine patch in their custom Proton
-    // build; on macOS/CrossOver the practical workaround is to install via
-    // maxima-ui to a non-Steam path so the binary doesn't carry CEG.
-    let path_lower = path.to_lowercase();
-    if path_lower.contains("\\steamapps\\common\\") || path_lower.contains("/steamapps/common/") {
-        warn!(
-            "Game path is inside a Steam library (steamapps/common/...). On macOS/CrossOver \
-             and other Wine runtimes, Steam-installed copies of EA-on-Steam titles commonly \
-             trigger 'Engine Error: File corruption detected' because Steam CEG validation \
-             fails under Wine's ntdll Junction_Points patch. If you hit this, install via \
-             maxima-ui to a non-Steam path. See CLAUDE.md 'CEG / Steam-installed games' for \
-             details."
-        );
+    if is_wine_environment() {
+        let path_lower = path.to_lowercase();
+        if path_lower.contains("\\steamapps\\common\\")
+            || path_lower.contains("/steamapps/common/")
+        {
+            let exe = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let slug = offer.as_ref().map(|o| o.slug().as_str()).unwrap_or("<slug>");
+            warn!(
+                "{} is in a Steam library. Steam DRM-wrapped executables can fail under Wine; \
+                 `maxima-cli install {} --replace-files {} --only-listed-files` refreshes the \
+                 executable from EA's CDN.",
+                exe, slug, exe
+            );
+        }
     }
 
+    // Which Wine prefix THIS game runs in. Resolved per launch and carried
+    // explicitly from here on; never exported through the environment, so a
+    // server launching two games in two prefixes keeps them apart.
     #[cfg(unix)]
-    mx_linux_setup().await?;
+    let wine_prefix: Option<PathBuf> = {
+        let slug = offer.as_ref().map(|o| o.slug().clone());
+        Some(match (slug, options.wine_prefix.as_deref()) {
+            (Some(slug), explicit) => {
+                crate::unix::prefix::resolve_for_game(&slug, explicit).await?
+            }
+            (None, Some(explicit)) => explicit.to_path_buf(),
+            (None, None) => crate::unix::prefix::ambient()?,
+        })
+    };
+    #[cfg(not(unix))]
+    let wine_prefix: Option<PathBuf> = None;
+    let wine_prefix_ref = wine_prefix.as_deref();
+
+    #[cfg(unix)]
+    if let Some(prefix) = wine_prefix_ref {
+        mx_linux_setup(prefix).await?;
+    }
 
     match mode {
         LaunchMode::Offline(_) => {}
@@ -356,26 +476,29 @@ pub async fn start_game(
 
             // Diagnostic override: setting `MAXIMA_SKIP_LICENSE_WRITE=1` in the
             // environment makes us NOT fetch + write the `.dlf` license file
-            // to `…/EA Services/License/<content_id>.dlf`. Used to test whether
-            // TF2's "Engine Error: File corruption detected" symptom is driven
-            // by the on-disk `.dlf` (hardware-hash mismatch hypothesis from
-            // CLAUDE.md) — if TF2 still corrupts when we DON'T write a `.dlf`,
-            // the issue is somewhere else (Steam DRM, local file integrity,
-            // some other check). Remove the .dlf manually before testing so
-            // there's no stale file lying around.
+            // to `…/EA Services/License/<content_id>.dlf`. Used to tell whether
+            // a launch failure is driven by the on-disk `.dlf` or by something
+            // else. Remove the .dlf manually before testing so there's no
+            // stale file lying around.
             if env::var("MAXIMA_SKIP_LICENSE_WRITE").is_ok() {
                 warn!(
                     "MAXIMA_SKIP_LICENSE_WRITE is set — skipping OOA license \
                      fetch + .dlf write entirely. Game will only have whatever \
                      .dlf was already on disk (or none)."
                 );
-            } else if needs_license_update(&content_id).await? {
+            } else if needs_license_update(&content_id, wine_prefix_ref).await? {
                 info!(
                     "Requesting new game license for {}...",
                     offer.offer().display_name()
                 );
 
-                request_and_save_license(&auth, &content_id, path.to_owned().into()).await?;
+                request_and_save_license(
+                    &auth,
+                    &content_id,
+                    path.to_owned().into(),
+                    wine_prefix_ref,
+                )
+                .await?;
             } else {
                 info!("Existing game license is still valid, not updating");
             }
@@ -385,7 +508,7 @@ pub async fn start_game(
 
                 let result = maxima
                     .cloud_sync()
-                    .obtain_lock(offer, CloudSyncLockMode::Read)
+                    .obtain_lock(offer, CloudSyncLockMode::Read, wine_prefix_ref)
                     .await;
                 if let Err(err) = result {
                     error!("Failed to obtain CloudSync read lock: {}", err);
@@ -406,8 +529,14 @@ pub async fn start_game(
         LaunchMode::OnlineOffline(_, ref persona, ref password) => {
             let auth = LicenseAuth::Direct(persona.to_owned(), password.to_owned());
 
-            if needs_license_update(&content_id).await? {
-                request_and_save_license(&auth, &content_id, path.to_owned().into()).await?;
+            if needs_license_update(&content_id, wine_prefix_ref).await? {
+                request_and_save_license(
+                    &auth,
+                    &content_id,
+                    path.to_owned().into(),
+                    wine_prefix_ref,
+                )
+                .await?;
             } else {
                 info!("Existing game license is still valid, not updating");
             }
@@ -421,11 +550,18 @@ pub async fn start_game(
         game_args.append(&mut parse_arguments(args.as_str()));
     }
 
-    let is_steam_launch = options.steam_app_id.is_some();
+    let steam_app_id = options.steam_app_id.clone().or_else(steam_app_id_from_env);
+    let entitlement_override = options
+        .entitlement_source
+        .or_else(EntitlementSource::from_env);
+    let source_tag =
+        EntitlementSource::resolve(entitlement_override, steam_app_id.as_deref()).env_tag();
 
     if !bootstrap_path()?.exists() {
         return Err(LaunchError::BootstrapMissing);
     }
+
+    let slug = offer.as_ref().map(|o| o.slug().clone());
 
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
@@ -434,9 +570,8 @@ pub async fn start_game(
     // runs as a GUI frontend's child (ui-backend under maxima-native, or a
     // one-shot launch spawned by an app), inherited pipes/descriptors
     // connected to that app reach wine and the game — and wine's macOS
-    // driver chokes on GUI-app descriptors: TF2 reproducibly freezes right
-    // after LSX GetAllGameInfo. Same root cause Draconis documents in its
-    // CleanSpawn service; files-or-null stdio is the shell-equivalent
+    // driver chokes on GUI-app descriptors: games can freeze right after
+    // LSX GetAllGameInfo. Files-or-null stdio is the shell-equivalent
     // context wine expects. Diagnostics are unaffected: bootstrap and wine
     // log to files. Windows keeps console inheritance (useful there, no
     // wine involved).
@@ -446,9 +581,21 @@ pub async fn start_game(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    // Belt and braces for a bootstrap that predates the `wine_prefix` field
+    // in its launch payload: it reads the prefix from its own environment.
+    // Set on this child only, never on our own process.
+    #[cfg(unix)]
+    if let Some(prefix) = wine_prefix_ref {
+        child.env(crate::unix::prefix::WINE_PREFIX_ENV, prefix);
+    }
+
     let bootstrap_args = BootstrapLaunchArgs {
         path: path.to_string(),
         args: game_args,
+        wine_prefix: wine_prefix
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        wine_dll_overrides: options.wine_dll_overrides.clone(),
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&bootstrap_args)?);
@@ -458,12 +605,8 @@ pub async fn start_game(
     let launch_id = Uuid::new_v4().to_string();
 
     // Source / owner / entitlement env vars: "EA" for EA-Desktop-launched
-    // games, "Steam" for games launched via Steam (the user clicked Play in
-    // Steam). When mismatched, TF2 (and likely other EA-on-Steam titles)
-    // throws a "corrupted game files" error because its DRM stub expects
-    // the ownership tag to match its install context.
-    let source_tag = if is_steam_launch { "Steam" } else { "EA" };
-
+    // games, "Steam" for games launched via Steam. Some EA-on-Steam titles'
+    // DRM stubs expect the ownership tag to match their install context.
     child
         .current_dir(PathBuf::from(path).safe_parent()?)
         .env("MXLaunchId", launch_id.to_owned())
@@ -485,7 +628,7 @@ pub async fn start_game(
         )
         .env("EALaunchEnv", "production")
         .env("EALaunchOfflineMode", "false")
-        .env("EALsxPort", maxima.lsx_port.to_string())
+        .env("EALsxPort", maxima.effective_lsx_port().to_string())
         .env(
             "EARtPLaunchCode",
             simple_crypto::rtp_handshake().to_string(),
@@ -508,7 +651,7 @@ pub async fn start_game(
     // `SteamClientLaunch` and `SteamPath` are normally set by Steam's
     // own runtime; we default-fill them from the parent env (if Steam
     // really did launch us) or to safe constants otherwise.
-    if let Some(ref app_id) = options.steam_app_id {
+    if let Some(ref app_id) = steam_app_id {
         child.env("SteamAppId", app_id).env("SteamGameId", app_id);
         let inherited_client_launch = env::var("SteamClientLaunch").ok();
         child.env(
@@ -581,7 +724,10 @@ pub async fn start_game(
         &content_id,
         offer,
         mode,
-        options.steam_app_id.clone(),
+        steam_app_id,
+        slug,
+        wine_prefix,
+        entitlement_override,
         child,
     ));
 
@@ -608,8 +754,9 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
     nucleus_auth_exchange(&context, JUNO_PC_CLIENT_ID, "token").await
 }
 
+/// Make sure the wine runtime and the given prefix are ready to run a game.
 #[cfg(target_os = "linux")]
-pub async fn mx_linux_setup() -> Result<(), NativeError> {
+pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
         install_wine, setup_wine_registry,
@@ -631,33 +778,83 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
         }
     }
 
-    setup_wine_registry().await?;
+    std::fs::create_dir_all(wine_prefix)?;
+    setup_wine_registry(wine_prefix).await?;
 
     Ok(())
 }
 
 /// macOS variant: games run through a CrossOver bottle — no wine/umu
-/// auto-install here. The bottle is normally selected (and created on
-/// demand) by `crossover::ensure_game_bottle`, which exports
-/// MAXIMA_WINE_PREFIX for this process and its children; we require it here
-/// so an unwired call path fails with a clear message instead of wine
-/// silently creating a fresh prefix at ~/.local/share/maxima/wine/prefix.
+/// auto-install here. The bottle is chosen (and created on demand) per game
+/// by `unix::prefix::resolve_for_game`; this only checks it is really there,
+/// so a wrong `--wine-prefix` fails with a clear message instead of wine
+/// silently creating a fresh prefix somewhere.
 #[cfg(target_os = "macos")]
-pub async fn mx_linux_setup() -> Result<(), NativeError> {
+pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeError> {
     use crate::unix::wine::setup_wine_registry;
 
-    if std::env::var("MAXIMA_WINE_PREFIX").is_err() {
-        return Err(NativeError::MissingEnvironmentVariable(
-            "MAXIMA_WINE_PREFIX (no bottle selected — `maxima-cli install`/`launch` \
-             auto-create a per-game CrossOver bottle; set this manually for `serve` \
-             or a custom prefix)"
-                .to_string(),
-        ));
+    if !wine_prefix.join("system.reg").exists() {
+        return Err(NativeError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "wine prefix `{}` is not an existing CrossOver bottle — `maxima-cli \
+                 install`/`launch` create a per-game bottle automatically; for a custom \
+                 prefix, create the bottle in CrossOver first",
+                wine_prefix.display()
+            ),
+        )));
     }
 
-    setup_wine_registry().await?;
+    setup_wine_registry(wine_prefix).await?;
 
     Ok(())
+}
+
+/// The game's executable according to the installer manifest inside
+/// `install_dir`, resolved against that directory (no registry involved).
+/// The executable inside `install_dir`, trying in order the per-game
+/// overrides file, the offer's execute path and the installer manifest. The
+/// first candidate that exists wins; if none does the first one is returned
+/// so the launch fails on a path the user can recognise.
+async fn exe_in_install_dir(
+    install_dir: &std::path::Path,
+    offer: Option<&OwnedOffer>,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(offer) = offer {
+        let overrides = load_game_overrides();
+        if let Some(exe) = override_for_offer(&overrides, offer.offer_id()).and_then(|o| o.exe.as_ref())
+        {
+            candidates.push(path_in_install_root(install_dir, exe));
+        }
+        if let Some(name) = offer.exe_file_name().await {
+            candidates.push(install_dir.join(name));
+        }
+    }
+    if let Some(exe) = exe_from_install_manifest(install_dir).await {
+        candidates.push(exe);
+    }
+
+    #[cfg(unix)]
+    let exists = |p: &PathBuf| case_insensitive_path(p.clone()).exists();
+    #[cfg(not(unix))]
+    let exists = |p: &PathBuf| p.exists();
+
+    candidates
+        .iter()
+        .find(|p| exists(p))
+        .or(candidates.first())
+        .cloned()
+}
+
+async fn exe_from_install_manifest(install_dir: &std::path::Path) -> Option<PathBuf> {
+    let manifest_path = install_dir.join(MANIFEST_RELATIVE_PATH);
+    #[cfg(unix)]
+    let manifest_path = case_insensitive_path(manifest_path);
+    let manifest = manifest::read(manifest_path).await.ok()?;
+    let relative = manifest.execute_path(false)?;
+    Some(path_in_install_root(install_dir, &relative))
 }
 
 pub fn parse_arguments(input: &str) -> Vec<String> {
@@ -687,4 +884,74 @@ pub fn parse_arguments(input: &str) -> Vec<String> {
     }
 
     args
+}
+
+#[cfg(test)]
+mod wine_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_payload_from_an_older_launcher_has_no_prefix() {
+        let payload = r#"{"path":"C:\\Game\\game.exe","args":["-a"]}"#;
+        let args: BootstrapLaunchArgs = serde_json::from_str(payload).unwrap();
+        assert_eq!(args.wine_prefix, None);
+        assert_eq!(args.args, vec!["-a".to_string()]);
+    }
+
+    #[test]
+    fn bootstrap_payload_carries_the_prefix_and_omits_it_when_unset() {
+        let with = BootstrapLaunchArgs {
+            path: "game.exe".into(),
+            args: vec![],
+            wine_prefix: Some("/prefixes/a".into()),
+            wine_dll_overrides: vec![],
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: BootstrapLaunchArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wine_prefix.as_deref(), Some("/prefixes/a"));
+
+        let without = BootstrapLaunchArgs::default();
+        assert!(!serde_json::to_string(&without).unwrap().contains("wine_prefix"));
+    }
+
+    #[test]
+    fn parse_arguments_groups_quotes() {
+        assert_eq!(
+            parse_arguments(r#"-a "b c" -d"#),
+            vec!["-a".to_string(), "b c".to_string(), "-d".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod entitlement_tests {
+    use super::*;
+
+    #[test]
+    fn entitlement_source_resolution() {
+        assert_eq!(EntitlementSource::resolve(None, None), EntitlementSource::Ea);
+        assert_eq!(
+            EntitlementSource::resolve(None, Some("12345")),
+            EntitlementSource::Steam
+        );
+        assert_eq!(
+            EntitlementSource::resolve(Some(EntitlementSource::Ea), Some("12345")),
+            EntitlementSource::Ea
+        );
+        assert_eq!(
+            EntitlementSource::resolve(Some(EntitlementSource::Steam), None),
+            EntitlementSource::Steam
+        );
+    }
+
+    #[test]
+    fn entitlement_source_parsing_and_tags() {
+        assert_eq!(EntitlementSource::parse(" Steam "), Some(EntitlementSource::Steam));
+        assert_eq!(EntitlementSource::parse("EA"), Some(EntitlementSource::Ea));
+        assert_eq!(EntitlementSource::parse("origin"), None);
+        assert_eq!(EntitlementSource::Steam.env_tag(), "Steam");
+        assert_eq!(EntitlementSource::Steam.lsx_tag(), "STEAM");
+        assert_eq!(EntitlementSource::Ea.env_tag(), "EA");
+        assert_eq!(EntitlementSource::Ea.lsx_tag(), "EA");
+    }
 }

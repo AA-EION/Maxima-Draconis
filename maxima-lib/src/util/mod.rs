@@ -1,3 +1,5 @@
+pub mod dll_overrides;
+pub mod elevation;
 pub mod github;
 pub mod hash;
 pub mod log;

@@ -14,24 +14,28 @@
 //! Menu on every platform: **Open Maxima** · **Stop Server**. See
 //! docs/MACOS_BUNDLING.md.
 
+/// Asks the server to shut down; called from the icon's **Stop Server** item.
+pub type StopServer = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Bring up the server's status-bar icon. Never blocks; best-effort — a
 /// failure just means no icon (the server still runs and is CLI-drivable).
-pub fn spawn(port: u16) {
+pub fn spawn(stop: StopServer) {
     #[cfg(windows)]
-    crate::tray::spawn_tray(port);
+    crate::tray::spawn_tray(stop);
 
     #[cfg(target_os = "macos")]
     {
-        let _ = port;
+        // The menu-bar host is a client; it stops the server over the proto.
+        let _ = stop;
         macos::spawn_menubar_host();
     }
 
     #[cfg(all(target_os = "linux", feature = "linux-tray"))]
-    crate::linux_tray::spawn_sni(port);
+    crate::linux_tray::spawn_sni(stop);
 
     #[cfg(all(target_os = "linux", not(feature = "linux-tray")))]
     {
-        let _ = port;
+        let _ = stop;
         log::info!(
             "Linux: running headless (build maxima-server with --features linux-tray for an \
              SNI status icon). Drive it with `maxima-cli server-status` / `server-stop`."

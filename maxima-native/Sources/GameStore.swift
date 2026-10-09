@@ -70,6 +70,8 @@ final class GameStore: ObservableObject {
         case "ready":
             backendState = .ready(persona: event["persona"] as? String ?? "")
             Task { await refreshAll() }
+        case "login-required":
+            backendState = .connecting
         case "presence":
             guard let id = event["id"] as? String else { return }
             presences[id] = Presence(
@@ -140,8 +142,8 @@ final class GameStore: ObservableObject {
     }
 
     /// CrossOver's bottle directory — custom location honored from its
-    /// preferences plist, read straight from disk (Draconis PathResolver
-    /// approach), standard path as fallback.
+    /// preferences plist, read straight from disk (the same way other
+    /// launchers do), standard path as fallback.
     static func bottlesRoot() -> URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let fallback = home.appendingPathComponent(

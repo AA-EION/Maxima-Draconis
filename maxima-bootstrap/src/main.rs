@@ -4,13 +4,12 @@
 
 use std::env::current_exe;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::string::FromUtf8Error;
 use thiserror::Error;
 use tokio::process::Command;
 
 use base64::{engine::general_purpose, Engine};
-use maxima::auth_server::AUTHORIZE_PORT;
 use maxima::core::launch::BootstrapLaunchArgs;
 use maxima::util::native::NativeError;
 #[cfg(windows)]
@@ -29,9 +28,9 @@ mod macos;
 /// 1. **EA Origin offer id** — `Origin.OFR.<digits>.<digits>` (e.g.
 ///    `Origin.OFR.50.0002694`). Emitted by EA Desktop and by games launched
 ///    directly outside Steam.
-/// 2. **Pure-numeric Steam App ID** — e.g. `1237970` (Titanfall 2 on Steam).
+/// 2. **Pure-numeric Steam App ID** — e.g. `12345`.
 ///    Emitted by EA-published games when launched from inside Steam, where
-///    the URL looks like `link2ea://launchgame/1237970?platform=steam&theme=tf2`.
+///    the URL looks like `link2ea://launchgame/12345?platform=steam`.
 ///    `maxima-cli`'s exhaustive library lookup resolves these against the
 ///    user's owned games (matching against `product.id`, `offer.content_id`,
 ///    etc., not just the slug).
@@ -92,31 +91,23 @@ fn log_event(line: &str) {
     }
 }
 
-/// Quick TCP probe — does the `/authorize` HTTP server look reachable?
-/// Used before paying for a full reqwest round-trip.
-///
-/// Uses tokio's async `TcpStream::connect` wrapped in `timeout` so it
-/// doesn't block the executor thread. (`std::net::TcpStream::connect_timeout`
-/// inside an async fn parks a worker for up to the timeout duration,
-/// which we don't want.)
-async fn auth_server_alive(port: u16) -> bool {
-    let addr = format!("127.0.0.1:{}", port);
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+/// The `/authorize` endpoint of *this* context's Maxima — read from
+/// `instance.json` in our own data directory, which inside a Wine prefix is
+/// that prefix's copy. Never a well-known port: every prefix on the machine
+/// shares the host loopback.
+fn authorize_endpoint() -> Option<(u16, String)> {
+    match maxima::server_client::discover() {
+        maxima_proto::Discovery::Running(info) => info.authorize_port.map(|port| (port, info.token)),
+        _ => None,
+    }
 }
 
-/// Hand a `link2ea://` or `origin2://` URL off to whichever Maxima
-/// already speaks `/authorize`, or fall back to the legacy
-/// `maxima-cli launch` spawn if nothing's listening.
+/// Hand a `link2ea://` or `origin2://` URL off to this context's running
+/// Maxima over `/authorize`, or fall back to spawning `maxima-cli launch`
+/// (which starts the server if needed) when none is serving yet.
 ///
 /// The fall-back path preserves the upstream behavior (and the `link2ea`
-/// flow Draconis used before `serve`-mode existed), so this rewrite
+/// flow used before `serve`-mode existed), so this rewrite
 /// doesn't regress users who never type `maxima-cli serve` — they just
 /// don't get the benefit of the always-on auth server.
 ///
@@ -138,15 +129,10 @@ async fn handle_protocol_authorize(
         return Ok(false);
     }
 
-    let port = std::env::var("MAXIMA_AUTHORIZE_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(AUTHORIZE_PORT);
-
-    if auth_server_alive(port).await {
+    if let Some((port, token)) = authorize_endpoint() {
         // Forward to the running Maxima. The server will refresh the
         // `.dlf`, set the EA-* env vars, and spawn the game executable
-        // via `launch::start_game` — that's the chain TF2's Origin
+        // via `launch::start_game` — that's the chain a game's Origin
         // DRM stub expects when it emits `link2ea://` and exits.
         let mut url = format!(
             "http://127.0.0.1:{}/authorize?offer_id={}",
@@ -172,7 +158,11 @@ async fn handle_protocol_authorize(
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
-        let resp = client.post(&url).send().await?;
+        let resp = client
+            .post(&url)
+            .header(maxima::auth_server::TOKEN_HEADER, token)
+            .send()
+            .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.is_success() {
@@ -185,7 +175,7 @@ async fn handle_protocol_authorize(
         // Server is alive but rejected the request. Don't fall back to
         // spawning `maxima-cli launch` — that would just re-attempt the
         // same operation through a different code path and produce a
-        // duplicate side-effect (a second TF2 process) without resolving
+        // duplicate side-effect (a second game process) without resolving
         // the underlying problem (not logged in, offer not in library).
         log_event(&format!(
             "Auth server rejected {} authorize for {} ({}, body: {})",
@@ -209,8 +199,8 @@ async fn handle_protocol_authorize(
     // `maxima-cli serve` (or whose `serve` hasn't started yet) still get
     // a working launch path.
     log_event(&format!(
-        "No auth server on 127.0.0.1:{}; falling back to maxima-cli launch for {} offer={}",
-        port, protocol_name, offer_id
+        "No running Maxima serves /authorize here; falling back to maxima-cli launch for {} offer={}",
+        protocol_name, offer_id
     ));
 
     #[cfg(windows)]
@@ -428,6 +418,24 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     let mut binding = Command::new(&args.path);
     let child = binding.args(&args.args);
 
+    // Inside a Wine prefix, forward only what was explicitly requested; the
+    // bottle keeps its own defaults.
+    if maxima::util::native::is_wine_environment() {
+        let requested = maxima::util::dll_overrides::requested_wine_dll_overrides(
+            &args.wine_dll_overrides,
+        );
+        if !requested.is_empty() {
+            let inherited = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
+            child.env(
+                "WINEDLLOVERRIDES",
+                maxima::util::dll_overrides::merge_dll_overrides([
+                    inherited.as_str(),
+                    requested.as_str(),
+                ]),
+            );
+        }
+    }
+
     let temp_dir = std::env::temp_dir();
     let debug_log = temp_dir.join("maxima_execution.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -456,15 +464,26 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
 
 #[cfg(unix)]
 async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
-    use maxima::unix::wine::run_wine_command;
-    use maxima::unix::wine::CommandType;
+    use maxima::unix::{
+        prefix,
+        wine::{run_wine_command_with_overrides, CommandType},
+    };
 
-    run_wine_command(
+    // The launcher names the prefix in the payload; a payload from an older
+    // launcher falls back to the ambient prefix (MAXIMA_WINE_PREFIX).
+    let wine_prefix = match args.wine_prefix.as_deref().filter(|p| !p.is_empty()) {
+        Some(prefix) => std::path::PathBuf::from(prefix),
+        None => prefix::ambient()?,
+    };
+
+    run_wine_command_with_overrides(
         args.path,
         Some(args.args),
         None,
         false,
         CommandType::WaitForExitAndRun,
+        &wine_prefix,
+        &args.wine_dll_overrides,
     )
     .await?;
 

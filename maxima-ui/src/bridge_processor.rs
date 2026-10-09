@@ -39,7 +39,7 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             .unwrap();
 
                         // External-command auto-install: if the user
-                        // (or an external launcher like Draconis)
+                        // (or an external launcher)
                         // passed `--install <slug>` on the command
                         // line, fire it now that the login has
                         // landed. `take()` so we never re-fire on a
@@ -83,6 +83,8 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                     GameInfoResponse(res) => {
                         app.games.insert(res.game.slug.clone(), res.game);
                     }
+                    #[cfg(feature = "bg-videos")]
+                    GameBgVideoResponse(slug, url) => app.bg_video.set_url(slug, url),
                     GameDetailsResponse(res) => {
                         let response = res.response;
 

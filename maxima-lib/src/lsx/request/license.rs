@@ -26,13 +26,13 @@ pub async fn handle_license_request(
     let mut maxima = arc.lock().await;
 
     // When the game wasn't launched through Maxima (e.g. the user opened
-    // Maxima UI / `maxima-cli serve` and then started TF2 via Steam or
-    // Northstar mode), `maxima.playing()` is None — there is no
+    // Maxima UI / `maxima-cli serve` and then started the game via Steam or
+    // a launcher), `maxima.playing()` is None — there is no
     // ActiveGameContext to consult for content_id or mode. Upstream this
     // unwrap-panics, killing the spawned LSX-request task and leaving the
     // game waiting forever for a response. Mirror the same defensive
     // pattern `handle_set_presence_request` already uses below: return an
-    // empty `attr_License` so TF2 falls back to its on-disk `.dlf` (which
+    // empty `attr_License` so the game falls back to its on-disk `.dlf` (which
     // `request_and_save_license` deposited at `…/EA Services/License/`
     // during the prior `maxima-cli launch` run, if there was one) rather
     // than crashing the connection.
@@ -42,6 +42,8 @@ pub async fn handle_license_request(
     };
     let content_id = playing.content_id().to_owned();
     let mode = playing.mode();
+    // The hardware identity of the license is that of THIS game's prefix.
+    let wine_prefix = playing.wine_prefix().clone();
 
     let auth = match mode {
         LaunchMode::Offline(_) => {
@@ -54,7 +56,7 @@ pub async fn handle_license_request(
     };
 
     // TODO: how to get version
-    let hw_info = HardwareInfo::new(2);
+    let hw_info = HardwareInfo::new(2, wine_prefix.as_deref());
     let license = request_license(
         &content_id,
         &hw_info.generate_hardware_hash(),

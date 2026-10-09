@@ -5,7 +5,7 @@
 //! Upstream's bootstrap treats `link2ea://launchgame/<offer_id>` as
 //! "launch this game" — it spawns a fresh `maxima-cli launch <offer_id>`
 //! which in turn calls `launch::start_game`, spawning the game executable.
-//! That works as a one-shot but doesn't compose: if Draconis already has
+//! That works as a one-shot but doesn't compose: if a consumer launcher already has
 //! a long-running Maxima session in the bottle (cached login, RTM, etc.),
 //! every protocol-handler invocation re-bootstraps from scratch.
 //!
@@ -18,11 +18,19 @@
 //! (D-Bus on Linux per the issue, plain TCP HTTP for our cross-OS
 //! Wine bottle).
 //!
-//! ## Endpoints
+//! ## Discovery and authentication
 //!
-//! - `GET /`  →  `200 OK` body `maxima-auth-server`. Used by bootstrap as
-//!   a liveness probe before deciding whether to forward or fall back to
-//!   spawning a fresh `maxima-cli launch`.
+//! The listener binds an OS-assigned loopback port (or `MAXIMA_AUTHORIZE_PORT`)
+//! and the owning process publishes that port together with its session token
+//! in `instance.json` in the Maxima data directory. The bootstrap reads the
+//! file from its *own* data directory — inside a Wine prefix that is the
+//! prefix's own copy — and sends the token in the `X-Maxima-Token` header, so
+//! it only ever reaches the Maxima of its own prefix. Requests without the
+//! token, and any request carrying a browser `Origin` header, are refused: a
+//! web page can't make the session launch games.
+//!
+//! ## Endpoint
+//!
 //! - `POST /authorize?offer_id=<id>`  →  Validate login, resolve the offer
 //!   (EA library lookup with [`crate::steam`] fallback for the install
 //!   path), then call [`crate::core::launch::start_game`] which:
@@ -39,7 +47,7 @@
 //!
 //! ### Why /authorize spawns the game (not just preflight)
 //!
-//! Empirically, Titanfall 2's Origin DRM stub emits `link2ea://` and
+//! Empirically, some games' Origin DRM stubs emit `link2ea://` and
 //! **exits**, expecting whoever handles the URL to re-launch it with
 //! EA auth context (`EAGenericAuthToken` etc.) in the environment. A
 //! preflight-only endpoint would refresh the `.dlf` but leave the game
@@ -49,7 +57,7 @@
 //! the standard active-launch branch (not the catornot external-LSX
 //! branch).
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use log::{debug, error, info, warn};
 use serde::Serialize;
@@ -81,13 +89,13 @@ use crate::core::{
     Maxima,
 };
 use crate::steam::{
-    lookup_steam_game, lookup_steam_game_by_offer, resolve_steam_install_path, STEAM_APP_ID_PATTERN,
+    installed_steam_app, installed_steam_apps, load_game_overrides, match_offer_by_name,
+    normalize_name, override_for_offer, override_for_steam_app, override_install_dir,
+    InstalledSteamApp, STEAM_APP_ID_PATTERN,
 };
 
-/// Default port for the authorize HTTP server. LSX is 3216; we pick
-/// `lsx + 3` so the two stay together in `netstat` output but don't
-/// collide. Override via `MAXIMA_AUTHORIZE_PORT` if anything ever clashes.
-pub const AUTHORIZE_PORT: u16 = 13219;
+/// Header carrying the session token from `instance.json`.
+pub const TOKEN_HEADER: &str = "x-maxima-token";
 
 #[derive(Error, Debug)]
 pub enum AuthServerError {
@@ -95,17 +103,19 @@ pub enum AuthServerError {
     Io(#[from] std::io::Error),
 }
 
-/// Bind the authorize HTTP listener and spawn the accept loop. Returns
-/// once the listener is bound; errors inside the accept loop are logged
-/// but don't propagate, so an LSX server already running stays up if
-/// some transient socket error hits this listener.
+/// Bind the authorize HTTP listener (`port` 0 picks a free one) and spawn
+/// the accept loop. Returns the bound port once listening; errors inside the
+/// accept loop are logged but don't propagate, so an LSX server already
+/// running stays up if some transient socket error hits this listener.
 pub async fn start_server(
     port: u16,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
-) -> Result<(), AuthServerError> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Authorize HTTP server listening on {}", addr);
+) -> Result<u16, AuthServerError> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let port = listener.local_addr()?.port();
+    info!("Authorize HTTP server listening on 127.0.0.1:{}", port);
+    let token: Arc<str> = Arc::from(token);
 
     tokio::spawn(async move {
         loop {
@@ -113,8 +123,9 @@ pub async fn start_server(
                 Ok((socket, peer)) => {
                     debug!("Authorize: new connection from {}", peer);
                     let maxima = maxima_arc.clone();
+                    let token = token.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(socket, maxima).await {
+                        if let Err(err) = handle_connection(socket, &token, maxima).await {
                             warn!("Authorize: request failed: {}", err);
                         }
                     });
@@ -129,7 +140,7 @@ pub async fn start_server(
         }
     });
 
-    Ok(())
+    Ok(port)
 }
 
 #[derive(Serialize)]
@@ -146,12 +157,15 @@ struct ErrorResponse {
 /// Public entry point: wraps the real handler in a per-request
 /// `tokio::time::timeout` so a stalled / hostile peer can't keep a
 /// task pinned indefinitely. Slow-client mitigation for an
-/// unauthenticated loopback HTTP listener.
+/// loopback HTTP listener.
 async fn handle_connection(
     socket: TcpStream,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
 ) -> Result<(), std::io::Error> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, handle_connection_inner(socket, maxima_arc)).await {
+    match tokio::time::timeout(REQUEST_TIMEOUT, handle_connection_inner(socket, token, maxima_arc))
+        .await
+    {
         Ok(result) => result,
         Err(_) => {
             warn!(
@@ -165,6 +179,7 @@ async fn handle_connection(
 
 async fn handle_connection_inner(
     mut socket: TcpStream,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
 ) -> Result<(), std::io::Error> {
     let (read_half, _) = socket.split();
@@ -174,9 +189,7 @@ async fn handle_connection_inner(
     // we respond 400 instead of hanging on the read.
     let mut reader = BufReader::new(read_half.take(MAX_REQUEST_HEAD_BYTES));
 
-    // We only need the request line — the body is empty for our endpoints
-    // and headers carry nothing we care about. Drain enough to keep the
-    // peer's send buffer happy, then respond.
+    // The body is always empty; only the request line and two headers matter.
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
@@ -187,20 +200,28 @@ async fn handle_connection_inner(
     let method = parts[0].to_string();
     let path_and_query = parts[1].to_string();
 
-    // Drain headers (until empty line). HTTP/1.1 requires this even if
-    // we don't read further data — without it, some clients refuse to
-    // read the response.
+    let mut presented_token = None;
+    let mut from_browser = false;
     loop {
         let mut header = String::new();
         let n = reader.read_line(&mut header).await?;
         if n == 0 || header == "\r\n" || header == "\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case(TOKEN_HEADER) {
+                presented_token = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("origin") {
+                from_browser = true;
+            }
+        }
     }
 
-    // GET / — health probe used by bootstrap.
-    if method == "GET" && (path_and_query == "/" || path_and_query.starts_with("/?")) {
-        return write_response(&mut socket, 200, "OK", b"maxima-auth-server").await;
+    let authorized = !from_browser
+        && presented_token.is_some_and(|t| maxima_proto::instance::token_matches(token, &t));
+    if !authorized {
+        return write_response(&mut socket, 401, "Unauthorized", b"").await;
     }
 
     // POST /authorize?offer_id=...&cmd_params=...
@@ -237,6 +258,11 @@ enum AuthorizeError {
     NotLoggedIn,
     #[error("no owned offer '{0}' in EA library — link your Steam account at https://www.ea.com")]
     OfferNotFound(String),
+    #[error(
+        "Steam app '{0}' could not be matched to a game in your EA library: no entry in \
+         game-overrides.json and no installed Steam app with a matching name"
+    )]
+    SteamAppUnresolved(String),
     #[error(transparent)]
     Token(#[from] TokenError),
     #[error(transparent)]
@@ -250,7 +276,9 @@ impl AuthorizeError {
         match self {
             AuthorizeError::MissingOfferId => (400, "Bad Request"),
             AuthorizeError::NotLoggedIn | AuthorizeError::Token(_) => (401, "Unauthorized"),
-            AuthorizeError::OfferNotFound(_) => (404, "Not Found"),
+            AuthorizeError::OfferNotFound(_) | AuthorizeError::SteamAppUnresolved(_) => {
+                (404, "Not Found")
+            }
             // `LaunchError::NotInstalled` / `NoOfferFound` are also "not found"
             // shaped; map them precisely so curl users see a useful status.
             AuthorizeError::Launch(LaunchError::NotInstalled(_))
@@ -277,44 +305,12 @@ async fn handle_authorize(
     let raw_offer_id = raw_offer_id.ok_or(AuthorizeError::MissingOfferId)?;
     info!("Authorize request for slug '{}'", raw_offer_id);
 
-    // Steam emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
-    // (e.g. `1237970` for TF2). EA Desktop's library is keyed by Origin
-    // offer IDs like `Origin.OFR.50.0001456`, so we translate via the
-    // STEAM_GAMES table before doing the library lookup. The original
-    // slug is kept as `steam_app_id` to thread through to `launch.rs`
-    // for SteamAppId/SteamGameId env-var setup on the spawned game.
-    let (offer_id, steam_app_id): (String, Option<String>) =
-        if STEAM_APP_ID_PATTERN.is_match(raw_offer_id) {
-            match lookup_steam_game(raw_offer_id) {
-                Some(entry) => {
-                    info!(
-                        "Steam App ID '{}' resolved to Origin offer ID '{}'",
-                        raw_offer_id, entry.origin_offer_id
-                    );
-                    (
-                        entry.origin_offer_id.to_owned(),
-                        Some(raw_offer_id.to_owned()),
-                    )
-                }
-                None => {
-                    warn!(
-                        "Steam App ID '{}' is not in the STEAM_GAMES table; \
-                         passing through directly (will likely 404 in library lookup)",
-                        raw_offer_id
-                    );
-                    (raw_offer_id.to_owned(), Some(raw_offer_id.to_owned()))
-                }
-            }
-        } else {
-            // Looks like an Origin offer ID already (TF2 itself emits
-            // these mid-run; older EA-Desktop-style launches go this
-            // path too).
-            (raw_offer_id.to_owned(), None)
-        };
+    let overrides = load_game_overrides();
+    let is_steam_id = STEAM_APP_ID_PATTERN.is_match(raw_offer_id);
 
-    // Phase 1: cheap pre-checks. Drop the lock before
+    // Phase 1: pre-checks and resolution. Drop the lock before
     // `launch::start_game` re-acquires it, so we don't deadlock.
-    {
+    let (offer_id, steam_app_id, install_dir) = {
         let mut maxima = maxima_arc.lock().await;
 
         // `logged_in()` re-validates the cached token so an expired
@@ -327,29 +323,99 @@ async fn handle_authorize(
             return Err(AuthorizeError::NotLoggedIn);
         }
 
-        // Confirm the (translated) offer is in the user's EA library
-        // here so we can give a clean 404 ("link your accounts at
-        // ea.com") instead of bubbling a less-helpful
-        // `LaunchError::NoOfferFound` later.
-        if maxima
+        let titles: Vec<LibraryEntry> = maxima
+            .mut_library()
+            .games()
+            .await?
+            .iter()
+            .map(|title| {
+                let base = title.base_offer();
+                LibraryEntry {
+                    offer_id: base.offer_id().clone(),
+                    slug: base.slug().clone(),
+                    names: vec![title.name(), base.offer().display_name().to_owned()],
+                }
+            })
+            .collect();
+        let slugs: Vec<&str> = titles.iter().map(|t| t.slug.as_str()).collect();
+        let prefixes = steam_prefix_candidates(&slugs);
+
+        // Steam emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
+        // while EA's library is keyed by Origin offer IDs. Map the App ID to
+        // an offer through the overrides file, else through the installed
+        // Steam app's name. The App ID itself is threaded on to `launch.rs`
+        // for the SteamAppId/SteamGameId env vars on the spawned game.
+        let (offer_id, steam_app_id, installed, by_override) = if is_steam_id {
+            let by_override = override_for_steam_app(&overrides, raw_offer_id);
+            let installed = find_installed_app(raw_offer_id, &prefixes);
+            let offer_id = match by_override {
+                Some(entry) => entry.offer_id.clone(),
+                None => installed
+                    .as_ref()
+                    .and_then(|(app, _)| {
+                        let candidates: Vec<(String, Vec<String>)> = titles
+                            .iter()
+                            .map(|t| (t.offer_id.clone(), t.names.clone()))
+                            .collect();
+                        match_offer_by_name(&app.manifest.name, &candidates)
+                    })
+                    .ok_or_else(|| AuthorizeError::SteamAppUnresolved(raw_offer_id.to_owned()))?,
+            };
+            info!(
+                "Steam App ID '{}' resolved to offer '{}'",
+                raw_offer_id, offer_id
+            );
+            (offer_id, Some(raw_offer_id.to_owned()), installed, by_override)
+        } else {
+            // Already an offer ID (games emit these mid-run too).
+            (
+                raw_offer_id.to_owned(),
+                None,
+                None,
+                override_for_offer(&overrides, raw_offer_id),
+            )
+        };
+
+        // Confirm the offer is in the user's EA library here so we can give
+        // a clean 404 ("link your accounts at ea.com") instead of bubbling a
+        // less-helpful `LaunchError::NoOfferFound` later.
+        let offer = maxima
             .mut_library()
             .game_by_base_offer(&offer_id)
             .await?
-            .is_none()
-        {
-            return Err(AuthorizeError::OfferNotFound(offer_id.clone()));
-        }
-    }
+            .cloned()
+            .ok_or_else(|| AuthorizeError::OfferNotFound(offer_id.clone()))?;
 
-    // Phase 2: build LaunchOptions. The Steam-install path fallback is
-    // crucial for Titanfall 2 from Steam — EA Desktop has no record of
-    // the install, so `launch::start_game` would bail with
-    // `LaunchError::NotInstalled` without an explicit override.
-    let path_override = lookup_steam_game_by_offer(&offer_id)
-        .and_then(resolve_steam_install_path)
-        .and_then(|p| p.to_str().map(str::to_owned));
+        // Where a copy EA Desktop has no record of lives (e.g. in a Steam
+        // library): the overrides file, else the Steam app that was
+        // resolved, else - for a game EA doesn't see installed - an
+        // installed Steam app of the same name. `launch::start_game` turns
+        // the directory into the executable.
+        let prefix_hint = installed
+            .as_ref()
+            .and_then(|(_, prefix)| prefix.as_deref())
+            .or_else(|| prefixes.iter().find_map(|p| p.as_deref()));
+        let install_dir = by_override
+            .and_then(|entry| entry.install_dir.as_deref())
+            .and_then(|dir| override_install_dir(dir, prefix_hint))
+            .or_else(|| installed.as_ref().map(|(app, _)| app.install_dir()));
+        let install_dir = match install_dir {
+            Some(dir) => Some(dir),
+            None if !offer.is_installed().await => {
+                find_installed_by_name(&offer_names(&titles, &offer_id), &prefixes)
+                    .map(|app| app.install_dir())
+            }
+            None => None,
+        };
+
+        (offer_id, steam_app_id, install_dir)
+    };
+
+    let path_override = install_dir
+        .filter(|dir| dir.exists())
+        .and_then(|dir| dir.to_str().map(str::to_owned));
     if let Some(ref p) = path_override {
-        info!("Resolved Steam install path for {}: {}", offer_id, p);
+        info!("Resolved install directory for {}: {}", offer_id, p);
     }
 
     let arguments = cmd_params
@@ -370,13 +436,16 @@ async fn handle_authorize(
         arguments,
         cloud_saves: true,
         // Threading the original Steam App ID (if any) through to
-        // `launch.rs` makes it set SteamAppId/SteamGameId env vars on
-        // the spawned game — without these the game exits with code
-        // 100010 "Steam not detected". Per-game launch args (e.g.
-        // -noOriginStartup, -multiple) must come from the caller via
-        // `cmd_params` or `MAXIMA_LAUNCH_ARGS`; we no longer inject
-        // any TF2-specific defaults.
+        // `launch.rs` makes it set SteamAppId/SteamGameId env vars on the
+        // spawned game; Steam-aware games exit without them. Per-game launch
+        // args must come from the caller via `cmd_params` or
+        // `MAXIMA_LAUNCH_ARGS`.
         steam_app_id,
+        entitlement_source: None,
+        // The game's own prefix (recorded at install, else its per-game
+        // default) is picked inside `start_game`.
+        wine_prefix: None,
+        wine_dll_overrides: Vec::new(),
     };
 
     // Phase 3: hand off to the upstream launch flow. This refreshes the
@@ -393,6 +462,71 @@ async fn handle_authorize(
 
     info!("Game launched for offer '{}'", offer_id);
     Ok(())
+}
+
+struct LibraryEntry {
+    offer_id: String,
+    slug: String,
+    names: Vec<String>,
+}
+
+fn offer_names(titles: &[LibraryEntry], offer_id: &str) -> Vec<String> {
+    titles
+        .iter()
+        .find(|t| t.offer_id == offer_id)
+        .map(|t| t.names.clone())
+        .unwrap_or_default()
+}
+
+/// Wine prefixes that may hold a Steam install, most specific first: the
+/// user override, each library game's own prefix, the ambient one. A single
+/// "no prefix" entry on Windows hosts, where Steam is found natively.
+fn steam_prefix_candidates(slugs: &[&str]) -> Vec<Option<PathBuf>> {
+    #[cfg(unix)]
+    {
+        use crate::unix::prefix;
+
+        let mut found: Vec<Option<PathBuf>> = Vec::new();
+        let mut add = |path: Option<PathBuf>| {
+            if let Some(path) = path.filter(|p| p.exists()) {
+                if !found.contains(&Some(path.clone())) {
+                    found.push(Some(path));
+                }
+            }
+        };
+        add(prefix::explicit_override());
+        for slug in slugs {
+            add(prefix::prefix_for_game(slug, None).ok());
+        }
+        add(prefix::ambient().ok());
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = slugs;
+        vec![None]
+    }
+}
+
+fn find_installed_app(
+    steam_app_id: &str,
+    prefixes: &[Option<PathBuf>],
+) -> Option<(InstalledSteamApp, Option<PathBuf>)> {
+    prefixes.iter().find_map(|prefix| {
+        installed_steam_app(steam_app_id, prefix.as_deref()).map(|app| (app, prefix.clone()))
+    })
+}
+
+fn find_installed_by_name(
+    names: &[String],
+    prefixes: &[Option<PathBuf>],
+) -> Option<InstalledSteamApp> {
+    let wanted: Vec<String> = names.iter().map(|n| normalize_name(n)).collect();
+    prefixes.iter().find_map(|prefix| {
+        installed_steam_apps(prefix.as_deref())
+            .into_iter()
+            .find(|app| wanted.contains(&normalize_name(&app.manifest.name)))
+    })
 }
 
 fn extract_query_param(path_and_query: &str, key: &str) -> Option<String> {

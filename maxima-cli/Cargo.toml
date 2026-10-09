@@ -4,6 +4,11 @@ version.workspace = true
 authors = ["Sean Kahler <sean@battleda.sh>"]
 edition = "2021"
 
+[features]
+# EA's social gRPC presence backend for the in-process paths (serve, launch
+# --login). Off by default; see maxima-lib/src/presence/.
+presence-grpc = ["maxima-lib/presence-grpc"]
+
 [dependencies]
 maxima-lib = { path = "../maxima-lib" }
 maxima-proto = { path = "../maxima-proto" }

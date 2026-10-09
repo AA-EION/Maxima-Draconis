@@ -36,7 +36,7 @@ jobs:
       uses: actions/cache@v3
       with:
         path: ${{ github.workspace }}\rust\.rustup
-        key: rust-${{ matrix.rust-version }}-${{ hashFiles('**/rust-toolchain') }}
+        key: rust-${{ matrix.rust-version }}-${{ hashFiles('rust-toolchain.toml') }}
 
     - name: Setup Rust ${{ matrix.rust-version }}
       if: runner.os != 'macOS'
@@ -44,8 +44,12 @@ jobs:
       with:
         profile: minimal
         toolchain: ${{ matrix.rust-version }}
-        override: true
         components: rustfmt, clippy
+
+    - name: Install the pinned nightly
+      # rust-toolchain.toml decides the compiler; no directory override above.
+      if: runner.os != 'macOS'
+      run: rustup toolchain install
 
     - name: Install Protoc
       # Only needed for the Rust build (maxima-lib/prost-build). macOS only
@@ -113,7 +117,7 @@ jobs:
 
     - name: Build Maxima
       if: runner.os == 'Linux'
-      # Build the Draconis-relevant crates + the server. maxima-ui pulls
+      # Build the consumer-facing crates + the server. maxima-ui pulls
       # accesskit_unix → zbus 3 → async-io 1.13 → rustix 0.37.28, which doesn't
       # build on modern nightly (uses `rustc_attrs`, now a reserved namespace).
       # maxima-service is windows-only. We skip both here.
@@ -181,6 +185,118 @@ jobs:
         name: maxima-helper-zip
         path: dist/MaximaHelper.zip
 
+  # ── Linux arm64 (native) ─────────────────────────────────────────────────
+  # Compiles the aarch64 paths of maxima-lib (hardware hash via /proc/cpuinfo
+  # and lscpu instead of cpuid) on a real arm64 runner. Same crates as the
+  # x86_64 Linux job; glibc target, so no static musl build here.
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libdbus-1-dev pkg-config
+
+    - name: Install Rust nightly
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: Linux-arm64-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Build Maxima
+      run: |
+        cargo build --release -p maxima-cli -p maxima-bootstrap -p maxima-server
+
+    - name: Unit tests (maxima-lib)
+      # read_files/write_files need a live EA session.
+      run: cargo test --release -p maxima-lib --lib -- --skip read_files --skip write_files
+
+    - name: Smoke-test the arm64 CLI
+      run: |
+        set -e
+        ./target/release/maxima-cli --help >/dev/null
+        test "$(uname -m)" = aarch64
+
+  # ── Linux packages (AppImage + Flatpak/metainfo checks) ──────────────────
+  # Builds the static musl binaries (incl. maxima-tui, which compiles fine on
+  # Linux - only maxima-ui does not), wraps them in an AppImage and runs it, and
+  # syntax-checks the Flatpak manifest, metainfo and .desktop file. A full
+  # flatpak-builder run is not done here: it needs the vendored cargo-sources.json
+  # and a runtime download, which is far too slow for a push CI.
+  linux-packages:
+    name: Linux packages
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config desktop-file-utils appstream python3-yaml
+        rustup target add x86_64-unknown-linux-musl
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: Linux-packages-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Validate packaging files
+      run: REQUIRE_TOOLS=1 packaging/linux/validate.sh
+
+    - name: Build static binaries
+      run: |
+        cargo build --release --target x86_64-unknown-linux-musl \
+          -p maxima-cli -p maxima-server -p maxima-bootstrap -p maxima-tui
+      env:
+        RUSTFLAGS: "-C target-feature=+crt-static"
+
+    - name: Build AppImage
+      run: packaging/linux/appimage/build.sh
+
+    - name: Smoke-test the AppImage
+      env:
+        APPIMAGE_EXTRACT_AND_RUN: "1"
+      run: |
+        set -e
+        img="$(ls dist/Maxima-*-x86_64.AppImage)"
+        "$img" --help >/dev/null
+        "$img" cli --help >/dev/null
+        out="$("$img" server-status --json)"
+        echo "$out"
+        echo "$out" | grep -q '"running":false'
+        "$img" --appimage-extract >/dev/null
+        for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
+          test -x "squashfs-root/usr/bin/$b"
+        done
+        grep -q 'x-scheme-handler/link2ea' squashfs-root/com.ArmchairDevelopers.Maxima.desktop
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: maxima-appimage-x86_64
+        path: dist/Maxima-*-x86_64.AppImage
+
   # ── macOS native (Apple Silicon) ─────────────────────────────────────────
   # The native-mode binaries (maxima-cli / maxima-server / maxima-bootstrap /
   # maxima-tui), MaximaBootstrap.app and the SwiftUI Maxima.app. The matrix
@@ -198,8 +314,8 @@ jobs:
       run: brew install protobuf
 
     - name: Install Rust nightly
-      # rust-toolchain.toml pins nightly; rustup picks it up on first use.
-      run: rustup show active-toolchain || rustup toolchain install nightly --profile minimal
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
 
     - uses: Swatinem/rust-cache@v2
       with:
@@ -235,8 +351,40 @@ jobs:
         codesign --verify --deep maxima-native/build/Maxima.app
         echo "✓ native macOS build looks healthy"
 
+  # ── maxima-ui animated backgrounds (opt-in `bg-videos` feature) ────────────
+  # The default build needs no FFmpeg. This job only compiles the feature on
+  # macOS so the FFmpeg-backed player (maxima-ui/src/renderers/media_player.rs)
+  # can't rot unnoticed. ffmpeg-next tracks the FFmpeg major.minor, so the
+  # version pinned in maxima-ui/Cargo.toml (~7.1) is paired with ffmpeg@7,
+  # which Homebrew keeps keg-only (hence the PKG_CONFIG_PATH).
+  ui-bg-videos:
+    name: ui-bg-videos (macOS)
+    runs-on: macos-26
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install FFmpeg, pkgconf and protoc
+      run: brew install ffmpeg@7 pkgconf protobuf
+
+    - name: Install Rust nightly
+      # The exact nightly pinned in rust-toolchain.toml.
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: macOS-ui-bg-videos-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Check maxima-ui with bg-videos
+      run: |
+        export PKG_CONFIG_PATH="$(brew --prefix ffmpeg@7)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        cargo check -p maxima-ui --features bg-videos
+
   # ── MaximaSetup.exe under Wine on macOS ──────────────────────────────────
-  # The in-bottle mode Draconis uses: install MaximaSetup.exe into a fresh
+  # The in-bottle mode consumer launchers use: install MaximaSetup.exe into a fresh
   # Wine prefix on a macOS runner, then check the installed layout and that
   # the thin-client CLI really spawns maxima-server.exe. Intel runner so the
   # x86_64 Windows binaries run without Rosetta.

@@ -12,7 +12,14 @@ repository = "https://github.com/ArmchairDevelopers/Maxima"
 documentation = "https://docs.rs/maxima"
 rust-version = "1.81.0"
 
+[features]
+default = []
+# EA's social gRPC presence service (upstream PR 67): the tonic transport.
+# Off by default; selected at runtime with MAXIMA_PRESENCE_BACKEND=grpc|auto.
+presence-grpc = ["dep:tonic"]
+
 [dependencies]
+maxima-proto = { path = "../maxima-proto" }
 tokio = { version = "1.28.2", features = [
     "full",
     "rt",
@@ -23,7 +30,7 @@ tokio = { version = "1.28.2", features = [
 moka = { version = "0.12.1", features = ["sync"] }
 serde = { version = "1.0.164", features = ["derive"] }
 serde_json = "1.0.97"
-quick-xml = { version = "0.30.0", features = ["serialize"] }
+quick-xml = { version = "0.30.0", features = ["serialize", "overlapped-lists"] }
 paste = "1.0.12"
 hex = "0.4.3"
 lazy_static = "1.4.0"
@@ -77,6 +84,18 @@ gethostname = "0.5.0"
 thiserror = "2.0.12"
 url = "2.5.2"
 http = "0.2.12"
+globset = "0.4"
+
+# Transport for the `presence-grpc` feature. The protobuf messages stay on the
+# workspace's prost 0.12 (see presence/grpc.rs for the codec that bridges the
+# two), so tonic's own `prost` feature is deliberately left off: enabling the
+# feature adds tonic + hyper/h2/tower and rustls 0.23, but no second prost.
+tonic = { version = "0.13.1", optional = true, default-features = false, features = [
+    "channel",
+    "codegen",
+    "tls-ring",
+    "tls-webpki-roots",
+] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [
@@ -91,6 +110,11 @@ winapi = { version = "0.3.9", features = [
     "iphlpapi",
     "tcpmib",
     "winsvc",
+    "shellapi",
+    "processthreadsapi",
+    "errhandlingapi",
+    "winbase",
+    "winuser",
     "impl-default"
 ] }
 winreg = "0.51.0"
@@ -107,6 +131,9 @@ libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.12.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lib]
 name = "maxima"

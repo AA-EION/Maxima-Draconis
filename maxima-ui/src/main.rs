@@ -58,32 +58,16 @@ const ACCENT_COLOR: Color32 = Color32::from_rgb(8, 171, 244);
 const APP_MARGIN: Vec2 = vec2(12.0, 12.0); //TODO: user setting
 const FRIEND_INGAME_COLOR: Color32 = Color32::from_rgb(39, 106, 252); // temp
 
-/// Write panics to `%LOCALAPPDATA%\Maxima\Logs\maxima.panic.log`
-/// (Windows) or `$XDG_DATA_HOME/maxima/logs/maxima.panic.log` (unix)
+/// Write panics to `maxima.panic.log` in `maxima_logs_path()`
+/// (`%LOCALAPPDATA%\Maxima\Logs` on Windows, `<data dir>/logs` elsewhere)
 /// in addition to stderr. Without this, panics in worker threads or
 /// during tokio runtime construction can leave no trace — exactly the
 /// failure mode that made the user-reported "Maxima UI thread crash"
 /// hard to diagnose. Mirrored from `maxima-cli`'s install_panic_hook.
 fn install_panic_hook() {
-    let log_path: Option<std::path::PathBuf> = {
-        #[cfg(windows)]
-        {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("APPDATA"))
-                .map(std::path::PathBuf::from)
-                .map(|p| p.join("Maxima").join("Logs").join("maxima.panic.log"))
-        }
-        #[cfg(unix)]
-        {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
-                })
-                .map(|p| p.join("maxima").join("logs").join("maxima.panic.log"))
-        }
-    };
+    let log_path: Option<std::path::PathBuf> = maxima::util::native::maxima_logs_path()
+        .ok()
+        .map(|d| d.join("maxima.panic.log"));
 
     std::panic::set_hook(Box::new(move |info| {
         // Best-effort: never let the panic hook itself panic.
@@ -128,7 +112,7 @@ struct Args {
     /// External-command: on startup, log in (if not already) then
     /// auto-queue an install of this game slug. The UI navigates to
     /// the Downloads view so the user sees progress. Used by external
-    /// launchers (e.g. Draconis) that want to drive a headless-feel
+    /// launchers that want to drive a headless-feel
     /// install without the user manually clicking through the library.
     ///
     /// Requires `--install-path`. The slug is resolved against the
@@ -218,7 +202,7 @@ async fn async_main() {
         viewport: ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([940.0, 480.0])
-            .with_app_id("io.github.ArmchairDevelopers.Maxima")
+            .with_app_id(maxima::util::native::APP_ID)
             .with_icon(
                 eframe::icon_data::from_png_bytes(
                     &include_bytes!("../../maxima-resources/assets/logo.png")[..],
@@ -405,6 +389,9 @@ pub struct MaximaEguiApp {
     app_bg_renderer: Option<AppBgRenderer>,
     /// Image cache
     img_cache: UIImageCache,
+    /// Animated game backgrounds (off unless enabled in settings)
+    #[cfg(feature = "bg-videos")]
+    bg_video: renderers::bg_video::BgVideo,
     /// Translations
     locale: TranslationManager,
     /// If a core thread has crashed and made the UI unstable
@@ -472,6 +459,10 @@ pub struct FrontendSettings {
     /// keeps settings persisted by older builds deserializable.
     #[serde(default)]
     wine_command: String,
+    /// Play animated game backgrounds. Only has an effect in builds with the
+    /// `bg-videos` feature; off by default to save CPU/battery.
+    #[serde(default)]
+    videos: bool,
 }
 
 impl FrontendSettings {
@@ -483,6 +474,7 @@ impl FrontendSettings {
             game_settings: HashMap::new(),
             performance_settings: FrontendPerformanceSettings::new(),
             wine_command: String::new(),
+            videos: false,
         }
     }
 }
@@ -630,6 +622,8 @@ impl MaximaEguiApp {
             game_view_bg_renderer: GameViewBgRenderer::new(cc),
             app_bg_renderer: AppBgRenderer::new(cc),
             img_cache,
+            #[cfg(feature = "bg-videos")]
+            bg_video: Default::default(),
             locale: TranslationManager::new(&settings.language),
             critical_error: None,
             nonfatal_errors: Vec::new(),
@@ -1048,7 +1042,7 @@ impl MaximaEguiApp {
                                         ui.add_enabled_ui(PathBuf::from(&self.installer_state.locate_path).exists(), |ui| {
 
                                             if ui.add_sized(button_size, egui::Button::new(&self.locale.localization.modals.game_install.locate_action.to_ascii_uppercase())).clicked() {
-                                                self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::LocateGameRequest(self.installer_state.locate_path.clone())).unwrap();
+                                                self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::LocateGameRequest(self.installer_state.locate_path.clone(), game.slug.clone())).unwrap();
                                                 self.installer_state.locating = true;
                                             }
                                         });
@@ -1202,7 +1196,38 @@ impl eframe::App for MaximaEguiApp {
             frame,
             "Maxima",
             |ui| {
-                if let Some(render) = &self.app_bg_renderer {
+                // The video is plain egui painting, so it works with any renderer
+                // (the glow-only background below is absent under wgpu).
+                #[cfg(feature = "bg-videos")]
+                let video_drawn = {
+                    let has_game_img = self.backend_state == BackendStallState::BingChilling
+                        && self.games.len() > 0;
+                    let gaming = self.page_view == PageType::Games && has_game_img;
+                    if has_game_img && self.game_sel.is_empty() {
+                        if let Some(key) = self.games.keys().next() {
+                            self.game_sel = key.clone()
+                        }
+                    }
+                    let how_game: f32 = ctx
+                        .animate_bool(egui::Id::new("MainAppBackgroundGamePageFadeBool"), gaming);
+                    let mut fullrect = ui.available_rect_before_wrap().clone();
+                    fullrect.min -= APP_MARGIN;
+                    fullrect.max += APP_MARGIN;
+                    has_game_img
+                        && self.bg_video.draw(
+                            ui,
+                            fullrect,
+                            &self.game_sel,
+                            self.settings.videos,
+                            gaming,
+                            how_game,
+                            &self.backend.backend_commander,
+                        )
+                };
+                #[cfg(not(feature = "bg-videos"))]
+                let video_drawn = false;
+
+                if let Some(render) = self.app_bg_renderer.as_ref().filter(|_| !video_drawn) {
                     let mut fullrect = ui.available_rect_before_wrap().clone();
                     fullrect.min -= APP_MARGIN;
                     fullrect.max += APP_MARGIN;

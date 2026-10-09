@@ -62,10 +62,10 @@ impl BridgeThread {
         rx: Receiver<MaximaLibRequest>,
         tx: Sender<MaximaLibResponse>,
     ) -> Result<()> {
-        // Connect to the server, spawning `maxima-server` if it isn't up.
-        let port = maxima_proto::server_port();
-        let server = locate_server();
-        let client: Arc<MaximaClient> = MaximaClient::connect_or_spawn(port, &server).await?;
+        // Connect to this context's server, spawning `maxima-server` if needed.
+        let client: Arc<MaximaClient> =
+            maxima::server_client::connect(concat!("maxima-tui/", env!("CARGO_PKG_VERSION")), true)
+                .await?;
 
         // The server's `ready` carries the signed-in persona.
         match client.await_ready().await {
@@ -121,17 +121,4 @@ impl BridgeThread {
             }
         }
     }
-}
-
-/// Locate `maxima-server` next to this binary (installer / cargo layout).
-fn locate_server() -> std::path::PathBuf {
-    #[cfg(windows)]
-    const NAME: &str = "maxima-server.exe";
-    #[cfg(not(windows))]
-    const NAME: &str = "maxima-server";
-
-    std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join(NAME)))
-        .unwrap_or_else(|| std::path::PathBuf::from(NAME))
 }
