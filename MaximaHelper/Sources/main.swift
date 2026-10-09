@@ -18,8 +18,14 @@ private let maximaPort = 31033
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingTask: URLSessionDataTask?
+    private var receivedURL = false
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    // When macOS launches this app *for* a qrc:// link, the GetURL Apple
+    // Event is delivered while the app is still launching, before
+    // applicationDidFinishLaunching. Registering there lost that event: the
+    // helper stayed running and nothing was forwarded. Register before launch
+    // completes, as Apple recommends for URL handlers.
+    func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleGetURL(_:withReply:)),
@@ -28,22 +34,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Launched without a link, or it never arrived: don't stay running.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self, !self.receivedURL else { return }
+            os_log("No qrc:// URL received; exiting", log: log, type: .error)
+            NSApp.terminate(nil)
+        }
+    }
+
+    // AppKit's own route for opened URLs, used if the Apple Event reaches it
+    // instead of the handler above.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first else { return }
+        handle(url.absoluteString)
+    }
+
     @objc func handleGetURL(
         _ event: NSAppleEventDescriptor,
         withReply reply: NSAppleEventDescriptor
     ) {
+        handle(event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue)
+    }
+
+    private func handle(_ rawURL: String?) {
+        guard !receivedURL else { return }
         guard
-            let rawURL = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+            let rawURL,
             let url = URL(string: rawURL),
             url.scheme == "qrc"
         else {
-            os_log("Ignoring non-qrc URL", log: log, type: .debug)
+            os_log("Ignoring non-qrc URL", log: log, type: .error)
             NSApp.terminate(nil)
             return
         }
+        receivedURL = true
 
-        os_log("Received qrc:// URL, forwarding to maxima-cli at 127.0.0.1:%d",
-               log: log, type: .info, maximaPort)
+        os_log("Received qrc:// URL, forwarding to Maxima at 127.0.0.1:%d",
+               log: log, type: .default, maximaPort)
         forward(url)
     }
 
@@ -70,7 +98,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                        log: log, type: .error, error.localizedDescription)
             } else {
                 os_log("Forward succeeded (HTTP %d)",
-                       log: log, type: .info,
+                       log: log, type: .default,
                        (response as? HTTPURLResponse)?.statusCode ?? 0)
             }
             DispatchQueue.main.async {
