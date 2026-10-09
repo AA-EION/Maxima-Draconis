@@ -472,28 +472,49 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
         Request::GameImages { slug } => {
             game_images(state, &slug).await.map(|i| json!({ "images": i }))
         }
-        Request::Launch { slug, args, exe_override, cloud_saves } => cmd_launch(
-            state, slug, args, exe_override, cloud_saves,
+        Request::Launch { slug, args, exe_override, cloud_saves, wine_prefix } => cmd_launch(
+            state, slug, args, exe_override, cloud_saves, wine_prefix,
         )
         .await
         .map(|_| json!({})),
-        Request::Install { slug, path, build_id, replace_files, only_listed_files } => {
-            cmd_install(state, slug, path, build_id, replace_files, only_listed_files)
+        Request::Install {
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            wine_prefix,
+            exclude,
+        } => cmd_install(
+            state,
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            wine_prefix,
+            exclude,
+        )
+        .await
+        .map(|_| json!({})),
+        Request::LocateGame { path, slug, wine_prefix } => {
+            cmd_locate(state, &path, slug, wine_prefix).await.map(|_| json!({}))
+        }
+        Request::CloudSync { slug, write, wine_prefix } => {
+            cmd_cloud_sync(state, &slug, write, wine_prefix).await.map(|_| json!({}))
+        }
+        Request::Verify { slug, path, repair, wine_prefix, exclude } => {
+            cmd_verify(state, slug, path, repair, wine_prefix, exclude)
                 .await
                 .map(|_| json!({}))
         }
-        Request::LocateGame { path } => cmd_locate(state, &path).await.map(|_| json!({})),
-        Request::CloudSync { slug, write } => {
-            cmd_cloud_sync(state, &slug, write).await.map(|_| json!({}))
+        Request::DownloadFile { slug, build_id, file, wine_prefix } => {
+            cmd_download_file(state, &slug, build_id, &file, wine_prefix)
+                .await
+                .map(|_| json!({}))
         }
-        Request::Verify { slug, path, repair } => {
-            cmd_verify(state, slug, path, repair).await.map(|_| json!({}))
-        }
-        Request::DownloadFile { slug, build_id, file } => {
-            cmd_download_file(state, &slug, build_id, &file).await.map(|_| json!({}))
-        }
-        Request::BottleInfo { slug } => {
-            cmd_bottle_info(state, &slug).await.map(|b| json!({ "bottle": b }))
+        Request::BottleInfo { slug, wine_prefix } => {
+            cmd_bottle_info(state, &slug, wine_prefix).await.map(|b| json!({ "bottle": b }))
         }
         Request::RegisterProtocols => cmd_register_protocols().await.map(|_| json!({})),
     };
@@ -678,6 +699,10 @@ async fn game_details(state: &Arc<ServerState>, slug: &str) -> Result<GameDetail
     })
 }
 
+/// Resolve whatever the client typed to the library's canonical
+/// `(slug, offer_id)`. Pure lookup: choosing (and creating) the game's Wine
+/// prefix is a separate, per-request step ([`prepare_prefix`] /
+/// [`peek_prefix`]), so two games never share a selection.
 async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String, String)> {
     let mut maxima = maxima_arc.lock().await;
     let slug = maxima.mut_library().canonical_slug(typed).await;
@@ -687,17 +712,66 @@ async fn resolve_game(maxima_arc: &LockedMaxima, typed: &str) -> Result<(String,
         .await?
         .map(|o| o.offer_id().clone())
         .ok_or_else(|| anyhow::anyhow!("`{}` is not in this EA library", typed))?;
-    drop(maxima);
-
-    #[cfg(target_os = "macos")]
-    maxima::unix::crossover::ensure_game_bottle(&slug).await?;
-
     Ok((slug, offer_id))
 }
 
-fn conventional_game_dir(slug: &str) -> Option<String> {
-    let prefix = std::env::var("MAXIMA_WINE_PREFIX").ok()?;
-    let dir = std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug);
+fn explicit_prefix(wine_prefix: &Option<String>) -> Option<std::path::PathBuf> {
+    wine_prefix
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The Wine prefix `slug` runs in for this request, created if it is Maxima's
+/// to create (the per-game CrossOver bottle on macOS). Done before any lock
+/// on the session is taken: creating a bottle can take a minute. `None` on
+/// Windows, which has no prefixes.
+#[cfg(unix)]
+async fn prepare_prefix(
+    slug: &str,
+    wine_prefix: &Option<String>,
+) -> Result<Option<std::path::PathBuf>> {
+    let explicit = explicit_prefix(wine_prefix);
+    Ok(Some(
+        maxima::unix::prefix::resolve_for_game(slug, explicit.as_deref()).await?,
+    ))
+}
+
+#[cfg(not(unix))]
+async fn prepare_prefix(
+    _slug: &str,
+    _wine_prefix: &Option<String>,
+) -> Result<Option<std::path::PathBuf>> {
+    Ok(None)
+}
+
+/// Like [`prepare_prefix`] but creates nothing — for read-only commands.
+#[cfg(unix)]
+fn peek_prefix(
+    slug: &str,
+    wine_prefix: &Option<String>,
+) -> Option<(std::path::PathBuf, maxima::unix::prefix::PrefixSource)> {
+    let explicit = explicit_prefix(wine_prefix);
+    maxima::unix::prefix::peek_for_game(slug, explicit.as_deref()).ok()
+}
+
+#[cfg(not(unix))]
+fn peek_prefix(_slug: &str, _wine_prefix: &Option<String>) -> Option<(std::path::PathBuf, ())> {
+    None
+}
+
+fn peeked_prefix_path(slug: &str, wine_prefix: &Option<String>) -> Option<std::path::PathBuf> {
+    peek_prefix(slug, wine_prefix).map(|(path, _)| path)
+}
+
+fn recorded_install_dir(slug: &str) -> Option<std::path::PathBuf> {
+    maxima::gameinfo::load_game_info(slug)
+        .map(|info| info.path)
+        .filter(|path| path.is_dir())
+}
+
+fn conventional_game_dir(slug: &str, prefix: Option<&std::path::Path>) -> Option<String> {
+    let dir = prefix?.join("drive_c").join("Games").join(slug);
     dir.exists().then(|| dir.to_string_lossy().to_string())
 }
 
@@ -707,14 +781,24 @@ async fn cmd_launch(
     args: Vec<String>,
     exe_override: Option<String>,
     cloud_saves: bool,
+    wine_prefix: Option<String>,
 ) -> Result<()> {
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let path_override = exe_override.or_else(|| conventional_game_dir(&slug));
+    let prefix = prepare_prefix(&slug, &wine_prefix).await?;
+    let path_override = exe_override
+        .or_else(|| recorded_install_dir(&slug).map(|d| d.to_string_lossy().to_string()))
+        .or_else(|| conventional_game_dir(&slug, prefix.as_deref()));
 
     launch::start_game(
         state.maxima.clone(),
         LaunchMode::Online(offer_id),
-        LaunchOptions { path_override, arguments: args, cloud_saves, steam_app_id: None },
+        LaunchOptions {
+            path_override,
+            arguments: args,
+            cloud_saves,
+            steam_app_id: None,
+            wine_prefix: prefix,
+        },
     )
     .await?;
 
@@ -722,17 +806,22 @@ async fn cmd_launch(
     Ok(())
 }
 
-/// Resolve the install path for a game — explicit, or the conventional
-/// per-bottle dir.
-fn install_dir_for(slug: &str, path: Option<String>) -> Result<std::path::PathBuf> {
-    match path {
-        Some(p) => Ok(std::path::PathBuf::from(p)),
-        None => {
-            let prefix = std::env::var("MAXIMA_WINE_PREFIX")
-                .map_err(|_| anyhow::anyhow!("no path and no bottle selected for {}", slug))?;
-            Ok(std::path::Path::new(&prefix).join("drive_c").join("Games").join(slug))
-        }
+/// Resolve the install path for a game: explicit, else where its install
+/// record says it lives, else the conventional per-prefix dir.
+fn install_dir_for(
+    slug: &str,
+    path: Option<String>,
+    prefix: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
+    if let Some(p) = path {
+        return Ok(std::path::PathBuf::from(p));
     }
+    if let Some(dir) = recorded_install_dir(slug) {
+        return Ok(dir);
+    }
+    let prefix = prefix
+        .ok_or_else(|| anyhow::anyhow!("no path and no wine prefix known for {}", slug))?;
+    Ok(prefix.join("drive_c").join("Games").join(slug))
 }
 
 /// Reject `..` / absolute segments so a bad replace-files entry can't escape
@@ -748,6 +837,7 @@ fn safe_relative(relative: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_install(
     state: &Arc<ServerState>,
     typed: String,
@@ -755,12 +845,21 @@ async fn cmd_install(
     build_id_override: Option<String>,
     replace_files: Vec<String>,
     only_listed_files: bool,
+    wine_prefix: Option<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
     use maxima::content::manager::QueuedGameBuilder;
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let install_path = install_dir_for(&slug, path)?;
+    // A surgical refresh of a few files neither installs the game nor needs
+    // its prefix to exist; a real install creates the prefix up front.
+    let prefix = if only_listed_files {
+        peeked_prefix_path(&slug, &wine_prefix)
+    } else {
+        prepare_prefix(&slug, &wine_prefix).await?
+    };
+    let install_path = install_dir_for(&slug, path, prefix.as_deref())?;
 
     // Pre-install replace step: delete listed files so the downloader
     // re-fetches them (works for ANY file of ANY game — the Steam-CEG fix
@@ -830,10 +929,15 @@ async fn cmd_install(
         return Err(Busy("another install is already running".into()).into());
     }
     let mut maxima = state.maxima.lock().await;
+    let locale = maxima.locale().full_str().to_owned();
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build_id)
         .path(install_path)
+        .slug(slug.clone())
+        .wine_prefix(prefix)
+        .exclude(exclude)
+        .locale(Some(locale))
         .build()?;
     maxima.content_manager().install_now(game).await?;
     drop(maxima);
@@ -851,12 +955,23 @@ async fn cmd_verify(
     typed: String,
     path: Option<String>,
     repair: bool,
+    wine_prefix: Option<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
-    use maxima::content::{downloader::ZipDownloader, ContentService};
+    use maxima::content::{downloader::ZipDownloader, exclusion::get_exclusion_list, ContentService};
     use tokio::fs;
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
-    let install_path = install_dir_for(&slug, path.clone())?;
+    let prefix = peeked_prefix_path(&slug, &wine_prefix);
+    let install_path = install_dir_for(&slug, path.clone(), prefix.as_deref())?;
+
+    // Files the user excluded from the download are not "missing": the
+    // game's exclusion file, what the install recorded, and this request.
+    let mut patterns = maxima::gameinfo::load_game_info(&slug)
+        .map(|info| info.exclude)
+        .unwrap_or_default();
+    patterns.extend(exclude);
+    let exclusion = get_exclusion_list(&slug, &patterns);
     if !fs::try_exists(&install_path).await.unwrap_or(false) {
         anyhow::bail!("install path '{}' doesn't exist", install_path.display());
     }
@@ -874,9 +989,18 @@ async fn cmd_verify(
     };
 
     let downloader = ZipDownloader::new(&offer_id, &manifest_url, &install_path).await?;
-    let entries = downloader.manifest().entries();
+    let entries: Vec<_> = downloader
+        .manifest()
+        .entries()
+        .iter()
+        .filter(|entry| !exclusion.is_match(entry.name()))
+        .collect();
+    let skipped = downloader.manifest().entries().len() - entries.len();
     let total = entries.len() as u64;
     info!("Verifying {} files for '{}' (build {})", total, offer_id, build_id);
+    if skipped > 0 {
+        info!("Skipping {} excluded file(s)", skipped);
+    }
 
     let mut broken: Vec<String> = Vec::new();
     let progress_every = std::cmp::max(entries.len() / 20, 100);
@@ -924,6 +1048,8 @@ async fn cmd_verify(
             None,
             broken_clone,
             true,
+            wine_prefix,
+            Vec::new(),
         ))
         .await?;
         state.notify(Notification::VerifyDone {
@@ -950,11 +1076,13 @@ async fn cmd_download_file(
     typed: &str,
     build_id: Option<String>,
     file: &str,
+    wine_prefix: Option<String>,
 ) -> Result<()> {
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, typed).await?;
-    let install_path = install_dir_for(&slug, None)?;
+    let prefix = peeked_prefix_path(&slug, &wine_prefix);
+    let install_path = install_dir_for(&slug, None, prefix.as_deref())?;
 
     let auth = { state.maxima.lock().await.auth_storage().clone() };
     let content_service = ContentService::new(auth);
@@ -987,31 +1115,51 @@ async fn cmd_download_file(
 async fn cmd_bottle_info(
     state: &Arc<ServerState>,
     typed: &str,
+    wine_prefix: Option<String>,
 ) -> Result<maxima_proto::types::BottleInfoDto> {
     let slug = {
         let mut maxima = state.maxima.lock().await;
         maxima.mut_library().canonical_slug(typed).await
     };
 
-    let env_prefix = std::env::var("MAXIMA_WINE_PREFIX").ok().map(std::path::PathBuf::from);
-
-    #[cfg(target_os = "macos")]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
-        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
-        None => {
-            let name = format!("Maxima-{}", slug);
-            let p = maxima::unix::crossover::bottles_dir().ok().map(|d| d.join(&name));
-            (Some(name), p)
+    #[cfg(unix)]
+    let (bottle_name, prefix, prefix_source): (
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+    ) = {
+        use maxima::unix::prefix::PrefixSource;
+        match peek_prefix(&slug, &wine_prefix) {
+            Some((path, source)) => {
+                // CrossOver addresses a bottle by name; elsewhere a name only
+                // means something when the user chose the prefix themselves.
+                let named = cfg!(target_os = "macos")
+                    || matches!(source, PrefixSource::Explicit | PrefixSource::Override);
+                let name = named
+                    .then(|| maxima::unix::prefix::bottle_name(&path))
+                    .flatten();
+                let source = match source {
+                    PrefixSource::Explicit => "explicit",
+                    PrefixSource::Override => "override",
+                    PrefixSource::Recorded => "recorded",
+                    PrefixSource::Default => "default",
+                };
+                (name, Some(path), Some(source.to_owned()))
+            }
+            None => (None, None, None),
         }
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = match env_prefix {
-        Some(p) => (p.file_name().map(|n| n.to_string_lossy().to_string()), Some(p)),
-        None => (None, maxima::unix::wine::wine_prefix_dir().ok()),
-    };
     #[cfg(windows)]
-    let (bottle_name, prefix): (Option<String>, Option<std::path::PathBuf>) = (None, None);
+    let (bottle_name, prefix, prefix_source): (
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+    ) = {
+        let _ = &wine_prefix;
+        (None, None, None)
+    };
 
+    let record = maxima::gameinfo::load_game_info(&slug);
     let game_dir = prefix.as_ref().map(|p| p.join("drive_c").join("Games").join(&slug));
     let wine_prefix_exists = prefix.as_ref().map(|p| p.join("system.reg").exists()).unwrap_or(false);
     let game_dir_exists = game_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -1023,6 +1171,12 @@ async fn cmd_bottle_info(
         wine_prefix_exists,
         default_game_dir: game_dir.as_ref().map(|p| p.display().to_string()),
         game_dir_exists,
+        prefix_source,
+        install_dir: record.as_ref().map(|r| r.path.display().to_string()),
+        build_id: record.as_ref().and_then(|r| r.build_id.clone()),
+        version: record.as_ref().and_then(|r| r.version.clone()),
+        locale: record.as_ref().and_then(|r| r.locale.clone()),
+        installed_at: record.as_ref().and_then(|r| r.installed_at.clone()),
     })
 }
 
@@ -1036,16 +1190,78 @@ async fn cmd_register_protocols() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_locate(state: &Arc<ServerState>, path: &str) -> Result<()> {
-    let path = std::path::PathBuf::from(path);
-    let man = manifest::read(path.join(maxima::core::manifest::MANIFEST_RELATIVE_PATH)).await?;
-    man.run_touchup(&path).await?;
+/// Register an existing install: run its touchup in the right prefix and
+/// write the install record, so every later command finds it without a
+/// registry.
+async fn cmd_locate(
+    state: &Arc<ServerState>,
+    path: &str,
+    slug: Option<String>,
+    wine_prefix: Option<String>,
+) -> Result<()> {
+    use maxima::core::manifest::MANIFEST_RELATIVE_PATH;
+    use maxima::gameinfo::GameInstallInfo;
+
+    let path = std::path::PathBuf::from(path.trim_end_matches(['/', '\\']));
+
+    // Which game is this folder? Either the client says, or we already have a
+    // record for exactly this folder.
+    let game = match slug {
+        Some(typed) => Some(resolve_game(&state.maxima, &typed).await?),
+        None => match maxima::gameinfo::find_slug_by_path(&path) {
+            Some(known) => Some(resolve_game(&state.maxima, &known).await?),
+            None => None,
+        },
+    };
+
+    let prefix = match &game {
+        Some((slug, _)) => prepare_prefix(slug, &wine_prefix).await?,
+        None => {
+            #[cfg(unix)]
+            {
+                explicit_prefix(&wine_prefix)
+                    .or_else(maxima::unix::prefix::explicit_override)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "can't tell which Wine prefix `{}` belongs to — pass the game's \
+                             slug (locate-game --slug) or --wine-prefix",
+                            path.display()
+                        )
+                    })
+                    .map(Some)?
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        }
+    };
+
+    let man = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
+    man.run_touchup(&path, prefix.as_deref()).await?;
+
+    if let Some((slug, offer_id)) = game {
+        let locale = state.maxima.lock().await.locale().full_str().to_owned();
+        let mut info = GameInstallInfo::new(path.clone(), prefix)
+            .with_slug(&slug)
+            .with_offer(&offer_id, None)
+            .with_locale(&locale);
+        info.version = man.version();
+        info.save(&slug)?;
+    }
+
     // Refresh library so the located game shows as installed to every client.
     let _ = state.maxima.lock().await.mut_library().games().await;
     Ok(())
 }
 
-async fn cmd_cloud_sync(state: &Arc<ServerState>, slug: &str, write: bool) -> Result<()> {
+async fn cmd_cloud_sync(
+    state: &Arc<ServerState>,
+    slug: &str,
+    write: bool,
+    wine_prefix: Option<String>,
+) -> Result<()> {
+    let explicit = explicit_prefix(&wine_prefix);
     let mut maxima = state.maxima.lock().await;
     let offer = maxima
         .mut_library()
@@ -1054,7 +1270,10 @@ async fn cmd_cloud_sync(state: &Arc<ServerState>, slug: &str, write: bool) -> Re
         .ok_or_else(|| anyhow::anyhow!("`{}` not in library", slug))?
         .clone();
     let mode = if write { CloudSyncLockMode::Write } else { CloudSyncLockMode::Read };
-    let lock = maxima.cloud_sync().obtain_lock(&offer, mode).await?;
+    let lock = maxima
+        .cloud_sync()
+        .obtain_lock(&offer, mode, explicit.as_deref())
+        .await?;
     let res = lock.sync_files().await;
     lock.release().await?;
     res?;
@@ -1083,6 +1302,7 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
         } else {
             None
         };
+        let record = base.install_info();
         let extra_offers = title
             .extra_offers()
             .iter()
@@ -1104,6 +1324,11 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
             extra_offers,
             image_url: None,
             hero_url: None,
+            install_dir: record.as_ref().map(|r| r.path.display().to_string()),
+            wine_prefix: record
+                .as_ref()
+                .and_then(|r| r.wine_prefix.as_ref())
+                .map(|p| p.display().to_string()),
         });
     }
     Ok(out)

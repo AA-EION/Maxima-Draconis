@@ -93,6 +93,12 @@ enum Mode {
         /// programmatically instead of scraping log lines.
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -104,8 +110,23 @@ enum Mode {
         #[arg(long)]
         json: bool,
     },
+    /// Register an existing install of a game: run its touchup in the right
+    /// Wine prefix and remember where it lives, so launch / verify / list-games
+    /// find it without any registry.
     LocateGame {
+        /// The game's install folder (the one containing `__Installer`).
         path: String,
+
+        /// Which game this folder is. Optional when Maxima already has an
+        /// install record for exactly this folder.
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     /// Install a game from the user's EA library to a local path,
     /// non-interactively. Equivalent to the interactive "Install Game"
@@ -155,6 +176,18 @@ enum Mode {
         #[arg(long, requires = "replace_files")]
         only_listed_files: bool,
 
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+        /// Glob pattern of files to leave out (repeatable), on top of the
+        /// game's exclusion file `<data dir>/exclude/<slug>`. `*` crosses
+        /// directories, matching ignores case, a trailing `/` excludes a
+        /// folder: `--exclude "*.bik" --exclude "Movies/"`.
+        #[arg(long)]
+        exclude: Vec<String>,
+
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
         /// `{"event":"progress","percent":<0-100>}`; the terminator is
@@ -179,9 +212,10 @@ enum Mode {
         /// Slug / offer_id / content_id, resolved against the EA
         /// library the same way `install` and `launch` resolve theirs.
         slug: String,
-        /// Absolute path of the existing install dir.
+        /// Absolute path of the existing install dir. Defaults to where the
+        /// game's install record says it lives.
         #[arg(long)]
-        path: String,
+        path: Option<String>,
         /// After listing broken files, immediately re-download them
         /// via `install --replace-files --only-listed-files`. No-op
         /// if the verify pass finds nothing wrong.
@@ -195,12 +229,30 @@ enum Mode {
         ///   `{"event":"error","message":"..."}` (also exits non-zero)
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
+        /// Glob pattern of files to leave out (repeatable), on top of the
+        /// game's exclusion file `<data dir>/exclude/<slug>`. `*` crosses
+        /// directories, matching ignores case, a trailing `/` excludes a
+        /// folder: `--exclude "*.bik" --exclude "Movies/"`.
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     CloudSync {
         game_slug: String,
 
         #[arg(long)]
         write: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     AccountInfo,
     CreateAuthCode {
@@ -235,6 +287,12 @@ enum Mode {
 
         #[arg(long)]
         file: String,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
     /// Run as a passive LSX server — log in, start the LSX listener, optionally
     /// log in to RTM, and wait indefinitely (Ctrl-C to stop). This is the CLI
@@ -305,6 +363,12 @@ enum Mode {
         /// Emit a single JSON object on stdout instead of log lines.
         #[arg(long)]
         json: bool,
+
+        /// Wine prefix / CrossOver bottle to use instead of the game's own
+        /// (unix hosts; ignored on Windows). Same as setting
+        /// MAXIMA_WINE_PREFIX, but for this command only.
+        #[arg(long)]
+        wine_prefix: Option<String>,
     },
 }
 
@@ -626,32 +690,69 @@ async fn startup(args: Args) -> Result<()> {
     // also stays in-process.
     match &args.mode {
         Some(Mode::ListGames { json }) => return server::run_list_games(*json).await,
-        Some(Mode::LocateGame { path }) => return server::run_locate_game(path).await,
-        Some(Mode::BottleInfo { slug, json }) => {
-            return server::run_bottle_info(slug, *json).await
+        Some(Mode::LocateGame { path, slug, wine_prefix }) => {
+            return server::run_locate_game(path, slug.clone(), wine_prefix.clone()).await
+        }
+        Some(Mode::BottleInfo { slug, json, wine_prefix }) => {
+            return server::run_bottle_info(slug, *json, wine_prefix.clone()).await
         }
         Some(Mode::RegisterProtocols) => return server::run_register_protocols().await,
-        Some(Mode::CloudSync { game_slug, write }) => {
-            return server::run_cloud_sync(game_slug, *write).await
+        Some(Mode::CloudSync { game_slug, write, wine_prefix }) => {
+            return server::run_cloud_sync(game_slug, *write, wine_prefix.clone()).await
         }
-        Some(Mode::Verify { slug, path, repair, json }) => {
-            return server::run_verify(slug, Some(path.clone()), *repair, *json).await
-        }
-        Some(Mode::DownloadSpecificFile { offer_id, build_id, file }) => {
-            return server::run_download_file(offer_id, Some(build_id.clone()), file).await
-        }
-        Some(Mode::Install { slug, path, build_id, replace_files, only_listed_files, json }) => {
-            return server::run_install(
+        Some(Mode::Verify { slug, path, repair, json, wine_prefix, exclude }) => {
+            return server::run_verify(
                 slug,
                 path.clone(),
-                build_id.clone(),
-                replace_files.clone(),
-                *only_listed_files,
+                *repair,
+                *json,
+                wine_prefix.clone(),
+                exclude.clone(),
+            )
+            .await
+        }
+        Some(Mode::DownloadSpecificFile { offer_id, build_id, file, wine_prefix }) => {
+            return server::run_download_file(
+                offer_id,
+                Some(build_id.clone()),
+                file,
+                wine_prefix.clone(),
+            )
+            .await
+        }
+        Some(Mode::Install {
+            slug,
+            path,
+            build_id,
+            replace_files,
+            only_listed_files,
+            json,
+            wine_prefix,
+            exclude,
+        }) => {
+            return server::run_install(
+                slug,
+                maxima_proto::InstallOptions {
+                    path: path.clone(),
+                    build_id: build_id.clone(),
+                    replace_files: replace_files.clone(),
+                    only_listed_files: *only_listed_files,
+                    wine_prefix: wine_prefix.clone(),
+                    exclude: exclude.clone(),
+                },
                 *json,
             )
             .await;
         }
-        Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json }) => {
+        Some(Mode::Launch {
+            slug,
+            game_path,
+            game_args,
+            login: None,
+            trailing_args,
+            json,
+            wine_prefix,
+        }) => {
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
             let req = maxima_proto::Request::Launch {
@@ -659,6 +760,7 @@ async fn startup(args: Args) -> Result<()> {
                 args: a,
                 exe_override: game_path.clone(),
                 cloud_saves: true,
+                wine_prefix: wine_prefix.clone(),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -730,20 +832,36 @@ async fn startup(args: Args) -> Result<()> {
             login: Some(login),
             trailing_args,
             json,
+            wine_prefix,
         } => {
             let mut game_args = game_args;
             game_args.extend(trailing_args);
             // offer_id must be a content id in this mode; pass the slug through.
-            start_game(&slug, game_path, game_args, Some(login), None, maxima_arc.clone(), json)
-                .await
+            start_game(
+                &slug,
+                game_path,
+                game_args,
+                Some(login),
+                None,
+                wine_prefix.map(PathBuf::from),
+                maxima_arc.clone(),
+                json,
+            )
+            .await
         }
         Mode::Serve {
             no_rtm,
             wine_prefix,
         } => {
+            // `serve` has no game to pick a prefix from, so the one the user
+            // named is the process-wide choice — registered with the prefix
+            // module rather than exported through the environment.
+            #[cfg(unix)]
             if let Some(prefix) = wine_prefix {
-                std::env::set_var("MAXIMA_WINE_PREFIX", prefix);
+                maxima::unix::prefix::set_process_override(Some(PathBuf::from(prefix)));
             }
+            #[cfg(not(unix))]
+            let _ = wine_prefix;
             serve_lsx(maxima_arc.clone(), no_rtm).await
         }
         Mode::AccountInfo => print_account_info(maxima_arc.clone()).await,
@@ -864,7 +982,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, None, maxima_arc.clone(), false).await?;
+    start_game(&offer_id, None, Vec::new(), None, None, None, maxima_arc.clone(), false).await?;
 
     Ok(())
 }
@@ -872,7 +990,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
 async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
     let mut maxima = maxima_arc.lock().await;
 
-    let offer_id = {
+    let (offer_id, slug) = {
         let mut owned_games = Vec::new();
         for game in maxima.mut_library().games().await? {
             if game.base_offer().is_installed().await {
@@ -890,7 +1008,10 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         let name =
             Select::new("What game would you like to install?", owned_games_strs).prompt()?;
         let game = owned_games.iter().find(|g| g.name() == name).unwrap();
-        game.base_offer().offer_id().to_owned()
+        (
+            game.base_offer().offer_id().to_owned(),
+            game.base_offer().slug().to_owned(),
+        )
     };
 
     let builds = maxima
@@ -915,10 +1036,20 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
         return Ok(());
     }
 
+    // The game's own Wine prefix (unix), chosen the same way every other
+    // command chooses it.
+    #[cfg(unix)]
+    let wine_prefix = Some(maxima::unix::prefix::resolve_for_game(&slug, None).await?);
+    #[cfg(not(unix))]
+    let wine_prefix: Option<PathBuf> = None;
+
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build.build_id().to_owned())
         .path(path.clone())
+        .slug(slug)
+        .wine_prefix(wine_prefix)
+        .locale(Some(maxima.locale().full_str().to_owned()))
         .build()?;
 
     let start_time = Instant::now();
@@ -1060,7 +1191,7 @@ async fn juno_token_refresh(maxima_arc: LockedMaxima) -> Result<()> {
 }
 
 async fn read_license_file(content_id: &str) -> Result<()> {
-    let path = ooa::get_license_dir()?.join(format!("{}.dlf", content_id));
+    let path = ooa::get_license_dir(None)?.join(format!("{}.dlf", content_id));
     let mut data = tokio::fs::read(path).await?;
     data.drain(0..65); // Signature
 
@@ -1213,12 +1344,14 @@ async fn list_games(maxima_arc: LockedMaxima) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_game(
     offer_id: &str,
     game_path_override: Option<String>,
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    wine_prefix: Option<PathBuf>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1231,6 +1364,7 @@ async fn start_game(
         game_args,
         login,
         steam_app_id,
+        wine_prefix,
         maxima_arc,
         json,
     )
@@ -1259,12 +1393,14 @@ async fn start_game(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_game_inner(
     offer_id: &str,
     game_path_override: Option<String>,
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    wine_prefix: Option<PathBuf>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1298,6 +1434,7 @@ async fn start_game_inner(
         arguments: game_args,
         cloud_saves: true,
         steam_app_id,
+        wine_prefix,
     };
 
     if login.is_none() {
@@ -1321,12 +1458,21 @@ async fn start_game_inner(
 
     if json {
         use std::io::Write;
+        // The prefix this launch actually used, not whatever the environment
+        // says.
+        let used_prefix = maxima_arc
+            .lock()
+            .await
+            .playing()
+            .as_ref()
+            .and_then(|p| p.wine_prefix().clone())
+            .map(|p| p.display().to_string());
         println!(
             "{}",
             serde_json::json!({
                 "event": "launched",
                 "offer_id": offer_id,
-                "wine_prefix": std::env::var("MAXIMA_WINE_PREFIX").ok(),
+                "wine_prefix": used_prefix,
             })
         );
         let _ = std::io::stdout().flush();

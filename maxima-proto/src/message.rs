@@ -51,6 +51,10 @@ pub enum Request {
         exe_override: Option<String>,
         #[serde(default = "default_true")]
         cloud_saves: bool,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
     },
     Install {
         slug: String,
@@ -67,14 +71,34 @@ pub enum Request {
         /// Restrict the install to ONLY `replace_files` (surgical refresh).
         #[serde(default)]
         only_listed_files: bool,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
+        /// Glob patterns of files to leave out of the download, on top of
+        /// the game's exclusion file. Remembered in the install record.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
     LocateGame {
         path: String,
+        /// The game the folder belongs to; when omitted the server looks the
+        /// folder up in its install records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug: Option<String>,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
     },
     CloudSync {
         slug: String,
         #[serde(default)]
         write: bool,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
     },
     /// Size-verify a game's files against the build manifest; `repair`
     /// re-downloads the broken ones.
@@ -84,6 +108,13 @@ pub enum Request {
         path: Option<String>,
         #[serde(default)]
         repair: bool,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
+        /// Extra glob patterns of files verify must not count as missing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
     /// Download a single named file from a game's build manifest.
     DownloadFile {
@@ -91,10 +122,18 @@ pub enum Request {
         #[serde(default)]
         build_id: Option<String>,
         file: String,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
     },
     /// Read-only bottle / prefix / game-dir readout (creates nothing).
     BottleInfo {
         slug: String,
+        /// Wine prefix (unix hosts) to use for this request instead of the
+        /// game's own. Omitted = the server picks per game.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wine_prefix: Option<String>,
     },
     /// Register Maxima's URL protocol handlers with the host OS.
     RegisterProtocols,
@@ -235,6 +274,7 @@ mod tests {
                 args: vec!["-northstar".into()],
                 exe_override: None,
                 cloud_saves: true,
+                wine_prefix: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
@@ -260,6 +300,56 @@ mod tests {
     fn unknown_error_kind_is_internal() {
         let kind: ErrorKind = serde_json::from_str(r#""something-new""#).unwrap();
         assert_eq!(kind, ErrorKind::Internal);
+    }
+
+    #[test]
+    fn new_request_fields_are_omitted_when_unset_and_optional_on_read() {
+        let env = RequestEnvelope {
+            id: 1,
+            request: Request::Install {
+                slug: "g".into(),
+                path: None,
+                build_id: None,
+                replace_files: vec![],
+                only_listed_files: false,
+                wine_prefix: None,
+                exclude: vec![],
+            },
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(!s.contains("wine_prefix"));
+        assert!(!s.contains("exclude"));
+
+        // A request from a client that predates the fields still parses.
+        let old = r#"{"id":2,"cmd":"install","slug":"g","path":"/p"}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
+        match parsed.request {
+            Request::Install { wine_prefix, exclude, .. } => {
+                assert_eq!(wine_prefix, None);
+                assert!(exclude.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let new = r#"{"id":3,"cmd":"verify","slug":"g","wine_prefix":"/w","exclude":["*.bik"]}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(new).unwrap();
+        match parsed.request {
+            Request::Verify { wine_prefix, exclude, .. } => {
+                assert_eq!(wine_prefix.as_deref(), Some("/w"));
+                assert_eq!(exclude, vec!["*.bik".to_string()]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locate_game_slug_is_optional() {
+        let old = r#"{"id":4,"cmd":"locate-game","path":"/g"}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            parsed.request,
+            Request::LocateGame { slug: None, wine_prefix: None, .. }
+        ));
     }
 
     #[test]

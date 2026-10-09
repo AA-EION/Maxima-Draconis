@@ -16,7 +16,7 @@ pub mod instance;
 pub mod message;
 pub mod types;
 
-pub use client::{ClientError, MaximaClient};
+pub use client::{ClientError, InstallOptions, MaximaClient};
 pub use instance::{discover, Discovery, InstanceInfo, InstanceState, PROTO_VERSION};
 pub use message::{
     ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage,

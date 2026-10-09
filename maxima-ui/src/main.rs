@@ -1042,7 +1042,7 @@ impl MaximaEguiApp {
                                         ui.add_enabled_ui(PathBuf::from(&self.installer_state.locate_path).exists(), |ui| {
 
                                             if ui.add_sized(button_size, egui::Button::new(&self.locale.localization.modals.game_install.locate_action.to_ascii_uppercase())).clicked() {
-                                                self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::LocateGameRequest(self.installer_state.locate_path.clone())).unwrap();
+                                                self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::LocateGameRequest(self.installer_state.locate_path.clone(), game.slug.clone())).unwrap();
                                                 self.installer_state.locating = true;
                                             }
                                         });
