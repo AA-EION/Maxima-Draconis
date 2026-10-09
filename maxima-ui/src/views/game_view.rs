@@ -104,7 +104,7 @@ fn game_view_action_buttons(app: &mut MaximaEguiApp, game: &GameInfo, ui: &mut U
                             );
                         }
                     }
-                } else if app.install_queue.contains_key(&game.offer)
+                } else if app.install_queue.iter().any(|q| q.offer == game.offer)
                     || app.installing_now.as_ref().is_some_and(|q| q.offer.eq(&game.offer))
                 {
                     let install_str = format!("  {}  ", &localization.resume.to_uppercase());
@@ -407,12 +407,7 @@ pub fn game_view_details_panel(app: &mut MaximaEguiApp, ui: &mut Ui) {
                                 Color32::from_black_alpha(128),
                             );
                             dlc.allocate_ui_at_rect(rect, |dlc| {
-                                let _ = match package.product().status() {
-                                    maxima::core::service_layer::ServiceOwnershipStatus::Active => true,
-                                    maxima::core::service_layer::ServiceOwnershipStatus::Disabled => false,
-                                };
-
-                                dlc.heading(format!("{}", package.offer().display_name()));
+                                dlc.heading(&package.display_name);
                             });
                         }
                     });

@@ -34,6 +34,11 @@ pub struct GameDto {
     /// The Wine prefix recorded for the install (unix hosts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_prefix: Option<String>,
+    /// Version of the live build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub mandatory_update: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -66,6 +71,8 @@ pub struct GameImagesDto {
     pub hero: Option<String>,
     pub logo: Option<String>,
     pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_video: Option<String>,
 }
 
 /// Rich per-game detail (mirrors the egui UI's `GameDetails`).

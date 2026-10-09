@@ -251,6 +251,10 @@ pub enum Notification {
     InstallProgress {
         slug: String,
         percent: f64,
+        #[serde(default)]
+        bytes: u64,
+        #[serde(default)]
+        bytes_total: u64,
     },
     InstallDone {
         #[serde(default)]
@@ -425,7 +429,7 @@ mod tests {
     fn notification_kebab_tags() {
         let n = Notification::GameStarted { slug: "x".into() };
         assert_eq!(serde_json::to_string(&n).unwrap(), r#"{"event":"game-started","slug":"x"}"#);
-        let n = Notification::InstallProgress { slug: "x".into(), percent: 12.5 };
+        let n = Notification::InstallProgress { slug: "x".into(), percent: 12.5, bytes: 1, bytes_total: 8 };
         assert!(serde_json::to_string(&n).unwrap().contains("\"event\":\"install-progress\""));
     }
 

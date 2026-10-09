@@ -1,15 +1,19 @@
 use egui::{pos2, vec2, Align2, Color32, FontId, Mesh, Rect, Rounding, Shape, Stroke, Ui, Widget};
 use humansize::DECIMAL;
 
-use crate::{MaximaEguiApp, APP_MARGIN};
+use crate::{bridge_thread::MaximaLibRequest, MaximaEguiApp, APP_MARGIN};
+
+fn send(app: &MaximaEguiApp, request: MaximaLibRequest) {
+    let _ = app.backend.backend_commander.send(request);
+}
 
 #[derive(Clone)]
 pub struct QueuedDownload {
     pub slug: String,
     pub offer: String,
+    pub percent: f64,
     pub downloaded_bytes: usize,
     pub total_bytes: usize,
-    // maybe add a thing here for updates? idk there's no real api to hook this up to yet
 }
 
 fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is_current: bool) {
@@ -20,7 +24,7 @@ fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is
     let container_size = vec2(ui.available_width(), 160.0);
     ui.allocate_ui(container_size, |ui| {
         let game_dl = game;
-        let game = app.games.get_mut(&game.slug).unwrap();
+        let Some(game) = app.games.get_mut(&game.slug) else { return };
         let (hero, logo) = {
             (
                 app.img_cache.get(crate::ui_image::UIImageType::Hero(game.slug.clone())),
@@ -124,7 +128,7 @@ fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is
                 max: pos2(
                     progress_bar_rect.min.x
                         + (progress_bar_rect.width()
-                            * (game_dl.downloaded_bytes as f32 / game_dl.total_bytes as f32)),
+                            * (game_dl.percent as f32 / 100.0).clamp(0.0, 1.0)),
                     progress_bar_rect.max.y,
                 ),
             };
@@ -141,8 +145,9 @@ fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is
                 progress_bar_rect.min - vec2(0.0, 8.0),
                 Align2::LEFT_BOTTOM,
                 format!(
-                    "{}",
-                    humansize::SizeFormatter::new(game_dl.downloaded_bytes, DECIMAL)
+                    "{} ({:.1}%)",
+                    humansize::SizeFormatter::new(game_dl.downloaded_bytes, DECIMAL),
+                    game_dl.percent
                 ),
                 FontId::proportional(12.0),
                 Color32::WHITE,
@@ -159,25 +164,29 @@ fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is
             );
 
             if ui.put(left_button_rect, egui::Button::new("🗙")).clicked() {
-                //TODO: Remove
+                send(app, MaximaLibRequest::CancelDownload(game_dl.slug.clone()));
             }
             if ui.put(right_button_rect, egui::Button::new("⏸")).clicked() {
-                //TODO: Pause
+                send(app, MaximaLibRequest::PauseDownloads);
             }
         } else {
             ui.painter().text(
                 img_response.rect.max + vec2(18.0, -corner_radius),
                 Align2::LEFT_BOTTOM,
-                "Queued",
+                if app.downloads_paused { "Paused" } else { "Queued" },
                 FontId::proportional(22.0),
                 Color32::WHITE,
             );
 
             if ui.put(left_button_rect, egui::Button::new("🗙")).clicked() {
-                //TODO: Remove
+                send(app, MaximaLibRequest::CancelDownload(game_dl.slug.clone()));
             }
-            if ui.put(right_button_rect, egui::Button::new("⮉")).clicked() {
-                //TODO: Move to top
+            if app.downloads_paused {
+                if ui.put(right_button_rect, egui::Button::new("⏵")).clicked() {
+                    send(app, MaximaLibRequest::ResumeDownloads);
+                }
+            } else if ui.put(right_button_rect, egui::Button::new("⮉")).clicked() {
+                send(app, MaximaLibRequest::MoveDownloadToTop(game_dl.slug.clone()));
             }
         }
     });
@@ -188,16 +197,7 @@ pub fn downloads_view(app: &mut MaximaEguiApp, ui: &mut Ui) {
         render_queued(app, ui, &now, true);
         ui.separator();
     }
-    for (_offer, game) in app.install_queue.clone() {
-        if !_offer.eq(&game.offer) {
-            egui::Label::new(egui::RichText::new(format!(
-                "offer mismatch! {} vs {}",
-                _offer, game.offer
-            )))
-            .selectable(false)
-            .ui(ui);
-        } else {
-            render_queued(app, ui, &game, false);
-        }
+    for game in app.install_queue.clone() {
+        render_queued(app, ui, &game, false);
     }
 }

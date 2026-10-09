@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 maxima-lib = { path = "../maxima-lib" }
+maxima-proto = { path = "../maxima-proto" }
 winapi = { version = "0.3.9", features = [ "memoryapi", "handleapi", "synchapi", "wincon", "consoleapi", "psapi", "wininet", "winerror", "iphlpapi", "tcpmib" ] }
 anyhow = "1.0.71"
 clap = { version = "4.3.8", features = ["derive"] }

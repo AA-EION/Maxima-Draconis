@@ -52,6 +52,8 @@ struct ServerState {
     shutdown: Notify,
     persona: Mutex<String>,
     clients: AtomicUsize,
+    /// Last presence per friend, replayed to clients as they connect.
+    presence: Mutex<HashMap<String, Notification>>,
 }
 
 impl ServerState {
@@ -99,6 +101,7 @@ pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> R
         shutdown: Notify::new(),
         persona: Mutex::new(String::new()),
         clients: AtomicUsize::new(0),
+        presence: Mutex::new(HashMap::new()),
     });
 
     // Serve before logging in: a first-run login waits on the user in the
@@ -254,9 +257,15 @@ async fn tick_loop(state: Arc<ServerState>) {
         was_playing = playing_now;
 
         let queue = queue_snapshot(&mut maxima);
-        if let (Some(current), Some(pct)) = (&queue.current, queue.percent) {
+        if let (Some(current), Some(download)) = (&queue.current, maxima.content_manager().current()) {
+            let pct = download.percentage_done();
             if (pct - last_percent).abs() > 0.05 {
-                state.notify(Notification::InstallProgress { slug: current.slug.clone(), percent: pct });
+                state.notify(Notification::InstallProgress {
+                    slug: current.slug.clone(),
+                    percent: pct,
+                    bytes: download.bytes_downloaded() as u64,
+                    bytes_total: download.bytes_total() as u64,
+                });
                 last_percent = pct;
             }
         }
@@ -279,12 +288,14 @@ async fn tick_loop(state: Arc<ServerState>) {
                 if prev_presence.get(&id) == Some(&presence) {
                     continue;
                 }
-                state.notify(Notification::Presence {
+                let note = Notification::Presence {
                     id: id.clone(),
                     basic: format!("{:?}", presence.basic()),
                     status: presence.status().clone(),
                     game: presence.game().clone(),
-                });
+                };
+                state.presence.lock().await.insert(id.clone(), note.clone());
+                state.notify(note);
                 prev_presence.insert(id, presence);
             }
         }
@@ -335,6 +346,9 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     if state.is_ready() {
         let persona = state.persona.lock().await.clone();
         send(&out_tx, &Notification::Ready { persona });
+        for note in state.presence.lock().await.values() {
+            send(&out_tx, note);
+        }
     } else {
         send(&out_tx, &Notification::LoginRequired);
     }
@@ -708,6 +722,12 @@ async fn game_images(state: &Arc<ServerState>, slug: &str) -> Result<maxima_prot
         hero: pick_hero(&images),
         logo: pick_logo(&images),
         background: pick_bg(&heroes),
+        background_video: heroes
+            .as_ref()
+            .and_then(|h| h.items().get(0))
+            .and_then(|hub| hub.background_video().as_ref())
+            .and_then(|video| video.url().clone())
+            .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
     })
 }
 
@@ -975,10 +995,17 @@ async fn cmd_install(
             state.notify(Notification::InstallProgress {
                 slug: slug.clone(),
                 percent: (idx as f64 / total as f64) * 100.0,
+                bytes: 0,
+                bytes_total: 0,
             });
             downloader.download_single_file(entry, None).await?;
         }
-        state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 100.0 });
+        state.notify(Notification::InstallProgress {
+            slug: slug.clone(),
+            percent: 100.0,
+            bytes: 0,
+            bytes_total: 0,
+        });
         state.notify(Notification::InstallDone { slug: Some(slug.clone()) });
         return Ok(slug);
     }
@@ -1405,6 +1432,12 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
             None
         };
         let record = base.install_info();
+        let downloads = base.offer().downloads();
+        let live = if downloads.len() == 1 {
+            downloads.first()
+        } else {
+            downloads.iter().find(|d| d.download_type() == "LIVE")
+        };
         let extra_offers = title
             .extra_offers()
             .iter()
@@ -1431,6 +1464,8 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
                 .as_ref()
                 .and_then(|r| r.wine_prefix.as_ref())
                 .map(|p| p.display().to_string()),
+            latest_version: live.map(|d| d.version().to_owned()),
+            mandatory_update: live.map_or(false, |d| *d.treat_updates_as_mandatory()),
         });
     }
     Ok(out)
