@@ -25,7 +25,7 @@ use crate::{
     ooa::{needs_license_update, request_and_save_license, LicenseAuth, LicenseError},
     steam::lookup_steam_game_by_offer,
     util::{
-        native::{NativeError, SafeParent, SafeStr},
+        native::{is_wine_environment, NativeError, SafeParent, SafeStr},
         registry::bootstrap_path,
         simple_crypto,
     },
@@ -355,27 +355,23 @@ pub async fn start_game(
     let path = path.safe_str()?;
     info!("Game path: {}", path);
 
-    // Heads-up for users hitting Steam CEG (Custom Executable Generation)
-    // failures under Wine. The exe Steam ships for EA-on-Steam titles like
-    // Titanfall 2 is signed per-user with CEG, and CEG's filesystem
-    // verification trips wine-staging's `ntdll-Junction_Points` patch —
-    // which CrossOver inherits — surfacing in-game as
-    // "Engine Error: File corruption detected". Maxima can't fix that from
-    // its layer: the validation runs inside the game exe against `ntdll`
-    // before the LSX `RequestLicense` request we control. NorthstarProton
-    // works around it by reverting that wine patch in their custom Proton
-    // build; on macOS/CrossOver the practical workaround is to install via
-    // maxima-ui to a non-Steam path so the binary doesn't carry CEG.
-    let path_lower = path.to_lowercase();
-    if path_lower.contains("\\steamapps\\common\\") || path_lower.contains("/steamapps/common/") {
-        warn!(
-            "Game path is inside a Steam library (steamapps/common/...). On macOS/CrossOver \
-             and other Wine runtimes, Steam-installed copies of EA-on-Steam titles commonly \
-             trigger 'Engine Error: File corruption detected' because Steam CEG validation \
-             fails under Wine's ntdll Junction_Points patch. If you hit this, install via \
-             maxima-ui to a non-Steam path. See CLAUDE.md 'CEG / Steam-installed games' for \
-             details."
-        );
+    if is_wine_environment() {
+        let path_lower = path.to_lowercase();
+        if path_lower.contains("\\steamapps\\common\\")
+            || path_lower.contains("/steamapps/common/")
+        {
+            let exe = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let slug = offer.as_ref().map(|o| o.slug().as_str()).unwrap_or("<slug>");
+            warn!(
+                "{} is in a Steam library. Steam DRM-wrapped executables can fail under Wine; \
+                 `maxima-cli install {} --replace-files {} --only-listed-files` refreshes the \
+                 executable from EA's CDN.",
+                exe, slug, exe
+            );
+        }
     }
 
     // Which Wine prefix THIS game runs in. Resolved per launch and carried
@@ -410,13 +406,10 @@ pub async fn start_game(
 
             // Diagnostic override: setting `MAXIMA_SKIP_LICENSE_WRITE=1` in the
             // environment makes us NOT fetch + write the `.dlf` license file
-            // to `…/EA Services/License/<content_id>.dlf`. Used to test whether
-            // TF2's "Engine Error: File corruption detected" symptom is driven
-            // by the on-disk `.dlf` (hardware-hash mismatch hypothesis from
-            // CLAUDE.md) — if TF2 still corrupts when we DON'T write a `.dlf`,
-            // the issue is somewhere else (Steam DRM, local file integrity,
-            // some other check). Remove the .dlf manually before testing so
-            // there's no stale file lying around.
+            // to `…/EA Services/License/<content_id>.dlf`. Used to tell whether
+            // a launch failure is driven by the on-disk `.dlf` or by something
+            // else. Remove the .dlf manually before testing so there's no
+            // stale file lying around.
             if env::var("MAXIMA_SKIP_LICENSE_WRITE").is_ok() {
                 warn!(
                     "MAXIMA_SKIP_LICENSE_WRITE is set — skipping OOA license \
