@@ -213,6 +213,12 @@ Section "Maxima Core" SEC_CORE
     SetOutPath "$INSTDIR"
     SetOverwrite on
 
+    ; A server left running by the previous version would refuse the new
+    ; clients (protocol mismatch) and keeps its exe locked.
+    IfFileExists "$INSTDIR\maxima-cli.exe" 0 +3
+        nsExec::ExecToLog '"$INSTDIR\maxima-cli.exe" server-stop'
+        Sleep 1500
+
     ; Install binaries
     File "${BIN_DIR}\maxima-bootstrap.exe"
     File "${BIN_DIR}\maxima-cli.exe"

@@ -75,7 +75,18 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             app.page_view = PageType::Downloads;
                         }
                     }
-                    LoginCacheEmpty => app.backend_state = BackendStallState::UserNeedsToLogIn,
+                    LoginCacheEmpty => {
+                        app.backend_state = BackendStallState::UserNeedsToLogIn;
+                        // `--install` (Draconis onboarding) logs in without a click, once.
+                        if app.pending_install.is_some() && !app.auto_login_sent {
+                            app.auto_login_sent = true;
+                            let _ = app
+                                .backend
+                                .backend_commander
+                                .send(bridge_thread::MaximaLibRequest::LoginRequestOauth);
+                            app.backend_state = BackendStallState::LoggingIn;
+                        }
+                    }
                     ServiceNeedsStarting => {
                         app.backend_state = BackendStallState::UserNeedsToInstallService
                     }

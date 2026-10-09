@@ -421,6 +421,7 @@ pub struct MaximaEguiApp {
     /// `take()`-d so we don't re-fire it on later login state
     /// changes. `None` for a normal interactive launch.
     pub pending_install: Option<(String, PathBuf)>,
+    auto_login_sent: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, EnumIter)]
@@ -632,6 +633,7 @@ impl MaximaEguiApp {
             settings,
             swapchain_nudged: false,
             pending_install,
+            auto_login_sent: false,
         }
     }
 }
