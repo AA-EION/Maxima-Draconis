@@ -612,10 +612,8 @@ async fn startup(args: Args) -> Result<()> {
     // no session of their own — short-circuit before any login / Maxima
     // setup so `server-stop` doesn't itself try to authenticate.
     match &args.mode {
-        Some(Mode::ServerStop) => return server::send_shutdown(server::server_port()).await,
-        Some(Mode::ServerStatus { json }) => {
-            return server::print_status(server::server_port(), *json).await
-        }
+        Some(Mode::ServerStop) => return server::send_shutdown().await,
+        Some(Mode::ServerStatus { json }) => return server::print_status(*json).await,
         Some(Mode::Service { action }) => return run_service(action),
         _ => {}
     }
@@ -626,26 +624,24 @@ async fn startup(args: Args) -> Result<()> {
     // developer/diagnostic subcommands fall through to the legacy in-process
     // path below. `launch --login` (manual/offline) is self-contained and
     // also stays in-process.
-    let port = server::server_port();
     match &args.mode {
-        Some(Mode::ListGames { json }) => return server::run_list_games(port, *json).await,
-        Some(Mode::LocateGame { path }) => return server::run_locate_game(port, path).await,
+        Some(Mode::ListGames { json }) => return server::run_list_games(*json).await,
+        Some(Mode::LocateGame { path }) => return server::run_locate_game(path).await,
         Some(Mode::BottleInfo { slug, json }) => {
-            return server::run_bottle_info(port, slug, *json).await
+            return server::run_bottle_info(slug, *json).await
         }
-        Some(Mode::RegisterProtocols) => return server::run_register_protocols(port).await,
+        Some(Mode::RegisterProtocols) => return server::run_register_protocols().await,
         Some(Mode::CloudSync { game_slug, write }) => {
-            return server::run_cloud_sync(port, game_slug, *write).await
+            return server::run_cloud_sync(game_slug, *write).await
         }
         Some(Mode::Verify { slug, path, repair, json }) => {
-            return server::run_verify(port, slug, Some(path.clone()), *repair, *json).await
+            return server::run_verify(slug, Some(path.clone()), *repair, *json).await
         }
         Some(Mode::DownloadSpecificFile { offer_id, build_id, file }) => {
-            return server::run_download_file(port, offer_id, Some(build_id.clone()), file).await
+            return server::run_download_file(offer_id, Some(build_id.clone()), file).await
         }
         Some(Mode::Install { slug, path, build_id, replace_files, only_listed_files, json }) => {
             return server::run_install(
-                port,
                 slug,
                 path.clone(),
                 build_id.clone(),
@@ -656,7 +652,6 @@ async fn startup(args: Args) -> Result<()> {
             .await;
         }
         Some(Mode::Launch { slug, game_path, game_args, login: None, trailing_args, json }) => {
-            server::ensure_server_running(port).await?;
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
             let req = maxima_proto::Request::Launch {
@@ -666,7 +661,7 @@ async fn startup(args: Args) -> Result<()> {
                 cloud_saves: true,
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
-            return server::forward_streaming(port, req, &["game-stopped"], *json).await;
+            return server::forward_streaming(req, &["game-stopped"], *json).await;
         }
         _ => {}
     }
@@ -1390,24 +1385,45 @@ async fn start_game_inner(
 /// is a no-op when `playing` is None and we don't want the content manager
 /// poking at downloads from a serve session. Ctrl-C is the exit path.
 async fn serve_lsx(maxima_arc: LockedMaxima, no_rtm: bool) -> Result<()> {
+    use maxima_proto::instance::{GuardError, InstanceGuard, InstanceState};
+
+    // `serve` is this context's server for as long as it runs: it publishes
+    // its ports in instance.json so the bootstrap finds it, and it can't run
+    // next to a maxima-server, which already serves LSX and /authorize.
+    let mut guard = match InstanceGuard::acquire(&maxima::util::native::maxima_dir()?, env!("CARGO_PKG_VERSION")) {
+        Ok(guard) => guard,
+        Err(GuardError::AlreadyRunning(_)) => bail!(
+            "a Maxima server is already running here and already serves LSX and /authorize"
+        ),
+        Err(err) => return Err(err.into()),
+    };
+
     {
         let mut maxima = maxima_arc.lock().await;
         maxima.start_lsx(maxima_arc.clone()).await?;
-        info!("LSX server listening on port {}", maxima.lsx_port());
+        info!("LSX server listening on port {}", maxima.effective_lsx_port());
 
-        // Bring up the HTTP `/authorize` endpoint too. Bootstrap probes
-        // this when handling `link2ea://` / `origin2://` and forwards the
-        // offer here instead of spawning a duplicate `maxima-cli launch`.
-        // Failure to bind isn't fatal — LSX is what TF2 strictly needs,
-        // and bootstrap falls back to the legacy spawn path if the probe
-        // can't reach us.
-        if let Err(err) = maxima.start_auth_server(maxima_arc.clone()).await {
-            warn!(
-                "Authorize HTTP server failed to start ({}); bootstrap will fall back \
-                 to spawning maxima-cli launch on link2ea://.",
-                err
-            );
-        }
+        // Bring up the HTTP `/authorize` endpoint too. The bootstrap reads its
+        // port from instance.json when handling `link2ea://` / `origin2://`
+        // and forwards the offer here instead of spawning a duplicate
+        // `maxima-cli launch`. Failure to bind isn't fatal.
+        let token = guard.info().token.clone();
+        let authorize_port = match maxima.start_auth_server(maxima_arc.clone(), &token).await {
+            Ok(port) => Some(port),
+            Err(err) => {
+                warn!(
+                    "Authorize HTTP server failed to start ({}); bootstrap will fall back \
+                     to spawning maxima-cli launch on link2ea://.",
+                    err
+                );
+                None
+            }
+        };
+        guard.publish(|info| {
+            info.state = InstanceState::Ready;
+            info.lsx_port = maxima.lsx_bound_port();
+            info.authorize_port = authorize_port;
+        })?;
 
         if !no_rtm {
             // Best-effort RTM login: it's only needed for friends presence /

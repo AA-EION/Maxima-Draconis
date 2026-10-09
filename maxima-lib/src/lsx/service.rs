@@ -524,6 +524,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_port_falls_back_to_a_free_one_when_taken() {
+        // Hold a port the way another instance would hold 3216.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+
+        let maxima = test_maxima().await;
+        {
+            let mut guard = maxima.lock().await;
+            guard.set_lsx_port(taken);
+            guard.lsx_port_fixed = false;
+            guard.start_lsx(maxima.clone()).await.unwrap();
+        }
+        let bound = maxima.lock().await.lsx_bound_port().expect("should bind a free port");
+        assert_ne!(bound, taken);
+        assert_eq!(maxima.lock().await.effective_lsx_port(), bound);
+    }
+
+    #[tokio::test]
     async fn all_game_info_reflects_the_client_not_a_hardcoded_title() {
         let (_maxima, port) = start().await;
 

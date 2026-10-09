@@ -23,6 +23,7 @@ linux-tray = ["dep:ksni"]
 maxima-resources = { path = "../maxima-resources" }
 
 [dependencies]
+serde = "1"
 maxima-lib = { path = "../maxima-lib" }
 maxima-proto = { path = "../maxima-proto" }
 tokio = { version = "1.28.2", features = [ "full", "rt", "rt-multi-thread", "time", "net" ] }

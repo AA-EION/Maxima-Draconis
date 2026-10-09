@@ -1,21 +1,16 @@
 //! Windows system-tray icon for the running Maxima server.
 //!
 //! Runs its own thread with a Win32 message loop (tray icons require one).
-//! The tray is fully decoupled from the server internals — it acts as an
-//! ordinary client of the control port:
 //!   * "Open Maxima"  → launches the UI (`maxima.exe` beside this binary).
-//!   * "Stop Server"  → opens a TCP connection to the port and sends a
-//!                      `{"cmd":"shutdown"}` line, exactly like
-//!                      `maxima-cli server-stop`.
+//!   * "Stop Server"  → asks the server to shut down, like `maxima-cli server-stop`.
 //!
 //! macOS and Linux don't use this: macOS shows a SwiftUI `MenuBarExtra` in
 //! Maxima.app, and Linux runs headless (systemd) — see CLAUDE.md.
 
 #![cfg(windows)]
 
-use std::io::Write;
-use std::net::TcpStream;
 use std::ptr::null_mut;
+use std::sync::OnceLock;
 
 use log::warn;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -36,23 +31,21 @@ const TRAY_CALLBACK: UINT = WM_APP + 1;
 const ID_OPEN: u16 = 1001;
 const ID_STOP: u16 = 1002;
 
-// Port is read once at spawn and stashed for the WndProc (which has no user
-// data channel we bother wiring). A tray is a singleton per server process.
-static mut TRAY_PORT: u16 = 13220;
+// Stashed for the WndProc, which has no user-data channel we bother wiring.
+// A tray is a singleton per server process.
+static STOP: OnceLock<crate::status_icon::StopServer> = OnceLock::new();
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Start the tray on a dedicated thread. Never blocks the caller.
-pub fn spawn_tray(port: u16) {
-    std::thread::spawn(move || unsafe {
-        TRAY_PORT = port;
-        run(port);
-    });
+pub fn spawn_tray(stop: crate::status_icon::StopServer) {
+    let _ = STOP.set(stop);
+    std::thread::spawn(|| unsafe { run() });
 }
 
-unsafe fn run(_port: u16) {
+unsafe fn run() {
     let hinstance = GetModuleHandleW(null_mut());
     let class_name = wide("MaximaTrayWindow");
 
@@ -180,11 +173,8 @@ fn open_ui() {
     }
 }
 
-/// Send a shutdown request to the control port — same as `server-stop`.
 fn send_shutdown() {
-    let port = unsafe { TRAY_PORT };
-    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-        let _ = stream.write_all(b"{\"id\":1,\"cmd\":\"shutdown\"}\n");
-        let _ = stream.flush();
+    if let Some(stop) = STOP.get() {
+        stop();
     }
 }

@@ -99,6 +99,8 @@ pub struct Maxima {
 
     lsx_port: u16,
     #[getter(skip)]
+    pub(crate) lsx_port_fixed: bool,
+    #[getter(skip)]
     lsx_bound_port: Arc<AtomicU16>,
     lsx_event_callback: Option<MaximaLSXEventCallback>,
     #[getter(skip)]
@@ -150,14 +152,27 @@ pub enum MaximaCreationError {
 
 pub type LockedMaxima = Arc<Mutex<Maxima>>;
 
+/// The LSX port games use when nothing tells them otherwise.
+pub const DEFAULT_LSX_PORT: u16 = 3216;
+
+async fn lsx_port_answers(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 impl Maxima {
     pub async fn new_with_options(
         options: MaximaOptions,
     ) -> Result<LockedMaxima, MaximaCreationError> {
-        let lsx_port = if let Ok(lsx_port) = env::var("MAXIMA_LSX_PORT") {
-            lsx_port.parse::<u16>()?
-        } else {
-            3216
+        let (lsx_port, lsx_port_fixed) = match env::var("MAXIMA_LSX_PORT") {
+            Ok(port) => (port.parse::<u16>()?, true),
+            Err(_) => (DEFAULT_LSX_PORT, false),
         };
 
         let request_cache = DynamicCache::new(
@@ -217,6 +232,7 @@ impl Maxima {
             library: GameLibrary::new(auth_storage.clone()).await,
             playing: None,
             lsx_port,
+            lsx_port_fixed,
             lsx_bound_port: Arc::new(AtomicU16::new(0)),
             lsx_event_callback: None,
             lsx_connections: Arc::new(AtomicU16::new(0)),
@@ -240,71 +256,36 @@ impl Maxima {
     }
 
     pub async fn start_lsx(&self, maxima: LockedMaxima) -> Result<(), LSXServerError> {
-        let lsx_port = self.lsx_port;
-
-        // Cooperate with any LSX server already listening on the same port
-        // — this is what makes `maxima-cli serve` actually useful.
-        //
-        // The protocol-handler chain (Steam Play → `link2ea://launchgame/X`
-        // → bootstrap → `maxima-cli.exe launch X`) **always** spawns a fresh
-        // maxima-cli process. That child has its own `Maxima` instance with
-        // `playing = Some(context)` and, without this guard, also tries to
-        // bind 127.0.0.1:3216. On a stock Linux/Windows stack the second
-        // `TcpListener::bind` would fail and the child's LSX task would
-        // exit harmlessly — the game's traffic would then hit the original
-        // server (serve / UI / earlier instance) which has `playing()=None`,
-        // exercising the catornot/patch-external-lsx code path that the
-        // user reports works on Windows.
-        //
-        // Under Wine on macOS/CrossOver we observed the opposite: the
-        // child's bind appears to succeed (or take precedence), so the
-        // game's connection lands on the *child's* LSX server, where
-        // `playing()=Some(...)`. That puts every handler down the
-        // active-launch branch and reproduces the "File corruption
-        // detected" symptom the user has been hitting.
-        //
-        // The fix is a synchronous probe: if a TCP connection to
-        // 127.0.0.1:<port> succeeds, an LSX server is already there, so
-        // we deliberately do NOT start another. The child still proceeds
-        // with `launch::start_game` (license preflight, env vars, spawn
-        // the game executable) — the game's `EALsxPort=<port>` env var
-        // will resolve to the existing server.
-        //
-        // Non-blocking probe via tokio so we don't park an executor
-        // thread for up to 200ms (an earlier version used
-        // `std::net::TcpStream::connect_timeout` which did exactly that).
-        // The connect is cheap when nothing's listening — immediate
-        // ECONNREFUSED on localhost — so the timeout is mostly a guard
-        // against accidental long DNS resolves or routing weirdness.
-        let probe_addr = format!("127.0.0.1:{}", lsx_port);
-        let probe_result = tokio::time::timeout(
-            Duration::from_millis(200),
-            tokio::net::TcpStream::connect(&probe_addr),
-        )
-        .await;
-        match probe_result {
-            Ok(Ok(stream)) => {
-                drop(stream);
+        let listener = if self.lsx_port_fixed {
+            // An explicitly chosen port that is already served (another
+            // Maxima, or the EA app) is used as is: games are pointed at it.
+            if lsx_port_answers(self.lsx_port).await {
                 warn!(
-                    "An LSX server is already listening on {}; not starting our own. \
-                     That's expected when another Maxima (server, serve, UI) is running, \
-                     but if it's EA Desktop / Origin in the same prefix, games will \
-                     authenticate against it instead of Maxima — close it if launches fail.",
-                    probe_addr
+                    "An LSX server is already listening on 127.0.0.1:{}; not starting our own",
+                    self.lsx_port
                 );
                 return Ok(());
             }
-            Ok(Err(_)) | Err(_) => {
-                // Nothing listening or probe timed out — proceed to bind below.
+            lsx::service::bind(self.lsx_port).await
+        } else {
+            // 3216 is what games expect when nothing tells them otherwise, but
+            // every Wine prefix shares the host's loopback, so another Maxima
+            // or the EA app may hold it. Never share another instance's LSX:
+            // take a free port instead. Games this instance launches are told
+            // the real port through `EALsxPort`.
+            match lsx::service::bind(self.lsx_port).await {
+                Ok(listener) => Ok(listener),
+                Err(err) => {
+                    info!(
+                        "LSX port {} is taken ({}); using a free port for this instance",
+                        self.lsx_port, err
+                    );
+                    lsx::service::bind(0).await
+                }
             }
-        }
+        };
 
-        // Bind before spawning so the listener is accepting by the time this
-        // returns and the port we actually got is recorded for
-        // `effective_lsx_port` (relevant once `MAXIMA_LSX_PORT=0` is used to
-        // get an OS-assigned port). A failed bind stays non-fatal, as it
-        // always was: the game's traffic then lands on whoever owns the port.
-        let listener = match lsx::service::bind(lsx_port).await {
+        let listener = match listener {
             Ok(listener) => listener,
             Err(e) => {
                 error!("Error starting LSX server: {}", e);
@@ -322,27 +303,21 @@ impl Maxima {
         Ok(())
     }
 
-    /// Start the `/authorize` HTTP server. Companion to [`Self::start_lsx`]
-    /// for the bootstrap → `link2ea://` forward path — see
-    /// [`crate::auth_server`] for protocol details. Defaults to port
-    /// [`crate::auth_server::AUTHORIZE_PORT`] (13219); override with the
-    /// `MAXIMA_AUTHORIZE_PORT` env var.
-    ///
-    /// This method is intended to be called once per process at startup
-    /// (e.g. `maxima-cli serve` or the UI bridge thread). It returns
-    /// immediately after the listener is bound; the accept loop runs in
-    /// a tokio task. Errors are surfaced if the bind itself fails, so
-    /// callers can degrade gracefully (the LSX server keeps working
-    /// even if authorize-HTTP is unavailable).
+    /// Start the `/authorize` HTTP server, companion to [`Self::start_lsx`]
+    /// for the bootstrap → `link2ea://` forward path (see
+    /// [`crate::auth_server`]). Binds a free port unless `MAXIMA_AUTHORIZE_PORT`
+    /// names one, and returns the bound port for the caller to publish in
+    /// `instance.json` together with `token`.
     pub async fn start_auth_server(
         &self,
         maxima: LockedMaxima,
-    ) -> Result<(), auth_server::AuthServerError> {
+        token: &str,
+    ) -> Result<u16, auth_server::AuthServerError> {
         let port = env::var("MAXIMA_AUTHORIZE_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(auth_server::AUTHORIZE_PORT);
-        auth_server::start_server(port, maxima).await
+            .unwrap_or(0);
+        auth_server::start_server(port, token, maxima).await
     }
 
     pub async fn access_token(&mut self) -> Result<String, TokenError> {
@@ -526,8 +501,11 @@ impl Maxima {
         &mut self.rtm
     }
 
+    /// Pin the LSX port. Unlike the default, a pinned port that is already
+    /// served is used as is instead of falling back to a free one.
     pub fn set_lsx_port(&mut self, port: u16) {
         self.lsx_port = port;
+        self.lsx_port_fixed = true;
     }
 
     /// The port our own LSX listener is bound to, if `start_lsx` bound one.

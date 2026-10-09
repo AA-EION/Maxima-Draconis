@@ -114,4 +114,8 @@ pub struct StatusDto {
     pub installing: Option<String>,
     pub lsx_port: u16,
     pub clients: u64,
+    #[serde(default)]
+    pub realm: String,
+    #[serde(default)]
+    pub logged_in: bool,
 }

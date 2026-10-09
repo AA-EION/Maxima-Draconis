@@ -264,7 +264,13 @@ fn project_dirs() -> Result<directories::ProjectDirs, NativeError> {
 /// | Linux   | `$XDG_DATA_HOME/maxima` (`~/.local/share/maxima`)                 |
 /// | macOS   | `~/Library/Application Support/com.ArmchairDevelopers.Maxima`     |
 /// | Windows | `%APPDATA%\ArmchairDevelopers\Maxima\data`                       |
+///
+/// `MAXIMA_DATA_DIR` replaces it wholesale, which makes a separate, fully
+/// independent Maxima instance (its own login and its own server).
 pub fn maxima_data_path() -> Result<PathBuf, NativeError> {
+    if let Some(dir) = env::var_os("MAXIMA_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     Ok(project_dirs()?.data_dir().to_path_buf())
 }
 

@@ -1,43 +1,48 @@
-//! `maxima-cli server` — the multi-client Maxima server.
+//! The multi-client Maxima server.
 //!
 //! One process holds the logged-in session, the LSX server, the `/authorize`
 //! HTTP endpoint and the RTM connection, and serves **many** concurrent
-//! clients over a loopback TCP socket (default `127.0.0.1:13220`, override
-//! with `MAXIMA_SERVER_PORT`). Every client sees the same state.
+//! clients over a loopback TCP socket. Every client sees the same state.
 //!
-//! This is upstream PR #23's "Maxima Server": one server, frontends as thin
-//! clients. The wire protocol and the client live in the `maxima-proto`
-//! crate (typed [`maxima_proto::Request`] / [`ResponseEnvelope`] /
-//! [`Notification`]); this module is the server side — it dispatches those
-//! requests against the real `maxima-lib` `Maxima` and broadcasts
+//! The control port is OS-assigned (or `MAXIMA_SERVER_PORT`) and published,
+//! together with a per-run token, in `instance.json` in this installation
+//! context's data directory (see `maxima_proto::instance`). A connection must
+//! open with a `hello` carrying that token; nothing else is answered. Wine
+//! prefixes share the host loopback, so this is what keeps a client in one
+//! prefix, on the host, or a web page from driving another context's session.
+//!
+//! The wire protocol and the client live in `maxima-proto`; this module
+//! dispatches requests against the real `maxima-lib` `Maxima` and broadcasts
 //! notifications to every client.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{error, info, warn};
 use maxima::core::{
     cloudsync::CloudSyncLockMode,
     launch::{self, LaunchMode, LaunchOptions},
     manifest, LockedMaxima, Maxima, MaximaEvent,
 };
-use maxima_proto::types::{ExtraOfferDto, GameDto};
 use maxima::rtm::client::RichPresence;
-use maxima_proto::message::{Notification, Request, RequestEnvelope, ResponseEnvelope};
-use maxima_proto::types::{FriendDto, GameDetailsDto, StatusDto};
+use maxima_proto::instance::{token_matches, InstanceGuard, InstanceState, PROTO_VERSION};
+use maxima_proto::message::{
+    ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
+};
+use maxima_proto::types::{ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, StatusDto};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
-pub fn server_port() -> u16 {
-    maxima_proto::server_port()
-}
-
 struct ServerState {
     maxima: LockedMaxima,
+    realm: String,
+    token: String,
+    /// The EA login has finished and the session services are up.
+    ready: AtomicBool,
     installing: Mutex<Option<String>>,
     /// Serialized [`Notification`] lines, broadcast to every client.
     events: broadcast::Sender<String>,
@@ -53,30 +58,106 @@ impl ServerState {
             let _ = self.events.send(line);
         }
     }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
-pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
-    let port = server_port();
+/// A request that conflicts with work already running.
+#[derive(Debug)]
+struct Busy(String);
 
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            anyhow::bail!(
-                "a Maxima server is already running on 127.0.0.1:{} (stop it with \
-                 `maxima-cli server-stop`)",
-                port
-            );
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> Result<()> {
+    let requested_port = std::env::var("MAXIMA_SERVER_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", requested_port)).await?;
+    let port = listener.local_addr()?.port();
+
+    let (events_tx, _) = broadcast::channel::<String>(256);
+    let state = Arc::new(ServerState {
+        maxima: maxima_arc.clone(),
+        realm: guard.info().realm.clone(),
+        token: guard.info().token.clone(),
+        ready: AtomicBool::new(false),
+        installing: Mutex::new(None),
+        events: events_tx,
+        shutdown: Notify::new(),
+        persona: Mutex::new(String::new()),
+        clients: AtomicUsize::new(0),
+    });
+
+    // Serve before logging in: a first-run login waits on the user in the
+    // browser, and clients should see `login-required` instead of a closed
+    // port they'd mistake for "no server".
+    guard.publish(|info| info.control_port = Some(port))?;
+    info!("Maxima server listening on 127.0.0.1:{}", port);
+
+    let accept_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let s = accept_state.clone();
+                    tokio::spawn(async move { handle_client(s, stream).await });
+                }
+                Err(err) => warn!("accept failed: {}", err),
+            }
         }
-        Err(err) => return Err(err.into()),
-    };
+    });
 
-    // --- Session setup: LSX + authorize + RTM, like `serve`. ---
-    let persona = {
+    // The server owns its status-bar icon on every OS (Windows tray / macOS
+    // menu-bar host / Linux SNI behind a feature). Menu: Open Maxima / Stop.
+    let stop_state = state.clone();
+    crate::status_icon::spawn(Arc::new(move || stop_state.shutdown.notify_one()));
+
+    tokio::select! {
+        result = start_session(&state, &mut guard) => {
+            if let Err(err) = result {
+                error!("Maxima session failed to start: {}", err);
+                return Err(err);
+            }
+        }
+        _ = state.shutdown.notified() => {
+            info!("Shutdown requested before login finished — Maxima server stopping");
+            return Ok(());
+        }
+    }
+
+    let tick_state = state.clone();
+    tokio::spawn(async move { tick_loop(tick_state).await });
+
+    state.shutdown.notified().await;
+    info!("Shutdown requested — Maxima server stopping");
+    Ok(())
+}
+
+/// Log in, then bring up LSX, `/authorize` and RTM, and announce `ready`.
+async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> Result<()> {
+    let maxima_arc = &state.maxima;
+    crate::log_in(maxima_arc).await?;
+
+    let (persona, lsx_port, authorize_port) = {
         let mut maxima = maxima_arc.lock().await;
         maxima.start_lsx(maxima_arc.clone()).await?;
-        if let Err(err) = maxima.start_auth_server(maxima_arc.clone()).await {
-            warn!("Authorize HTTP server failed to start: {}", err);
-        }
+        let authorize_port = match maxima.start_auth_server(maxima_arc.clone(), &state.token).await
+        {
+            Ok(port) => Some(port),
+            Err(err) => {
+                warn!("Authorize HTTP server failed to start: {}", err);
+                None
+            }
+        };
         if let Err(err) = maxima.rtm().login().await {
             warn!("RTM login failed (continuing without presence): {}", err);
         } else {
@@ -94,49 +175,23 @@ pub async fn run_server(maxima_arc: LockedMaxima) -> Result<()> {
             }
         }
         let user = maxima.local_user().await?;
-        user.player()
+        let persona = user
+            .player()
             .as_ref()
             .map(|p| p.display_name().to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (persona, maxima.lsx_bound_port(), authorize_port)
     };
 
-    let (events_tx, _) = broadcast::channel::<String>(256);
-    let state = Arc::new(ServerState {
-        maxima: maxima_arc.clone(),
-        installing: Mutex::new(None),
-        events: events_tx,
-        shutdown: Notify::new(),
-        persona: Mutex::new(persona.clone()),
-        clients: AtomicUsize::new(0),
-    });
-
-    info!("Maxima server listening on 127.0.0.1:{} (persona: {})", port, persona);
-
-    // The server owns its status-bar icon on every OS (Windows tray / macOS
-    // menu-bar host / Linux SNI behind a feature). Menu: Open Maxima / Stop.
-    crate::status_icon::spawn(port);
-
-    let tick_state = state.clone();
-    tokio::spawn(async move { tick_loop(tick_state).await });
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _addr)) => {
-                        let s = state.clone();
-                        tokio::spawn(async move { handle_client(s, stream).await; });
-                    }
-                    Err(err) => warn!("accept failed: {}", err),
-                }
-            }
-            _ = state.shutdown.notified() => {
-                info!("Shutdown requested — Maxima server stopping");
-                break;
-            }
-        }
-    }
-
+    guard.publish(|info| {
+        info.state = InstanceState::Ready;
+        info.lsx_port = lsx_port;
+        info.authorize_port = authorize_port;
+    })?;
+    *state.persona.lock().await = persona.clone();
+    state.ready.store(true, Ordering::Release);
+    state.notify(Notification::Ready { persona: persona.clone() });
+    info!("Logged in as {}; session ready", persona);
     Ok(())
 }
 
@@ -227,6 +282,21 @@ async fn tick_loop(state: Arc<ServerState>) {
 async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    // The first line must be a valid `hello`; anything else gets one error
+    // reply and the connection is closed.
+    let hello = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        _ => return,
+    };
+    if let Err(reply) = check_hello(&state, &hello) {
+        if let Ok(line) = serde_json::to_string(&reply) {
+            let _ = write_half.write_all(format!("{line}\n").as_bytes()).await;
+        }
+        return;
+    }
+
     let n = state.clients.fetch_add(1, Ordering::SeqCst) + 1;
     info!("client connected ({} total)", n);
 
@@ -242,7 +312,21 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     });
 
+    // Subscribe before replying so no notification can fall in between.
     let mut events_rx = state.events.subscribe();
+    let hello_id = id_hint(&hello);
+    let reply = ResponseEnvelope::ok(
+        hello_id,
+        json!({ "realm": state.realm, "server": env!("CARGO_PKG_VERSION"), "proto": PROTO_VERSION }),
+    );
+    send(&out_tx, &reply);
+    if state.is_ready() {
+        let persona = state.persona.lock().await.clone();
+        send(&out_tx, &Notification::Ready { persona });
+    } else {
+        send(&out_tx, &Notification::LoginRequired);
+    }
+
     let ev_tx = out_tx.clone();
     let forwarder = tokio::spawn(async move {
         loop {
@@ -258,46 +342,34 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     });
 
-    // Greet with a ready snapshot.
-    let persona = state.persona.lock().await.clone();
-    if let Ok(line) = serde_json::to_string(&Notification::Ready { persona }) {
-        let _ = out_tx.send(line);
-    }
-
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<RequestEnvelope>(&line) {
-                    Ok(env) => {
-                        let id = env.id;
-                        let is_shutdown = matches!(env.request, Request::Shutdown);
-                        let response = dispatch(&state, id, env.request).await;
-                        if let Ok(line) = serde_json::to_string(&response) {
-                            let _ = out_tx.send(line);
-                        }
-                        if is_shutdown {
-                            state.shutdown.notify_waiters();
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let resp = ResponseEnvelope::err(
-                            id_hint(&line),
-                            format!("bad request: {}", err),
-                        );
-                        if let Ok(line) = serde_json::to_string(&resp) {
-                            let _ = out_tx.send(line);
-                        }
-                    }
-                }
-            }
-            _ => break,
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
         }
+        let env = match serde_json::from_str::<RequestEnvelope>(&line) {
+            Ok(env) => env,
+            Err(err) => {
+                let reply = ResponseEnvelope::fail(
+                    id_hint(&line),
+                    ErrorKind::Invalid,
+                    format!("bad request: {}", err),
+                );
+                send(&out_tx, &reply);
+                continue;
+            }
+        };
+        // Each request runs on its own task, so a long verify or download
+        // doesn't hold up this client's other requests.
+        let state = state.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let is_shutdown = matches!(env.request, Request::Shutdown);
+            let response = dispatch(&state, env.id, env.request).await;
+            send(&out_tx, &response);
+            if is_shutdown {
+                state.shutdown.notify_one();
+            }
+        });
     }
 
     forwarder.abort();
@@ -305,6 +377,38 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     let _ = writer.await;
     let remaining = state.clients.fetch_sub(1, Ordering::SeqCst) - 1;
     info!("client disconnected ({} remaining)", remaining);
+}
+
+fn send<T: serde::Serialize>(out: &mpsc::UnboundedSender<String>, message: &T) {
+    if let Ok(line) = serde_json::to_string(message) {
+        let _ = out.send(line);
+    }
+}
+
+fn check_hello(state: &ServerState, line: &str) -> Result<(), ResponseEnvelope> {
+    let id = id_hint(line);
+    match serde_json::from_str::<RequestEnvelope>(line).map(|env| env.request) {
+        Ok(Request::Hello { token, client, proto }) => {
+            if !token_matches(&state.token, &token) {
+                warn!("rejected a client with a wrong token ({})", client);
+                return Err(ResponseEnvelope::fail(id, ErrorKind::Unauthorized, "bad token"));
+            }
+            if proto != PROTO_VERSION {
+                return Err(ResponseEnvelope::fail(
+                    id,
+                    ErrorKind::IncompatibleVersion,
+                    format!(
+                        "client speaks protocol {proto}, this server (Maxima {}) speaks {PROTO_VERSION}; \
+                         restart the server after updating",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                ));
+            }
+            info!("client identified as {}", if client.is_empty() { "unnamed" } else { &client });
+            Ok(())
+        }
+        _ => Err(ResponseEnvelope::fail(id, ErrorKind::Unauthorized, "send hello first")),
+    }
 }
 
 fn id_hint(line: &str) -> u64 {
@@ -317,7 +421,23 @@ fn id_hint(line: &str) -> u64 {
 /// Handle one request, returning the response for the requesting client.
 /// Notifications (broadcast to all) are emitted as a side effect.
 async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> ResponseEnvelope {
+    match request {
+        Request::Hello { .. } => {
+            return ResponseEnvelope::fail(id, ErrorKind::Invalid, "already identified")
+        }
+        Request::Status | Request::Shutdown => {}
+        _ if !state.is_ready() => {
+            return ResponseEnvelope::fail(
+                id,
+                ErrorKind::LoginPending,
+                "the Maxima server is waiting for the EA login to finish",
+            )
+        }
+        _ => {}
+    }
+
     let result: Result<serde_json::Value> = match request {
+        Request::Hello { .. } => unreachable!("handled above"),
         Request::Status => Ok(json!({ "status": status(state).await })),
         Request::Shutdown => Ok(json!({ "stopping": true })),
         Request::ListGames => {
@@ -380,18 +500,27 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
 
     match result {
         Ok(data) => ResponseEnvelope::ok(id, data),
+        Err(err) if err.is::<Busy>() => ResponseEnvelope::fail(id, ErrorKind::Busy, err.to_string()),
         Err(err) => ResponseEnvelope::err(id, err.to_string()),
     }
 }
 
 async fn status(state: &Arc<ServerState>) -> StatusDto {
-    let maxima = state.maxima.lock().await;
+    let logged_in = state.is_ready();
+    let (playing, lsx_port) = if logged_in {
+        let maxima = state.maxima.lock().await;
+        (maxima.playing().is_some(), maxima.effective_lsx_port())
+    } else {
+        (false, 0)
+    };
     StatusDto {
         persona: state.persona.lock().await.clone(),
-        playing: maxima.playing().is_some(),
+        playing,
         installing: state.installing.lock().await.clone(),
-        lsx_port: *maxima.lsx_port(),
+        lsx_port,
         clients: state.clients.load(Ordering::SeqCst) as u64,
+        realm: state.realm.clone(),
+        logged_in,
     }
 }
 
@@ -698,7 +827,7 @@ async fn cmd_install(
 
     // Full install: queue it; the tick loop broadcasts progress.
     if state.installing.lock().await.is_some() {
-        anyhow::bail!("another install is already running");
+        return Err(Busy("another install is already running".into()).into());
     }
     let mut maxima = state.maxima.lock().await;
     let game = QueuedGameBuilder::default()

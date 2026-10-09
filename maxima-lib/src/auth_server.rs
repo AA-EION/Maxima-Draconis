@@ -18,11 +18,19 @@
 //! (D-Bus on Linux per the issue, plain TCP HTTP for our cross-OS
 //! Wine bottle).
 //!
-//! ## Endpoints
+//! ## Discovery and authentication
 //!
-//! - `GET /`  →  `200 OK` body `maxima-auth-server`. Used by bootstrap as
-//!   a liveness probe before deciding whether to forward or fall back to
-//!   spawning a fresh `maxima-cli launch`.
+//! The listener binds an OS-assigned loopback port (or `MAXIMA_AUTHORIZE_PORT`)
+//! and the owning process publishes that port together with its session token
+//! in `instance.json` in the Maxima data directory. The bootstrap reads the
+//! file from its *own* data directory — inside a Wine prefix that is the
+//! prefix's own copy — and sends the token in the `X-Maxima-Token` header, so
+//! it only ever reaches the Maxima of its own prefix. Requests without the
+//! token, and any request carrying a browser `Origin` header, are refused: a
+//! web page can't make the session launch games.
+//!
+//! ## Endpoint
+//!
 //! - `POST /authorize?offer_id=<id>`  →  Validate login, resolve the offer
 //!   (EA library lookup with [`crate::steam`] fallback for the install
 //!   path), then call [`crate::core::launch::start_game`] which:
@@ -84,10 +92,8 @@ use crate::steam::{
     lookup_steam_game, lookup_steam_game_by_offer, resolve_steam_install_path, STEAM_APP_ID_PATTERN,
 };
 
-/// Default port for the authorize HTTP server. LSX is 3216; we pick
-/// `lsx + 3` so the two stay together in `netstat` output but don't
-/// collide. Override via `MAXIMA_AUTHORIZE_PORT` if anything ever clashes.
-pub const AUTHORIZE_PORT: u16 = 13219;
+/// Header carrying the session token from `instance.json`.
+pub const TOKEN_HEADER: &str = "x-maxima-token";
 
 #[derive(Error, Debug)]
 pub enum AuthServerError {
@@ -95,17 +101,19 @@ pub enum AuthServerError {
     Io(#[from] std::io::Error),
 }
 
-/// Bind the authorize HTTP listener and spawn the accept loop. Returns
-/// once the listener is bound; errors inside the accept loop are logged
-/// but don't propagate, so an LSX server already running stays up if
-/// some transient socket error hits this listener.
+/// Bind the authorize HTTP listener (`port` 0 picks a free one) and spawn
+/// the accept loop. Returns the bound port once listening; errors inside the
+/// accept loop are logged but don't propagate, so an LSX server already
+/// running stays up if some transient socket error hits this listener.
 pub async fn start_server(
     port: u16,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
-) -> Result<(), AuthServerError> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Authorize HTTP server listening on {}", addr);
+) -> Result<u16, AuthServerError> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let port = listener.local_addr()?.port();
+    info!("Authorize HTTP server listening on 127.0.0.1:{}", port);
+    let token: Arc<str> = Arc::from(token);
 
     tokio::spawn(async move {
         loop {
@@ -113,8 +121,9 @@ pub async fn start_server(
                 Ok((socket, peer)) => {
                     debug!("Authorize: new connection from {}", peer);
                     let maxima = maxima_arc.clone();
+                    let token = token.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(socket, maxima).await {
+                        if let Err(err) = handle_connection(socket, &token, maxima).await {
                             warn!("Authorize: request failed: {}", err);
                         }
                     });
@@ -129,7 +138,7 @@ pub async fn start_server(
         }
     });
 
-    Ok(())
+    Ok(port)
 }
 
 #[derive(Serialize)]
@@ -146,12 +155,15 @@ struct ErrorResponse {
 /// Public entry point: wraps the real handler in a per-request
 /// `tokio::time::timeout` so a stalled / hostile peer can't keep a
 /// task pinned indefinitely. Slow-client mitigation for an
-/// unauthenticated loopback HTTP listener.
+/// loopback HTTP listener.
 async fn handle_connection(
     socket: TcpStream,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
 ) -> Result<(), std::io::Error> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, handle_connection_inner(socket, maxima_arc)).await {
+    match tokio::time::timeout(REQUEST_TIMEOUT, handle_connection_inner(socket, token, maxima_arc))
+        .await
+    {
         Ok(result) => result,
         Err(_) => {
             warn!(
@@ -165,6 +177,7 @@ async fn handle_connection(
 
 async fn handle_connection_inner(
     mut socket: TcpStream,
+    token: &str,
     maxima_arc: Arc<Mutex<Maxima>>,
 ) -> Result<(), std::io::Error> {
     let (read_half, _) = socket.split();
@@ -174,9 +187,7 @@ async fn handle_connection_inner(
     // we respond 400 instead of hanging on the read.
     let mut reader = BufReader::new(read_half.take(MAX_REQUEST_HEAD_BYTES));
 
-    // We only need the request line — the body is empty for our endpoints
-    // and headers carry nothing we care about. Drain enough to keep the
-    // peer's send buffer happy, then respond.
+    // The body is always empty; only the request line and two headers matter.
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
@@ -187,20 +198,28 @@ async fn handle_connection_inner(
     let method = parts[0].to_string();
     let path_and_query = parts[1].to_string();
 
-    // Drain headers (until empty line). HTTP/1.1 requires this even if
-    // we don't read further data — without it, some clients refuse to
-    // read the response.
+    let mut presented_token = None;
+    let mut from_browser = false;
     loop {
         let mut header = String::new();
         let n = reader.read_line(&mut header).await?;
         if n == 0 || header == "\r\n" || header == "\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case(TOKEN_HEADER) {
+                presented_token = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("origin") {
+                from_browser = true;
+            }
+        }
     }
 
-    // GET / — health probe used by bootstrap.
-    if method == "GET" && (path_and_query == "/" || path_and_query.starts_with("/?")) {
-        return write_response(&mut socket, 200, "OK", b"maxima-auth-server").await;
+    let authorized = !from_browser
+        && presented_token.is_some_and(|t| maxima_proto::instance::token_matches(token, &t));
+    if !authorized {
+        return write_response(&mut socket, 401, "Unauthorized", b"").await;
     }
 
     // POST /authorize?offer_id=...&cmd_params=...

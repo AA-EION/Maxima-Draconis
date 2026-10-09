@@ -4,8 +4,12 @@
 //!
 //!   request       {"id":N,"cmd":"launch","slug":"…",…}
 //!   response ok    {"id":N,"ok":true,"games":[…]}
-//!   response err   {"id":N,"ok":false,"error":"…"}
+//!   response err   {"id":N,"ok":false,"error":"…","kind":"login-pending"}
 //!   notification   {"event":"presence","id":"…",…}
+//!
+//! The first request on every connection must be `hello`, carrying the token
+//! from the server's `instance.json` (see [`crate::instance`]); anything else
+//! is answered with an `unauthorized` error and the connection is closed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +23,13 @@ fn default_true() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
+    Hello {
+        token: String,
+        /// Free-form client name for the server log, e.g. `maxima-cli/0.14.0`.
+        #[serde(default)]
+        client: String,
+        proto: u32,
+    },
     ListGames,
     Friends,
     Status,
@@ -96,6 +107,24 @@ pub struct RequestEnvelope {
     pub request: Request,
 }
 
+/// Why a request failed, so clients can react without matching on messages.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErrorKind {
+    /// No valid `hello` on this connection.
+    Unauthorized,
+    /// The server is up but still waiting for the EA login to finish.
+    LoginPending,
+    /// The client speaks a protocol version the server doesn't.
+    IncompatibleVersion,
+    /// The request couldn't be parsed or its arguments are wrong.
+    Invalid,
+    /// Something is already running that this request would conflict with.
+    Busy,
+    #[serde(other)]
+    Internal,
+}
+
 /// A server → client response, matched to a request by `id`. `data` holds the
 /// per-command payload fields (games / friends / details / status / …).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -104,16 +133,21 @@ pub struct ResponseEnvelope {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ErrorKind>,
     #[serde(flatten)]
     pub data: Value,
 }
 
 impl ResponseEnvelope {
     pub fn ok(id: u64, data: Value) -> Self {
-        Self { id, ok: true, error: None, data }
+        Self { id, ok: true, error: None, kind: None, data }
     }
     pub fn err(id: u64, error: impl Into<String>) -> Self {
-        Self { id, ok: false, error: Some(error.into()), data: Value::Null }
+        Self::fail(id, ErrorKind::Internal, error)
+    }
+    pub fn fail(id: u64, kind: ErrorKind, error: impl Into<String>) -> Self {
+        Self { id, ok: false, error: Some(error.into()), kind: Some(kind), data: Value::Null }
     }
     /// Extract a named field from `data` and deserialize it.
     pub fn field<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Option<T> {
@@ -125,9 +159,13 @@ impl ResponseEnvelope {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum Notification {
+    /// The session is logged in. Sent after `hello` when it already is, and
+    /// to every client when a pending login completes.
     Ready {
         persona: String,
     },
+    /// Sent after `hello` while the server waits for the EA login.
+    LoginRequired,
     Presence {
         id: String,
         basic: String,
@@ -207,6 +245,24 @@ mod tests {
     }
 
     #[test]
+    fn hello_wire_shape() {
+        let env = RequestEnvelope {
+            id: 1,
+            request: Request::Hello { token: "t".into(), client: "c".into(), proto: 2 },
+        };
+        assert_eq!(
+            serde_json::to_string(&env).unwrap(),
+            r#"{"id":1,"cmd":"hello","token":"t","client":"c","proto":2}"#
+        );
+    }
+
+    #[test]
+    fn unknown_error_kind_is_internal() {
+        let kind: ErrorKind = serde_json::from_str(r#""something-new""#).unwrap();
+        assert_eq!(kind, ErrorKind::Internal);
+    }
+
+    #[test]
     fn notification_kebab_tags() {
         let n = Notification::GameStarted { slug: "x".into() };
         assert_eq!(serde_json::to_string(&n).unwrap(), r#"{"event":"game-started","slug":"x"}"#);
@@ -222,6 +278,11 @@ mod tests {
             serde_json::from_str::<ServerMessage>(resp).unwrap(),
             ServerMessage::Response(_)
         ));
+        let err = r#"{"id":2,"ok":false,"error":"x","kind":"login-pending"}"#;
+        match serde_json::from_str::<ServerMessage>(err).unwrap() {
+            ServerMessage::Response(r) => assert_eq!(r.kind, Some(ErrorKind::LoginPending)),
+            _ => panic!("expected a response"),
+        }
         let note = r#"{"event":"ready","persona":"Me"}"#;
         assert!(matches!(
             serde_json::from_str::<ServerMessage>(note).unwrap(),

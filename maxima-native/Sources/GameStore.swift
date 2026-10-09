@@ -70,6 +70,8 @@ final class GameStore: ObservableObject {
         case "ready":
             backendState = .ready(persona: event["persona"] as? String ?? "")
             Task { await refreshAll() }
+        case "login-required":
+            backendState = .connecting
         case "presence":
             guard let id = event["id"] as? String else { return }
             presences[id] = Presence(
