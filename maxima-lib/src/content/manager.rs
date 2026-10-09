@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     content::{
         downloader::{DownloadError, ZipDownloader},
+        exclusion::get_exclusion_list,
         zip::{self, CompressionType, ZipError, ZipFileEntry},
         ContentService,
     },
@@ -29,6 +30,7 @@ use crate::{
         service_layer::ServiceLayerError,
         MaximaEvent,
     },
+    gameinfo::GameInstallInfo,
     util::native::{maxima_dir, NativeError},
 };
 
@@ -77,11 +79,33 @@ pub struct InstallMarker {
     pub maxima_lib_version: String,
 }
 
-#[derive(Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedGame {
     offer_id: String,
     build_id: String,
     path: PathBuf,
+    /// Library slug: keys the install record and the per-game exclusion
+    /// file. Empty for entries queued by older versions, which then get
+    /// neither.
+    #[builder(default)]
+    #[serde(default)]
+    slug: String,
+    /// Wine prefix (unix) the game is installed into / will run in. Carried
+    /// with the queue entry so the touchup and the install record use the
+    /// prefix chosen when the install was requested, however long the
+    /// download is queued.
+    #[builder(default)]
+    #[serde(default)]
+    wine_prefix: Option<PathBuf>,
+    /// Extra glob patterns (on top of the game's exclusion file) for files
+    /// that must not be downloaded.
+    #[builder(default)]
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// Locale to record in the install record (e.g. `en_US`).
+    #[builder(default)]
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[derive(Default, Getters, Serialize, Deserialize)]
@@ -183,6 +207,9 @@ impl DownloadQueue {
 
 pub struct GameDownloader {
     offer_id: String,
+    install_info: GameInstallInfo,
+    slug: String,
+    wine_prefix: Option<PathBuf>,
 
     downloader: Arc<ZipDownloader>,
     entries: Vec<ZipFileEntry>,
@@ -207,10 +234,32 @@ impl GameDownloader {
 
         let downloader = ZipDownloader::new(&game.offer_id, &url.url(), &game.path).await?;
 
+        let exclusion = get_exclusion_list(&game.slug, &game.exclude);
         let mut entries = Vec::new();
+        let mut excluded = 0usize;
         for ele in downloader.manifest().entries() {
-            // TODO: Filtering
+            if exclusion.is_match(ele.name()) {
+                excluded += 1;
+                continue;
+            }
             entries.push(ele.clone());
+        }
+        if excluded > 0 {
+            info!(
+                "Excluding {} file(s) from the download ({} pattern(s))",
+                excluded,
+                exclusion.patterns().len()
+            );
+        }
+
+        let mut install_info = GameInstallInfo::new(game.path.clone(), game.wine_prefix.clone())
+            .with_offer(&game.offer_id, Some(&game.build_id))
+            .with_exclude(game.exclude.clone());
+        if let Some(locale) = &game.locale {
+            install_info = install_info.with_locale(locale);
+        }
+        if !game.slug.is_empty() {
+            install_info = install_info.with_slug(&game.slug);
         }
 
         let total_bytes = entries
@@ -221,6 +270,9 @@ impl GameDownloader {
 
         Ok(GameDownloader {
             offer_id: game.offer_id.to_owned(),
+            install_info,
+            slug: game.slug.clone(),
+            wine_prefix: game.wine_prefix.clone(),
 
             downloader: Arc::new(downloader),
             entries,
@@ -240,11 +292,21 @@ impl GameDownloader {
         let failure = self.failure.clone();
         let notify = self.notify.clone();
         let offer_id = self.offer_id.clone();
+        let install_info = self.install_info.clone();
+        let slug = self.slug.clone();
+        let wine_prefix = self.wine_prefix.clone();
 
         tokio::spawn(async move {
-            let result =
-                GameDownloader::start_downloads(downloader, entries, cancel_token, completed_bytes)
-                    .await;
+            let result = GameDownloader::start_downloads(
+                downloader,
+                entries,
+                cancel_token,
+                completed_bytes,
+                install_info,
+                slug,
+                wine_prefix,
+            )
+            .await;
             if let Err(err) = result {
                 error!("Install of {offer_id} failed: {err}");
                 *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
@@ -258,6 +320,9 @@ impl GameDownloader {
         entries: Vec<ZipFileEntry>,
         cancel_token: CancellationToken,
         completed_bytes: Arc<AtomicUsize>,
+        mut install_info: GameInstallInfo,
+        slug: String,
+        wine_prefix: Option<PathBuf>,
     ) -> Result<(), DownloaderError> {
         let total = entries.len();
         let failed = Arc::new(AtomicUsize::new(0));
@@ -299,9 +364,25 @@ impl GameDownloader {
         }
 
         let path = downloader.path();
-        info!("Files downloaded, running touchup...");
+        info!("Files downloaded");
+
+        // From here on the game is "installed": the record, not any
+        // registry, is what says so (and which prefix it lives in).
+        if !slug.is_empty() {
+            install_info.save_to_json(&slug);
+        }
+
+        info!("Running touchup...");
         let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-        manifest.run_touchup(path).await?;
+
+        if !slug.is_empty() {
+            if let Some(version) = manifest.version() {
+                install_info.version = Some(version);
+                install_info.save_to_json(&slug);
+            }
+        }
+
+        manifest.run_touchup(path, wine_prefix.as_deref()).await?;
         info!("Installation finished!");
 
         completed_bytes.fetch_add(1, Ordering::SeqCst);
@@ -577,7 +658,12 @@ mod tests {
     use super::*;
 
     fn game(id: &str) -> QueuedGame {
-        QueuedGame { offer_id: id.into(), build_id: "b".into(), path: PathBuf::from("/g") }
+        QueuedGame {
+            offer_id: id.into(),
+            build_id: "b".into(),
+            path: PathBuf::from("/g"),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -606,5 +692,71 @@ mod tests {
         queue.forget("a");
         assert!(queue.current.is_none());
         assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn queue_entries_saved_by_older_versions_still_load() {
+        // download_queue.json from before slugs / prefixes / exclusion existed.
+        let old = r#"{
+            "current": {"offer_id": "Origin.OFR.1", "build_id": "7", "path": "/g/one"},
+            "paused": false,
+            "queued": [{"offer_id": "Origin.OFR.2", "build_id": "8", "path": "/g/two"}],
+            "completed": []
+        }"#;
+        let queue: DownloadQueue = serde_json::from_str(old).unwrap();
+        let current = queue.current.unwrap();
+        assert_eq!(current.slug, "");
+        assert_eq!(current.wine_prefix, None);
+        assert!(current.exclude.is_empty());
+        assert_eq!(current.locale, None);
+        assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn two_games_queue_with_their_own_prefixes() {
+        let a = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.1".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/a".into())
+            .slug("game-a".to_owned())
+            .wine_prefix(Some("/prefixes/a".into()))
+            .exclude(vec!["*.bik".to_owned()])
+            .build()
+            .unwrap();
+        let b = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.2".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/b".into())
+            .slug("game-b".to_owned())
+            .wine_prefix(Some("/prefixes/b".into()))
+            .build()
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.wine_prefix(), &Some(PathBuf::from("/prefixes/a")));
+        assert_eq!(b.wine_prefix(), &Some(PathBuf::from("/prefixes/b")));
+
+        // They survive the on-disk queue round trip independently.
+        let queue = DownloadQueue {
+            current: Some(a.clone()),
+            paused: false,
+            queued: vec![b.clone()],
+            completed: vec![],
+        };
+        let back: DownloadQueue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert_eq!(back.current.as_ref(), Some(&a));
+        assert_eq!(back.queued, vec![b]);
+    }
+
+    #[test]
+    fn builder_defaults_keep_existing_call_sites_valid() {
+        let game = QueuedGameBuilder::default()
+            .offer_id("o".to_owned())
+            .build_id("b".to_owned())
+            .path("/p".into())
+            .build()
+            .unwrap();
+        assert_eq!(game.slug(), "");
+        assert_eq!(game.wine_prefix(), &None);
     }
 }

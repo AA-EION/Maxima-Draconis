@@ -84,6 +84,7 @@ gethostname = "0.5.0"
 thiserror = "2.0.12"
 url = "2.5.2"
 http = "0.2.12"
+globset = "0.4"
 
 # Transport for the `presence-grpc` feature. The protobuf messages stay on the
 # workspace's prost 0.12 (see presence/grpc.rs for the codec that bridges the
@@ -130,6 +131,9 @@ libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.12.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lib]
 name = "maxima"

@@ -446,8 +446,17 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
 
 #[cfg(unix)]
 async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
-    use maxima::unix::wine::run_wine_command;
-    use maxima::unix::wine::CommandType;
+    use maxima::unix::{
+        prefix,
+        wine::{run_wine_command, CommandType},
+    };
+
+    // The launcher names the prefix in the payload; a payload from an older
+    // launcher falls back to the ambient prefix (MAXIMA_WINE_PREFIX).
+    let wine_prefix = match args.wine_prefix.as_deref().filter(|p| !p.is_empty()) {
+        Some(prefix) => std::path::PathBuf::from(prefix),
+        None => prefix::ambient()?,
+    };
 
     run_wine_command(
         args.path,
@@ -455,6 +464,7 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
         None,
         false,
         CommandType::WaitForExitAndRun,
+        &wine_prefix,
     )
     .await?;
 

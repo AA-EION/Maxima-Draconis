@@ -174,9 +174,13 @@ pub async fn run_list_games(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_bottle_info(slug: &str, json: bool) -> Result<()> {
+pub async fn run_bottle_info(
+    slug: &str,
+    json: bool,
+    wine_prefix: Option<String>,
+) -> Result<()> {
     let client = connect_ready().await?;
-    let b = client.bottle_info(slug).await?;
+    let b = client.bottle_info_in(slug, wine_prefix).await?;
     if json {
         println!("{}", serde_json::to_string(&b)?);
     } else {
@@ -192,13 +196,29 @@ pub async fn run_bottle_info(slug: &str, json: bool) -> Result<()> {
             b.default_game_dir.as_deref().unwrap_or("-"),
             b.game_dir_exists
         );
+        if let Some(source) = &b.prefix_source {
+            info!("prefix chosen by: {}", source);
+        }
+        if let Some(dir) = &b.install_dir {
+            info!("installed at:     {}", dir);
+        }
+        if let Some(version) = &b.version {
+            info!("version:          {}", version);
+        }
+        if let Some(build) = &b.build_id {
+            info!("build:            {}", build);
+        }
     }
     Ok(())
 }
 
-pub async fn run_locate_game(path: &str) -> Result<()> {
+pub async fn run_locate_game(
+    path: &str,
+    slug: Option<String>,
+    wine_prefix: Option<String>,
+) -> Result<()> {
     let client = connect_ready().await?;
-    client.locate_game(path).await?;
+    client.locate_game_for(path, slug, wine_prefix).await?;
     info!("Installed!");
     Ok(())
 }
@@ -210,29 +230,27 @@ pub async fn run_register_protocols() -> Result<()> {
     Ok(())
 }
 
-pub async fn run_cloud_sync(slug: &str, write: bool) -> Result<()> {
+pub async fn run_cloud_sync(
+    slug: &str,
+    write: bool,
+    wine_prefix: Option<String>,
+) -> Result<()> {
     let client = connect_ready().await?;
     client
-        .request(Request::CloudSync { slug: slug.to_owned(), write })
+        .request(Request::CloudSync { slug: slug.to_owned(), write, wine_prefix })
         .await?;
     info!("Cloud sync {} done", if write { "write" } else { "read" });
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_install(
     slug: &str,
-    path: Option<String>,
-    build_id: Option<String>,
-    replace_files: Vec<String>,
-    only_listed_files: bool,
+    options: maxima_proto::InstallOptions,
     json: bool,
 ) -> Result<()> {
     let client = connect_ready().await?;
     let mut events = client.subscribe();
-    client
-        .install_full(slug, path, build_id, replace_files, only_listed_files)
-        .await?;
+    client.install_with(slug, options).await?;
     loop {
         let Some(note) = next_event(&client, &mut events).await else {
             anyhow::bail!(SERVER_GONE);
@@ -270,10 +288,14 @@ pub async fn run_verify(
     path: Option<String>,
     repair: bool,
     json: bool,
+    wine_prefix: Option<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
     let client = connect_ready().await?;
     let mut events = client.subscribe();
-    client.verify(slug, path, repair).await?;
+    client
+        .verify_with(slug, path, repair, wine_prefix, exclude)
+        .await?;
     loop {
         let Some(note) = next_event(&client, &mut events).await else {
             anyhow::bail!(SERVER_GONE);
@@ -311,9 +333,12 @@ pub async fn run_download_file(
     slug: &str,
     build_id: Option<String>,
     file: &str,
+    wine_prefix: Option<String>,
 ) -> Result<()> {
     let client = connect_ready().await?;
-    client.download_file(slug, build_id, file).await?;
+    client
+        .download_file_in(slug, build_id, file, wine_prefix)
+        .await?;
     info!("Downloaded {}", file);
     Ok(())
 }

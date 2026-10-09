@@ -56,6 +56,20 @@ impl ClientError {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseEnvelope>>>>;
 
+/// Everything an install request can carry. `Default` is "install the live
+/// build to the game's default location".
+#[derive(Clone, Debug, Default)]
+pub struct InstallOptions {
+    pub path: Option<String>,
+    pub build_id: Option<String>,
+    pub replace_files: Vec<String>,
+    pub only_listed_files: bool,
+    /// Wine prefix (unix hosts); `None` lets the server pick per game.
+    pub wine_prefix: Option<String>,
+    /// Glob patterns of files to leave out of the download.
+    pub exclude: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Session {
     Pending,
@@ -283,11 +297,24 @@ impl MaximaClient {
         exe_override: Option<String>,
         cloud_saves: bool,
     ) -> Result<(), ClientError> {
+        self.launch_in(slug, args, exe_override, cloud_saves, None).await
+    }
+
+    /// [`launch`](Self::launch) in an explicit Wine prefix (unix hosts).
+    pub async fn launch_in(
+        &self,
+        slug: &str,
+        args: Vec<String>,
+        exe_override: Option<String>,
+        cloud_saves: bool,
+        wine_prefix: Option<String>,
+    ) -> Result<(), ClientError> {
         self.request(Request::Launch {
             slug: slug.to_owned(),
             args,
             exe_override,
             cloud_saves,
+            wine_prefix,
         })
         .await
         .map(|_| ())
@@ -308,14 +335,36 @@ impl MaximaClient {
         replace_files: Vec<String>,
         only_listed_files: bool,
     ) -> Result<(), ClientError> {
-        let timeout = (!only_listed_files).then_some(REQUEST_TIMEOUT);
-        self.request_with(
-            Request::Install {
-                slug: slug.to_owned(),
+        self.install_with(
+            slug,
+            InstallOptions {
                 path,
                 build_id,
                 replace_files,
                 only_listed_files,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Install with every option, including the Wine prefix and the file
+    /// exclusion patterns.
+    pub async fn install_with(
+        &self,
+        slug: &str,
+        options: InstallOptions,
+    ) -> Result<(), ClientError> {
+        let timeout = (!options.only_listed_files).then_some(REQUEST_TIMEOUT);
+        self.request_with(
+            Request::Install {
+                slug: slug.to_owned(),
+                path: options.path,
+                build_id: options.build_id,
+                replace_files: options.replace_files,
+                only_listed_files: options.only_listed_files,
+                wine_prefix: options.wine_prefix,
+                exclude: options.exclude,
             },
             timeout,
         )
@@ -329,9 +378,25 @@ impl MaximaClient {
         path: Option<String>,
         repair: bool,
     ) -> Result<(), ClientError> {
-        self.request_with(Request::Verify { slug: slug.to_owned(), path, repair }, None)
-            .await
-            .map(|_| ())
+        self.verify_with(slug, path, repair, None, vec![]).await
+    }
+
+    /// [`verify`](Self::verify) with an explicit Wine prefix and extra
+    /// exclusion patterns (files verify must not count as missing).
+    pub async fn verify_with(
+        &self,
+        slug: &str,
+        path: Option<String>,
+        repair: bool,
+        wine_prefix: Option<String>,
+        exclude: Vec<String>,
+    ) -> Result<(), ClientError> {
+        self.request_with(
+            Request::Verify { slug: slug.to_owned(), path, repair, wine_prefix, exclude },
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn download_file(
@@ -340,8 +405,23 @@ impl MaximaClient {
         build_id: Option<String>,
         file: &str,
     ) -> Result<(), ClientError> {
+        self.download_file_in(slug, build_id, file, None).await
+    }
+
+    pub async fn download_file_in(
+        &self,
+        slug: &str,
+        build_id: Option<String>,
+        file: &str,
+        wine_prefix: Option<String>,
+    ) -> Result<(), ClientError> {
         self.request_with(
-            Request::DownloadFile { slug: slug.to_owned(), build_id, file: file.to_owned() },
+            Request::DownloadFile {
+                slug: slug.to_owned(),
+                build_id,
+                file: file.to_owned(),
+                wine_prefix,
+            },
             None,
         )
         .await
@@ -349,7 +429,15 @@ impl MaximaClient {
     }
 
     pub async fn bottle_info(&self, slug: &str) -> Result<BottleInfoDto, ClientError> {
-        self.request(Request::BottleInfo { slug: slug.to_owned() })
+        self.bottle_info_in(slug, None).await
+    }
+
+    pub async fn bottle_info_in(
+        &self,
+        slug: &str,
+        wine_prefix: Option<String>,
+    ) -> Result<BottleInfoDto, ClientError> {
+        self.request(Request::BottleInfo { slug: slug.to_owned(), wine_prefix })
             .await?
             .field("bottle")
             .ok_or(ClientError::Malformed("bottle"))
@@ -360,13 +448,33 @@ impl MaximaClient {
     }
 
     pub async fn locate_game(&self, path: &str) -> Result<(), ClientError> {
-        self.request(Request::LocateGame { path: path.to_owned() })
+        self.locate_game_for(path, None, None).await
+    }
+
+    /// Locate an existing install, naming the game and (unix hosts) the Wine
+    /// prefix it runs in.
+    pub async fn locate_game_for(
+        &self,
+        path: &str,
+        slug: Option<String>,
+        wine_prefix: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.request(Request::LocateGame { path: path.to_owned(), slug, wine_prefix })
             .await
             .map(|_| ())
     }
 
     pub async fn cloud_sync(&self, slug: &str, write: bool) -> Result<(), ClientError> {
-        self.request_with(Request::CloudSync { slug: slug.to_owned(), write }, None)
+        self.cloud_sync_in(slug, write, None).await
+    }
+
+    pub async fn cloud_sync_in(
+        &self,
+        slug: &str,
+        write: bool,
+        wine_prefix: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.request_with(Request::CloudSync { slug: slug.to_owned(), write, wine_prefix }, None)
             .await
             .map(|_| ())
     }

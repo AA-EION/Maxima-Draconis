@@ -5,10 +5,13 @@
 //! wine prefixes by hand. Bottles created here land in CrossOver's normal
 //! bottle directory and show up in the CrossOver UI like any other bottle.
 //!
-//! Selection precedence, everywhere wine is touched (`wine_prefix_dir()`):
-//! 1. Explicit `MAXIMA_WINE_PREFIX` — power users / Draconis pointing at an
-//!    existing bottle. Never overridden.
-//! 2. A `Maxima-<slug>` bottle, created on demand by [`ensure_game_bottle`].
+//! This module only knows how to name, locate and create bottles. WHICH
+//! prefix a request uses (explicit argument, `MAXIMA_WINE_PREFIX`, the game's
+//! install record, or the per-game `Maxima-<slug>` bottle) is decided by
+//! [`super::prefix`], per request; nothing here touches process-global state.
+//!
+//! The module compiles on every unix host so the logic stays type-checked on
+//! Linux CI; it is only ever reached on macOS (no CrossOver elsewhere).
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +19,8 @@ use log::info;
 use tokio::process::Command;
 
 use crate::util::native::{NativeError, WineError};
+
+static CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub const CROSSOVER_SUPPORT: &str = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver";
 
@@ -68,6 +73,13 @@ pub async fn ensure_bottle(name: &str) -> Result<PathBuf, NativeError> {
         return Ok(bottle);
     }
 
+    // Two requests for the same game must not both run `cxbottle --create`.
+    // Held across the create; re-checked once we own it.
+    let _creating = CREATE_LOCK.lock().await;
+    if bottle.join("system.reg").exists() {
+        return Ok(bottle);
+    }
+
     if !crossover_installed() {
         return Err(NativeError::CrossOverMissing);
     }
@@ -107,32 +119,22 @@ pub async fn ensure_bottle(name: &str) -> Result<PathBuf, NativeError> {
     Ok(bottle)
 }
 
-/// A user-supplied `MAXIMA_WINE_PREFIX`, captured at first use. Snapshotting
-/// matters in long-lived processes (the UI): `ensure_game_bottle` exports
-/// its selection through the same env var, so re-reading the env on every
-/// call would mistake game A's bottle for a user override when game B
-/// launches later.
-static USER_PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// Name of the per-game bottle Maxima creates for `slug`.
+pub fn game_bottle_name(slug: &str) -> String {
+    format!("Maxima-{}", slug)
+}
 
-/// Per-game bottle selection. Honors an explicit user-set
-/// `MAXIMA_WINE_PREFIX`; else creates/reuses a `Maxima-<slug>` bottle and
-/// exports it via that same env var so the whole pipeline follows — license
-/// dir, regedit, and the spawned bootstrap/game child processes all resolve
-/// the prefix through `wine_prefix_dir()`, and children inherit the
-/// environment.
-// ponytail: bottle selection is a process-global env var — concurrent
-// installs/launches of DIFFERENT games in one process would race it. Thread
-// a per-context prefix through LaunchOptions/ContentManager if that becomes
-// a real workload.
+/// Where the per-game bottle for `slug` lives (or would live); creates
+/// nothing.
+pub fn game_bottle_path(slug: &str) -> Result<PathBuf, NativeError> {
+    Ok(bottles_dir()?.join(game_bottle_name(slug)))
+}
+
+/// Create (or reuse) the default per-game bottle for `slug`. Pure: it does
+/// not consult or set `MAXIMA_WINE_PREFIX`. Callers that honor user
+/// overrides go through [`super::prefix::resolve_for_game`].
 pub async fn ensure_game_bottle(slug: &str) -> Result<PathBuf, NativeError> {
-    let user_prefix = USER_PREFIX.get_or_init(|| std::env::var("MAXIMA_WINE_PREFIX").ok());
-    if let Some(prefix) = user_prefix {
-        return Ok(PathBuf::from(prefix));
-    }
-
-    let bottle = ensure_bottle(&format!("Maxima-{}", slug)).await?;
-    std::env::set_var("MAXIMA_WINE_PREFIX", &bottle);
-    Ok(bottle)
+    ensure_bottle(&game_bottle_name(slug)).await
 }
 
 #[cfg(test)]

@@ -573,7 +573,11 @@ impl Maxima {
             if *playing.cloud_saves() && offer.offer().has_cloud_save() {
                 let result = self
                     .cloud_sync
-                    .obtain_lock(offer, CloudSyncLockMode::Write)
+                    .obtain_lock(
+                        offer,
+                        CloudSyncLockMode::Write,
+                        playing.wine_prefix().as_deref(),
+                    )
                     .await;
                 match result {
                     Err(err) => error!("Failed to obtain CloudSync write lock: {}", err),

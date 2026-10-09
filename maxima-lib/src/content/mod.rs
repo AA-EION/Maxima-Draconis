@@ -12,6 +12,7 @@ use crate::core::{
 };
 
 pub mod downloader;
+pub mod exclusion;
 pub mod manager;
 pub mod zip;
 pub mod zlib;

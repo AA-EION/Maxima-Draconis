@@ -396,6 +396,9 @@ async fn handle_authorize(
         // `cmd_params` or `MAXIMA_LAUNCH_ARGS`; we no longer inject
         // any TF2-specific defaults.
         steam_app_id,
+        // The game's own prefix (recorded at install, else its per-game
+        // default) is picked inside `start_game`.
+        wine_prefix: None,
     };
 
     // Phase 3: hand off to the upstream launch flow. This refreshes the

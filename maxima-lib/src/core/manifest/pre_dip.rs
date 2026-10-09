@@ -6,7 +6,7 @@ use crate::core::manifest::{
 };
 use derive_getters::Getters;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 macro_rules! predip_type {
     (
@@ -131,7 +131,11 @@ impl PreDiPManifest {
     }
 
     #[cfg(unix)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
         use log::warn;
 
         use crate::{
@@ -149,11 +153,15 @@ impl PreDiPManifest {
             return Ok(());
         }
 
-        mx_linux_setup().await?;
+        let prefix = match wine_prefix {
+            Some(prefix) => prefix.to_path_buf(),
+            None => crate::unix::prefix::ambient()?,
+        };
+        mx_linux_setup(&prefix).await?;
 
         // Clear any interrupted WiX Burn installs (e.g. vcredist killed mid-run)
         // so they start fresh rather than trying to resume from a corrupt checkpoint.
-        if let Err(err) = cleanup_interrupted_burn_installs().await {
+        if let Err(err) = cleanup_interrupted_burn_installs(&prefix).await {
             warn!("Burn cleanup check failed (proceeding with touchup anyway): {err:?}");
         }
 
@@ -164,14 +172,18 @@ impl PreDiPManifest {
 
         let path = install_path.join(remove_leading_slash(&self.executable.file_path));
         let path = case_insensitive_path(path);
-        run_wine_command(path, Some(args), None, true, CommandType::Run).await?;
+        run_wine_command(path, Some(args), None, true, CommandType::Run, &prefix).await?;
 
-        invalidate_mx_wine_registry().await;
+        invalidate_mx_wine_registry(&prefix).await;
         Ok(())
     }
 
     #[cfg(windows)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        _wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
         use crate::util::{
             elevation, native::NativeError, registry::cleanup_interrupted_burn_installs,
         };

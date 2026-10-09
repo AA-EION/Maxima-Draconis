@@ -98,27 +98,53 @@ async fn acquire_auth(auth: &LockedAuthStorage) -> Result<(String, String), Clou
 }
 
 #[cfg(windows)]
-fn home_dir() -> Result<PathBuf, NativeError> {
+fn home_dir(_wine_prefix: Option<&Path>) -> Result<PathBuf, NativeError> {
     Ok(PathBuf::from(
         std::env::var_os("USERPROFILE").unwrap_or_else(|| "C:\\Users\\Public".into()),
     ))
 }
 
+/// The Wine user's profile inside the game's prefix. Its name is not fixed:
+/// CrossOver bottles use `crossover`, Proton/umu `steamuser`, plain Wine the
+/// host user name — see [`crate::unix::prefix::wine_user_dir`].
 #[cfg(unix)]
-fn home_dir() -> Result<PathBuf, NativeError> {
-    use crate::unix::wine::wine_prefix_dir;
-    Ok(wine_prefix_dir()?.join("drive_c/users/steamuser"))
+fn home_dir(wine_prefix: Option<&Path>) -> Result<PathBuf, NativeError> {
+    use crate::unix::prefix;
+
+    let prefix = match wine_prefix {
+        Some(prefix) => prefix.to_path_buf(),
+        None => prefix::ambient()?,
+    };
+    Ok(prefix::wine_user_dir(&prefix))
 }
 
-fn substitute_paths<P: AsRef<str>>(path: P) -> Result<PathBuf, NativeError> {
+/// The prefix a cloud-save operation for `slug` should use: the one given,
+/// else the game's own (recorded or default) prefix. Unix only.
+#[cfg(unix)]
+fn effective_prefix(slug: &str, wine_prefix: Option<&Path>) -> Option<PathBuf> {
+    match wine_prefix {
+        Some(prefix) => Some(prefix.to_path_buf()),
+        None => crate::unix::prefix::prefix_for_game(slug, None).ok(),
+    }
+}
+
+#[cfg(not(unix))]
+fn effective_prefix(_slug: &str, wine_prefix: Option<&Path>) -> Option<PathBuf> {
+    wine_prefix.map(Path::to_path_buf)
+}
+
+fn substitute_paths<P: AsRef<str>>(
+    path: P,
+    wine_prefix: Option<&Path>,
+) -> Result<PathBuf, NativeError> {
     let mut result = PathBuf::new();
     let path_str = path.as_ref();
 
     if path_str.contains("%Documents%") {
-        let path = home_dir()?.join("Documents");
+        let path = home_dir(wine_prefix)?.join("Documents");
         result.push(path_str.replace("%Documents%", path.to_str().unwrap_or_default()));
     } else if path_str.contains("%SavedGames%") {
-        let path = home_dir()?.join("Saved Games");
+        let path = home_dir(wine_prefix)?.join("Saved Games");
         result.push(path_str.replace("%SavedGames%", path.to_str().unwrap_or_default()));
     } else {
         result.push(path_str);
@@ -127,9 +153,12 @@ fn substitute_paths<P: AsRef<str>>(path: P) -> Result<PathBuf, NativeError> {
     Ok(result)
 }
 
-fn unsubstitute_paths<P: AsRef<Path>>(path: P) -> Result<String, NativeError> {
+fn unsubstitute_paths<P: AsRef<Path>>(
+    path: P,
+    wine_prefix: Option<&Path>,
+) -> Result<String, NativeError> {
     let path = path.as_ref();
-    let home = home_dir()?;
+    let home = home_dir(wine_prefix)?;
 
     let documents_path = home.join("Documents");
     let saved_games_path = home.join("Saved Games");
@@ -196,6 +225,9 @@ pub struct CloudSyncLock<'a> {
     manifest: CloudSyncManifest,
     mode: CloudSyncLockMode,
     allowed_files: Vec<PathBuf>,
+    /// The Wine prefix the `%Documents%`-style paths in this lock's manifest
+    /// resolve against (unix; `None` = ambient).
+    wine_prefix: Option<PathBuf>,
 }
 
 impl<'a> CloudSyncLock<'a> {
@@ -206,6 +238,7 @@ impl<'a> CloudSyncLock<'a> {
         lock: String,
         mode: CloudSyncLockMode,
         allowed_files: Vec<PathBuf>,
+        wine_prefix: Option<PathBuf>,
     ) -> Result<Self, CloudSyncError> {
         let res = client.get(manifest_url).send().await?;
 
@@ -237,6 +270,7 @@ impl<'a> CloudSyncLock<'a> {
             manifest,
             mode,
             allowed_files,
+            wine_prefix,
         })
     }
 
@@ -273,7 +307,7 @@ impl<'a> CloudSyncLock<'a> {
         let mut paths = HashMap::new();
         for i in 0..self.manifest.file.len() {
             let local_path = &self.manifest.file[i].local_name;
-            let path = substitute_paths(local_path)?;
+            let path = substitute_paths(local_path, self.wine_prefix.as_deref())?;
 
             let file = OpenOptions::new().read(true).open(path.clone()).await;
 
@@ -407,7 +441,7 @@ impl<'a> CloudSyncLock<'a> {
                 continue;
             }
 
-            let name = unsubstitute_paths(&path)?;
+            let name = unsubstitute_paths(&path, self.wine_prefix.as_deref())?;
             let write_data = WriteData::File {
                 name,
                 file,
@@ -545,11 +579,15 @@ impl CloudSyncClient {
         }
     }
 
+    /// `wine_prefix` is the prefix the game's saves live in (unix); `None`
+    /// uses the game's own recorded/default prefix. Ignored on Windows.
     pub async fn obtain_lock<'a>(
         &self,
         offer: &OwnedOffer,
         mode: CloudSyncLockMode,
+        wine_prefix: Option<&Path>,
     ) -> Result<CloudSyncLock, CloudSyncError> {
+        let wine_prefix = effective_prefix(offer.slug(), wine_prefix);
         let id = cloudsync_id(
             offer.offer().primary_master_title_id(),
             offer.offer().multiplayer_id().as_deref(),
@@ -560,7 +598,7 @@ impl CloudSyncClient {
         if let Some(config) = offer.offer().cloud_save_configuration_override() {
             let criteria: CloudSyncSaveFileCriteria = quick_xml::de::from_str(config)?;
             for include in criteria.include {
-                let path = substitute_paths(include.value)?;
+                let path = substitute_paths(include.value, wine_prefix.as_deref())?;
                 let paths = glob::glob(path.safe_str()?)?;
                 for path in paths {
                     let path = path?;
@@ -575,7 +613,9 @@ impl CloudSyncClient {
             return Err(CloudSyncError::NoConfig(offer.offer_id().clone()));
         }
 
-        Ok(self.obtain_lock_raw(&id, mode, allowed_files).await?)
+        Ok(self
+            .obtain_lock_raw(&id, mode, allowed_files, wine_prefix)
+            .await?)
     }
 
     pub async fn obtain_lock_raw<'a>(
@@ -583,6 +623,7 @@ impl CloudSyncClient {
         id: &str,
         mode: CloudSyncLockMode,
         allowed_files: Vec<PathBuf>,
+        wine_prefix: Option<PathBuf>,
     ) -> Result<CloudSyncLock, CloudSyncError> {
         let (token, user_id) = acquire_auth(&self.auth).await?;
 
@@ -610,6 +651,7 @@ impl CloudSyncClient {
             lock,
             mode,
             allowed_files,
+            wine_prefix,
         )
         .await?)
     }
@@ -641,6 +683,63 @@ mod tests {
     fn cloudsync_id_falls_back_to_offer_id() {
         assert_eq!(cloudsync_id("123", Some("456"), "Origin.OFR.1"), "123_456");
         assert_eq!(cloudsync_id("123", None, "Origin.OFR.1"), "123_Origin.OFR.1");
+    }
+
+    #[cfg(unix)]
+    mod wine_profile {
+        use super::*;
+
+        fn prefix_with_users(names: &[&str]) -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            for name in names {
+                std::fs::create_dir_all(tmp.path().join("drive_c/users").join(name)).unwrap();
+            }
+            tmp
+        }
+
+        #[test]
+        fn saves_resolve_into_the_prefixs_own_profile() {
+            let crossover = prefix_with_users(&["Public", "crossover"]);
+            let proton = prefix_with_users(&["Public", "steamuser"]);
+
+            let a = substitute_paths("%Documents%/Saves/*.sav", Some(crossover.path())).unwrap();
+            let b = substitute_paths("%SavedGames%/G", Some(proton.path())).unwrap();
+
+            assert_eq!(
+                a,
+                crossover.path().join("drive_c/users/crossover/Documents/Saves/*.sav")
+            );
+            assert_eq!(b, proton.path().join("drive_c/users/steamuser/Saved Games/G"));
+        }
+
+        #[test]
+        fn two_prefixes_never_share_a_profile() {
+            let one = prefix_with_users(&["Public", "crossover"]);
+            let two = prefix_with_users(&["Public", "steamuser"]);
+            assert_ne!(
+                substitute_paths("%Documents%", Some(one.path())).unwrap(),
+                substitute_paths("%Documents%", Some(two.path())).unwrap()
+            );
+        }
+
+        #[test]
+        fn unsubstitute_inverts_substitute() {
+            let prefix = prefix_with_users(&["Public", "crossover"]);
+            let local = substitute_paths("%Documents%/G/save.dat", Some(prefix.path())).unwrap();
+            assert_eq!(
+                unsubstitute_paths(&local, Some(prefix.path())).unwrap(),
+                "%Documents%/G/save.dat"
+            );
+        }
+
+        #[test]
+        fn plain_paths_pass_through() {
+            let prefix = prefix_with_users(&["crossover"]);
+            assert_eq!(
+                substitute_paths("/abs/path", Some(prefix.path())).unwrap(),
+                PathBuf::from("/abs/path")
+            );
+        }
     }
 
     #[tokio::test]
@@ -682,7 +781,9 @@ mod tests {
 
         let client = CloudSyncClient::new(auth);
 
-        let lock = client.obtain_lock(offer, CloudSyncLockMode::Read).await?;
+        let lock = client
+            .obtain_lock(offer, CloudSyncLockMode::Read, None)
+            .await?;
         //lock.sync_read_files().await?;
         lock.release().await?;
         Ok(())
@@ -705,7 +806,9 @@ mod tests {
 
         let client = CloudSyncClient::new(auth);
 
-        let lock = client.obtain_lock(offer, CloudSyncLockMode::Write).await?;
+        let lock = client
+            .obtain_lock(offer, CloudSyncLockMode::Write, None)
+            .await?;
         let res = lock.sync_write_files().await;
         lock.release().await?;
         res?;

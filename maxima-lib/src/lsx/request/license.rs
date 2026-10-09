@@ -42,6 +42,8 @@ pub async fn handle_license_request(
     };
     let content_id = playing.content_id().to_owned();
     let mode = playing.mode();
+    // The hardware identity of the license is that of THIS game's prefix.
+    let wine_prefix = playing.wine_prefix().clone();
 
     let auth = match mode {
         LaunchMode::Offline(_) => {
@@ -54,7 +56,7 @@ pub async fn handle_license_request(
     };
 
     // TODO: how to get version
-    let hw_info = HardwareInfo::new(2);
+    let hw_info = HardwareInfo::new(2, wine_prefix.as_deref());
     let license = request_license(
         &content_id,
         &hw_info.generate_hardware_hash(),

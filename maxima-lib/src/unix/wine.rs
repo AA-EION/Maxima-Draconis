@@ -4,8 +4,9 @@ use std::{
     ffi::OsStr,
     fs::{create_dir_all, remove_dir_all, remove_file, File},
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    time::SystemTime,
 };
 
 use flate2::read::GzDecoder;
@@ -16,7 +17,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::AsyncWriteExt,
     process::Command,
     sync::Mutex,
 };
@@ -68,17 +69,6 @@ struct Versions {
     proton: String,
     eac_runtime: String,
     umu: String,
-}
-
-/// Returns internal prtoton pfx path
-pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
-    // Override to target an existing prefix — on macOS this is how a
-    // CrossOver bottle is selected, e.g.
-    // MAXIMA_WINE_PREFIX="$HOME/Library/Application Support/CrossOver/Bottles/Titanfall 2"
-    if let Ok(prefix) = env::var("MAXIMA_WINE_PREFIX") {
-        return Ok(PathBuf::from(prefix));
-    }
-    Ok(maxima_dir()?.join("wine/prefix"))
 }
 
 /// CrossOver's wine loader on macOS — used as the default wine command
@@ -445,15 +435,19 @@ fn get_wine_release() -> Result<GithubRelease, WineError> {
     release.ok_or(WineError::Fetch)
 }
 
+/// Run `arg` under Wine inside `prefix`. The prefix is always explicit: the
+/// caller resolved it for this one game (see [`super::prefix`]), so two
+/// concurrent commands for different games can never share a selection.
 pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     arg: T,
     args: Option<I>,
     cwd: Option<PathBuf>,
     want_output: bool,
     command_type: CommandType,
+    prefix: &Path,
 ) -> Result<String, NativeError> {
     let proton_path = proton_dir()?;
-    let proton_prefix_path = wine_prefix_dir()?;
+    let proton_prefix_path = prefix.to_path_buf();
     let eac_path = eac_dir()?;
     let umu_bin = umu_bin()?;
 
@@ -603,8 +597,8 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
         warn!("Failed to delete {:?} - {:?}", path, err);
     }
 
-    let _ = run_wine_command("", None::<[&str; 0]>, None, false, CommandType::Run).await;
-
+    // The prefix is initialised by the first command that runs in it, so
+    // there is nothing to warm up here (and no game prefix to warm).
     Ok(())
 }
 
@@ -655,8 +649,8 @@ fn extract_archive<R: Read + Sized>(
 /// `Resume=dword:00000001` in its Uninstall key and adds a RunOnce entry; the
 /// next invocation then tries to resume from the (potentially corrupt) checkpoint
 /// and exits with code 1 instead of installing fresh.
-pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
-    let registry = parse_mx_wine_registry().await?;
+pub async fn cleanup_interrupted_burn_installs(prefix: &Path) -> Result<(), NativeError> {
+    let registry = parse_mx_wine_registry(prefix).await?;
 
     let runonce_prefix_wow =
         "software\\wow6432node\\microsoft\\windows\\currentversion\\runonce\\";
@@ -685,7 +679,6 @@ pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
     }
 
     // Delete state.rsm checkpoint files directly on the host filesystem
-    let prefix = wine_prefix_dir()?;
     for (_, guid) in &to_clean {
         let state_rsm = prefix
             .join("drive_c")
@@ -721,7 +714,8 @@ pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
         }
     }
 
-    let reg_path = maxima_cache_dir()?.join("burn_cleanup.reg");
+    // Unique per call: cleanups for two prefixes can overlap.
+    let reg_path = maxima_cache_dir()?.join(format!("burn_cleanup-{}.reg", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(reg_path.safe_parent()?).await?;
     tokio::fs::write(&reg_path, reg.as_bytes()).await?;
 
@@ -731,11 +725,12 @@ pub async fn cleanup_interrupted_burn_installs() -> Result<(), NativeError> {
         None,
         true,
         CommandType::Run,
+        prefix,
     )
     .await?;
 
     tokio::fs::remove_file(&reg_path).await?;
-    invalidate_mx_wine_registry().await;
+    invalidate_mx_wine_registry(prefix).await;
 
     info!("Cleaned up {} interrupted Burn installation(s)", to_clean.len());
     Ok(())
@@ -753,7 +748,7 @@ fn extract_burn_guid_from_command(command: &str) -> Option<String> {
     }
 }
 
-pub async fn setup_wine_registry() -> Result<(), NativeError> {
+pub async fn setup_wine_registry(prefix: &Path) -> Result<(), NativeError> {
     let mut reg_content = "Windows Registry Editor Version 5.00\n\n".to_string();
     // This supports text values only at the moment
     // if you need a dword - implement it
@@ -835,7 +830,8 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         );
     }
 
-    let path = maxima_cache_dir()?.join("wine.reg");
+    // Unique per call: two prefixes can be set up at the same time.
+    let path = maxima_cache_dir()?.join(format!("wine-{}.reg", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(path.safe_parent()?).await?;
 
     {
@@ -849,34 +845,35 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         None,
         true,
         CommandType::Run,
+        prefix,
     )
     .await?;
 
     tokio::fs::remove_file(path).await?;
+    invalidate_mx_wine_registry(prefix).await;
 
     Ok(())
 }
 
 pub type WineRegistry = HashMap<String, String>;
 
-lazy_static! {
-    static ref MX_WINE_REGISTRY: Mutex<WineRegistry> = Mutex::new(WineRegistry::new());
+struct CachedRegistry {
+    modified: Option<SystemTime>,
+    len: u64,
+    registry: WineRegistry,
 }
 
-async fn parse_wine_registry(file_path: &str) -> WineRegistry {
-    let mut registry_map = MX_WINE_REGISTRY.lock().await;
-    if !registry_map.is_empty() {
-        return registry_map.clone();
-    }
+lazy_static! {
+    /// Parsed `system.reg` per prefix. Keyed by path so two prefixes never
+    /// see each other's registry; entries are re-read when the file changes.
+    static ref MX_WINE_REGISTRY: Mutex<HashMap<PathBuf, CachedRegistry>> = Mutex::new(HashMap::new());
+}
 
-    let file = tokio::fs::File::open(file_path)
-        .await
-        .expect("Could not open file");
-    let reader = BufReader::new(file);
+fn parse_registry_text(text: &str) -> WineRegistry {
+    let mut registry_map = WineRegistry::new();
     let mut current_section = String::new();
 
-    let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await.expect("Failed to read file") {
+    for line in text.lines() {
         let trimmed_line = line.trim();
 
         if trimmed_line.starts_with('[') && trimmed_line.contains(']') {
@@ -894,20 +891,60 @@ async fn parse_wine_registry(file_path: &str) -> WineRegistry {
         }
     }
 
-    registry_map.clone()
+    registry_map
 }
 
-pub async fn parse_mx_wine_registry() -> Result<WineRegistry, NativeError> {
-    let path = wine_prefix_dir()?.join("system.reg");
+async fn parse_wine_registry(file_path: &Path) -> WineRegistry {
+    let mut cache = MX_WINE_REGISTRY.lock().await;
+
+    let meta = tokio::fs::metadata(file_path).await.ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+    if let Some(entry) = cache.get(file_path) {
+        if entry.modified == modified && entry.len == len {
+            return entry.registry.clone();
+        }
+    }
+
+    // A registry that can't be read is "no values", not a panic: the prefix
+    // may be mid-creation or being rewritten by wineserver.
+    let text = match tokio::fs::read(file_path).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) => {
+            warn!("could not read {}: {}", file_path.display(), err);
+            return WineRegistry::new();
+        }
+    };
+
+    let registry = parse_registry_text(&text);
+    cache.insert(
+        file_path.to_path_buf(),
+        CachedRegistry {
+            modified,
+            len,
+            registry: registry.clone(),
+        },
+    );
+    registry
+}
+
+/// The registry of `prefix` (its `system.reg`); empty if it has none yet.
+pub async fn parse_mx_wine_registry(prefix: &Path) -> Result<WineRegistry, NativeError> {
+    let path = prefix.join("system.reg");
     if !path.exists() {
         return Ok(HashMap::new());
     }
 
-    Ok(parse_wine_registry(path.safe_str()?).await)
+    Ok(parse_wine_registry(&path).await)
 }
 
-pub async fn invalidate_mx_wine_registry() {
-    MX_WINE_REGISTRY.lock().await.clear();
+/// Drop the cached registry of one prefix (after something wrote to it).
+pub async fn invalidate_mx_wine_registry(prefix: &Path) {
+    MX_WINE_REGISTRY
+        .lock()
+        .await
+        .remove(&prefix.join("system.reg"));
 }
 
 fn normalize_key(key: &str) -> String {
@@ -921,8 +958,12 @@ fn normalize_key(key: &str) -> String {
     }
 }
 
-pub async fn get_mx_wine_registry_value(query_key: &str) -> Result<Option<String>, RegistryError> {
-    let registry_map = parse_mx_wine_registry().await?;
+/// Look `query_key` up in `prefix`'s registry.
+pub async fn get_mx_wine_registry_value_in(
+    prefix: &Path,
+    query_key: &str,
+) -> Result<Option<String>, RegistryError> {
+    let registry_map = parse_mx_wine_registry(prefix).await?;
     let normalized_query_key = normalize_key(query_key);
 
     let value = if let Some(value) = registry_map.get(&normalized_query_key) {
@@ -934,4 +975,171 @@ pub async fn get_mx_wine_registry_value(query_key: &str) -> Result<Option<String
     };
 
     Ok(value.map(|x| x.replace("Z:", "").replace("\\", "/")))
+}
+
+/// Registry lookup in the [`ambient`](super::prefix::ambient) prefix — for the
+/// shared `util::registry` helpers that have no game context. Anything that
+/// knows which game it is asking about uses
+/// [`get_mx_wine_registry_value_in`].
+pub async fn get_mx_wine_registry_value(query_key: &str) -> Result<Option<String>, RegistryError> {
+    let prefix = super::prefix::ambient()?;
+    get_mx_wine_registry_value_in(&prefix, query_key).await
+}
+
+/// Resolve a manifest-style `[HKLM\...\Value]relative\path` against `prefix`'s
+/// registry, mapping the value to a host path. Mirrors
+/// `util::registry::parse_registry_path` (which is bound to the ambient
+/// prefix); a key that doesn't resolve comes back verbatim.
+pub async fn parse_registry_path_in(prefix: &Path, key: &str) -> Result<PathBuf, RegistryError> {
+    let mut parts = key
+        .split(|c| c == '[' || c == ']')
+        .filter(|s| !s.is_empty());
+
+    if let (Some(first), Some(second)) = (parts.next(), parts.next()) {
+        let path = match get_mx_wine_registry_value_in(prefix, first).await? {
+            Some(path) => path.replace("\\", "/").replace("//", "/"),
+            None => return Ok(PathBuf::from(key.to_owned())),
+        };
+
+        let second = second.replace("\\", "/");
+        let second = second.strip_prefix("/").unwrap_or(&second);
+
+        return Ok([path, second.to_owned()].iter().collect());
+    }
+
+    Ok(super::fs::case_insensitive_path(PathBuf::from(key.to_owned())))
+}
+
+/// Like [`parse_registry_path_in`] but only the registry value (the install
+/// directory), without the trailing relative path.
+pub async fn parse_partial_registry_path_in(
+    prefix: &Path,
+    key: &str,
+) -> Result<PathBuf, RegistryError> {
+    let mut parts = key
+        .split(|c| c == '[' || c == ']')
+        .filter(|s| !s.is_empty());
+
+    if let (Some(first), Some(_second)) = (parts.next(), parts.next()) {
+        let path = match get_mx_wine_registry_value_in(prefix, first).await? {
+            Some(path) => path.replace("\\", "/"),
+            None => return Ok(PathBuf::from(key.to_owned())),
+        };
+
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(super::fs::case_insensitive_path(PathBuf::from(key.to_owned())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real system.reg escaping: doubled backslashes in key names and values.
+    const SYSTEM_REG: &str = r#"WINE REGISTRY Version 2
+;; All keys relative to \\Machine
+
+[Software\\Wow6432Node\\Origin] 1700000000
+#time=1d9
+"InstallSuccessful"="true"
+"ClientPath"="C:\\Windows\\System32\\conhost.exe"
+
+[Software\\Wow6432Node\\EA Games\\Some Game] 1700000001
+"Install Dir"="Z:\\games\\some game\\"
+"#;
+
+    const INSTALL_DIR_KEY: &str =
+        "HKEY_LOCAL_MACHINE\\Software\\EA Games\\Some Game\\Install Dir";
+
+    fn prefix_with_registry(contents: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("system.reg"), contents).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn registry_text_is_keyed_lowercase_by_section_and_name() {
+        let reg = parse_registry_text(SYSTEM_REG);
+        assert_eq!(
+            reg.get("software\\wow6432node\\ea games\\some game\\install dir")
+                .map(String::as_str),
+            Some("Z:\\\\games\\\\some game\\\\")
+        );
+        assert!(reg.contains_key("software\\wow6432node\\origin\\installsuccessful"));
+    }
+
+    #[tokio::test]
+    async fn two_prefixes_do_not_share_registry_state() {
+        let a = prefix_with_registry(SYSTEM_REG);
+        let b = prefix_with_registry(
+            "[Software\\\\Wow6432Node\\\\EA Games\\\\Some Game] 1\n\"Install Dir\"=\"Z:\\\\other\\\\\"\n",
+        );
+
+        let va = get_mx_wine_registry_value_in(a.path(), INSTALL_DIR_KEY).await.unwrap();
+        let vb = get_mx_wine_registry_value_in(b.path(), INSTALL_DIR_KEY).await.unwrap();
+        assert_eq!(va.as_deref(), Some("//games//some game//"));
+        assert_eq!(vb.as_deref(), Some("//other//"));
+    }
+
+    #[tokio::test]
+    async fn cache_follows_the_file() {
+        let a = prefix_with_registry("[Software\\\\Wow6432Node\\\\X] 1\n\"V\"=\"one\"\n");
+        let key = "HKEY_LOCAL_MACHINE\\Software\\X\\V";
+        assert_eq!(
+            get_mx_wine_registry_value_in(a.path(), key).await.unwrap().as_deref(),
+            Some("one")
+        );
+
+        // Different length, so the change is seen even within one mtime tick.
+        std::fs::write(
+            a.path().join("system.reg"),
+            "[Software\\\\Wow6432Node\\\\X] 1\n\"V\"=\"two-two\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            get_mx_wine_registry_value_in(a.path(), key).await.unwrap().as_deref(),
+            Some("two-two")
+        );
+
+        invalidate_mx_wine_registry(a.path()).await;
+        assert_eq!(
+            get_mx_wine_registry_value_in(a.path(), key).await.unwrap().as_deref(),
+            Some("two-two")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_registry_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(parse_mx_wine_registry(tmp.path()).await.unwrap().is_empty());
+        assert_eq!(
+            get_mx_wine_registry_value_in(tmp.path(), "HKEY_LOCAL_MACHINE\\Software\\X\\V")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_path_joins_value_and_relative_part_per_prefix() {
+        let a = prefix_with_registry(SYSTEM_REG);
+        let key = "[HKEY_LOCAL_MACHINE\\SOFTWARE\\EA Games\\Some Game\\Install Dir]bin\\game.exe";
+
+        let path = parse_registry_path_in(a.path(), key).await.unwrap();
+        assert_eq!(path, PathBuf::from("/games/some game/bin/game.exe"));
+
+        let dir = parse_partial_registry_path_in(a.path(), key).await.unwrap();
+        assert_eq!(dir, PathBuf::from("//games//some game//"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_registry_key_comes_back_verbatim() {
+        let a = prefix_with_registry(SYSTEM_REG);
+        let key = "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Nope\\Install Dir]x.exe";
+        assert_eq!(
+            parse_registry_path_in(a.path(), key).await.unwrap(),
+            PathBuf::from(key)
+        );
+    }
 }

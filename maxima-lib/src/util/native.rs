@@ -114,6 +114,8 @@ pub enum NativeError {
     Stringify,
     #[error("could not convert `{0:?}` to a string")]
     StringifyPath(Box<Path>),
+    #[error("`{0}` is not a valid game slug")]
+    InvalidSlug(String),
     #[error("could not get file name from path")]
     FileName,
     #[error("could not get the next path component of `{0}`")]

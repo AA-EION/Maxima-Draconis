@@ -26,6 +26,14 @@ pub struct GameDto {
     pub image_url: Option<String>,
     #[serde(default)]
     pub hero_url: Option<String>,
+    /// The game's install directory from its install record (as opposed to
+    /// `install_path`, which names the executable). Absent when Maxima has
+    /// no record of the install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<String>,
+    /// The Wine prefix recorded for the install (unix hosts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_prefix: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -96,6 +104,21 @@ pub struct BottleInfoDto {
     pub wine_prefix_exists: bool,
     pub default_game_dir: Option<String>,
     pub game_dir_exists: bool,
+    /// Where the prefix came from: `explicit`, `override`, `recorded` or
+    /// `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_source: Option<String>,
+    /// From the game's install record, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<String>,
 }
 
 /// Result of a verify pass over a game's files.
