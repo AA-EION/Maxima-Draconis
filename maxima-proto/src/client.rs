@@ -17,7 +17,8 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
 use crate::instance::{InstanceInfo, PROTO_VERSION};
 use crate::message::{
-    ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage,
+    EntitlementSource, ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
+    ServerMessage,
 };
 use crate::types::{
     BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, StatusDto, UserDto,
@@ -37,6 +38,8 @@ pub struct LaunchParams {
     pub wine_prefix: Option<String>,
     /// Wine DLL overrides, each `dll[,dll]=mode`.
     pub wine_dll_overrides: Vec<String>,
+    pub steam_app_id: Option<String>,
+    pub entitlement_source: Option<EntitlementSource>,
 }
 
 impl Default for LaunchParams {
@@ -47,6 +50,8 @@ impl Default for LaunchParams {
             cloud_saves: true,
             wine_prefix: None,
             wine_dll_overrides: Vec::new(),
+            steam_app_id: None,
+            entitlement_source: None,
         }
     }
 }
@@ -353,6 +358,8 @@ impl MaximaClient {
             cloud_saves: params.cloud_saves,
             wine_prefix: params.wine_prefix,
             wine_dll_overrides: params.wine_dll_overrides,
+            steam_app_id: params.steam_app_id,
+            entitlement_source: params.entitlement_source,
         })
         .await
         .map(|_| ())

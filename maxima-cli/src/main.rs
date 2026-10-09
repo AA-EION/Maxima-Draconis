@@ -48,6 +48,28 @@ lazy_static! {
     static ref MANUAL_LOGIN_PATTERN: Regex = Regex::new(r"^(.*):(.*)$").unwrap();
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum EntitlementArg {
+    Ea,
+    Steam,
+}
+
+impl From<EntitlementArg> for launch::EntitlementSource {
+    fn from(arg: EntitlementArg) -> Self {
+        match arg {
+            EntitlementArg::Ea => Self::Ea,
+            EntitlementArg::Steam => Self::Steam,
+        }
+    }
+}
+
+fn proto_entitlement(source: launch::EntitlementSource) -> maxima_proto::EntitlementSource {
+    match source {
+        launch::EntitlementSource::Ea => maxima_proto::EntitlementSource::Ea,
+        launch::EntitlementSource::Steam => maxima_proto::EntitlementSource::Steam,
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Mode {
     Launch {
@@ -90,6 +112,18 @@ enum Mode {
         /// built-in defaults and `MAXIMA_WINE_DLL_OVERRIDES`.
         #[arg(long = "wine-dll-override", value_name = "SPEC")]
         wine_dll_override: Vec<String>,
+
+        /// Steam App ID exposed to the game (`SteamAppId` / `SteamGameId`);
+        /// also makes the entitlement source Steam unless
+        /// `--entitlement-source` says otherwise. Env: `MAXIMA_STEAM_APP_ID`.
+        #[arg(long)]
+        steam_app_id: Option<String>,
+
+        /// Where the game's entitlement is reported to come from. Defaults to
+        /// `steam` when a Steam App ID is set, else `ea`. Env:
+        /// `MAXIMA_ENTITLEMENT_SOURCE`.
+        #[arg(long, value_enum)]
+        entitlement_source: Option<EntitlementArg>,
 
         /// Emit structured launch lifecycle events as JSONL on stdout
         /// (log output suppressed): `{"event":"launched",...}` once the
@@ -757,6 +791,8 @@ async fn startup(args: Args) -> Result<()> {
             login: None,
             trailing_args,
             wine_dll_override,
+            steam_app_id,
+            entitlement_source,
             json,
             wine_prefix,
         }) => {
@@ -769,6 +805,11 @@ async fn startup(args: Args) -> Result<()> {
                 cloud_saves: true,
                 wine_prefix: wine_prefix.clone(),
                 wine_dll_overrides: wine_dll_override.clone(),
+                steam_app_id: steam_app_id.clone().or_else(launch::steam_app_id_from_env),
+                entitlement_source: entitlement_source
+                    .map(launch::EntitlementSource::from)
+                    .or_else(launch::EntitlementSource::from_env)
+                    .map(proto_entitlement),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -840,6 +881,8 @@ async fn startup(args: Args) -> Result<()> {
             login: Some(login),
             trailing_args,
             wine_dll_override,
+            steam_app_id,
+            entitlement_source,
             json,
             wine_prefix,
         } => {
@@ -851,7 +894,8 @@ async fn startup(args: Args) -> Result<()> {
                 game_path,
                 game_args,
                 Some(login),
-                None,
+                steam_app_id,
+                entitlement_source.map(Into::into),
                 wine_prefix.map(PathBuf::from),
                 wine_dll_override,
                 maxima_arc.clone(),
@@ -996,6 +1040,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         &offer_id,
         None,
         Vec::new(),
+        None,
         None,
         None,
         None,
@@ -1372,6 +1417,7 @@ async fn start_game(
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
@@ -1386,6 +1432,7 @@ async fn start_game(
         game_args,
         login,
         steam_app_id,
+        entitlement_source,
         wine_prefix,
         wine_dll_overrides,
         maxima_arc,
@@ -1423,6 +1470,7 @@ async fn start_game_inner(
     game_args: Vec<String>,
     login: Option<String>,
     steam_app_id: Option<String>,
+    entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
@@ -1458,6 +1506,7 @@ async fn start_game_inner(
         arguments: game_args,
         cloud_saves: true,
         steam_app_id,
+        entitlement_source,
         wine_prefix,
         wine_dll_overrides,
     };

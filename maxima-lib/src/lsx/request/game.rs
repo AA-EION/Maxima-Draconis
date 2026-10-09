@@ -4,6 +4,7 @@ const LANGUAGES: &str =
 //const LANGUAGES: &str = "en_US,es_ES,fr_FR,pt_BR";
 
 use crate::{
+    core::launch::EntitlementSource,
     lsx::{
         connection::LockedConnectionState,
         request::LSXRequestError,
@@ -68,17 +69,15 @@ pub async fn handle_all_game_info_request(
 
     // `EntitlementSource` must agree with `IsSteamSubscriber` in
     // `GetProfileResponse` — a contradiction (e.g. "STEAM" +
-    // IsSteamSubscriber=false) is read as a tamper signal by some games' DRM
-    // stubs. Both are sourced from `ActiveGameContext.steam_app_id`, the
-    // Steam App ID that triggered this launch, if any; anything else is an
-    // EA launch.
-    let (offer, is_steam, installed_language) = {
+    // IsSteamSubscriber=false) can be read as a tamper signal by a game's
+    // DRM stub. Both come from `ActiveGameContext::entitlement_source`.
+    let (offer, entitlement_source, installed_language) = {
         let arc = state.write().await.maxima_arc();
         let maxima = arc.lock().await;
         let playing = maxima.playing().as_ref();
         (
             playing.and_then(|p| p.offer().clone()),
-            playing.is_some_and(|p| p.steam_app_id().is_some()),
+            playing.map_or(EntitlementSource::Ea, |p| p.entitlement_source()),
             maxima.locale().full_str().to_string(),
         )
     };
@@ -119,7 +118,7 @@ pub async fn handle_all_game_info_request(
         attr_Expiration: NEUTRAL_DATE.to_string(),
         attr_UpToDate: true,
         attr_HasExpiration: false,
-        attr_EntitlementSource: if is_steam { "STEAM" } else { "EA" }.to_string(),
+        attr_EntitlementSource: entitlement_source.lsx_tag().to_string(),
         attr_AvailableVersion: available_version,
         attr_DisplayName: display_name,
         attr_FreeTrial: false,

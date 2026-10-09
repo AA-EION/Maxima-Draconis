@@ -23,7 +23,7 @@ use crate::{
         Maxima,
     },
     ooa::{needs_license_update, request_and_save_license, LicenseAuth, LicenseError},
-    steam::lookup_steam_game_by_offer,
+    steam::{lookup_steam_game_by_offer, STEAM_APP_ID_PATTERN},
     util::{
         native::{is_wine_environment, NativeError, SafeParent, SafeStr},
         registry::bootstrap_path,
@@ -85,6 +85,78 @@ pub struct LibraryInjection {
     pub stage: StartupStage,
 }
 
+/// Where the game's entitlement is considered to come from. Reported to the
+/// game through the `EA*Source` environment variables and the LSX
+/// `EntitlementSource` / `IsSteamSubscriber` attributes, which all read it
+/// from [`ActiveGameContext::entitlement_source`] so they cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntitlementSource {
+    Ea,
+    Steam,
+}
+
+impl EntitlementSource {
+    /// Explicit choice if there is one, else Steam when the launch carries a
+    /// Steam App ID, else EA.
+    pub fn resolve(explicit: Option<Self>, steam_app_id: Option<&str>) -> Self {
+        explicit.unwrap_or(if steam_app_id.is_some() {
+            Self::Steam
+        } else {
+            Self::Ea
+        })
+    }
+
+    /// `ea` / `steam`, case-insensitive.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ea" => Some(Self::Ea),
+            "steam" => Some(Self::Steam),
+            _ => None,
+        }
+    }
+
+    /// `MAXIMA_ENTITLEMENT_SOURCE`, if set to a valid value.
+    pub fn from_env() -> Option<Self> {
+        let value = env::var("MAXIMA_ENTITLEMENT_SOURCE").ok()?;
+        let parsed = Self::parse(&value);
+        if parsed.is_none() {
+            warn!(
+                "Ignoring MAXIMA_ENTITLEMENT_SOURCE='{}' (expected 'ea' or 'steam')",
+                value
+            );
+        }
+        parsed
+    }
+
+    /// Value for the `EAEntitlementSource` / `EAExternalSource` /
+    /// `EALaunchOwner` environment variables.
+    pub fn env_tag(self) -> &'static str {
+        match self {
+            Self::Ea => "EA",
+            Self::Steam => "Steam",
+        }
+    }
+
+    /// Value for the LSX `EntitlementSource` attribute.
+    pub fn lsx_tag(self) -> &'static str {
+        match self {
+            Self::Ea => "EA",
+            Self::Steam => "STEAM",
+        }
+    }
+}
+
+/// `MAXIMA_STEAM_APP_ID`, if set to a plausible Steam App ID.
+pub fn steam_app_id_from_env() -> Option<String> {
+    let value = env::var("MAXIMA_STEAM_APP_ID").ok()?;
+    if STEAM_APP_ID_PATTERN.is_match(&value) {
+        Some(value)
+    } else {
+        warn!("Ignoring MAXIMA_STEAM_APP_ID='{}' (expected digits only)", value);
+        None
+    }
+}
+
 pub struct LaunchOptions {
     pub path_override: Option<String>,
     pub arguments: Vec<String>,
@@ -92,13 +164,16 @@ pub struct LaunchOptions {
     /// When set, the game is being launched from Steam context. Steam
     /// emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
     /// expecting the link2ea handler to take over the launch entirely
-    /// (Steam does NOT spawn the exe itself for older EA-on-Steam titles
-    /// like TF2 — it delegates to whatever owns the link2ea protocol).
+    /// (older EA-on-Steam titles delegate to whatever owns the link2ea
+    /// protocol instead of spawning the exe themselves). Falls back to
+    /// `MAXIMA_STEAM_APP_ID`.
     ///
     /// Passing `Some(steam_app_id)` causes `start_game` to:
-    ///   1. Set `EAEntitlementSource` / `EAExternalSource` / `EALaunchOwner`
-    ///      to `"Steam"` instead of `"EA"` so the DRM stub sees a launch
-    ///      context consistent with where it's being run from.
+    ///   1. Report the entitlement source as Steam (unless
+    ///      `entitlement_source` says otherwise): `EAEntitlementSource` /
+    ///      `EAExternalSource` / `EALaunchOwner` become `"Steam"` instead of
+    ///      `"EA"` so the DRM stub sees a launch context consistent with
+    ///      where it's being run from.
     ///   2. Set `SteamAppId` / `SteamGameId` env vars on the spawned game
     ///      (required by the Steam DRM stub — without these the game exits
     ///      immediately with code 100010 "Steam not detected").
@@ -108,11 +183,14 @@ pub struct LaunchOptions {
     /// `None` (the default) is the EA-Desktop-style launch path — env
     /// vars stay `"EA"` and no Steam-specific setup happens.
     ///
-    /// Note: per-game launch args (e.g. `-noOriginStartup` for Northstar,
-    /// `-multiple` for Source-engine titles) are NOT auto-injected. Callers
-    /// who need them pass them via `arguments`, `MAXIMA_LAUNCH_ARGS`, or
-    /// `cmd_params` on the `link2ea://` URL.
+    /// Note: per-game launch args are NOT auto-injected. Callers who need
+    /// them pass them via `arguments`, `MAXIMA_LAUNCH_ARGS`, or `cmd_params`
+    /// on the `link2ea://` URL.
     pub steam_app_id: Option<String>,
+    /// Overrides the entitlement source otherwise derived from
+    /// `steam_app_id` (Steam when set, EA when not). Falls back to
+    /// `MAXIMA_ENTITLEMENT_SOURCE`.
+    pub entitlement_source: Option<EntitlementSource>,
     /// Wine prefix (unix) to run this one game in, overriding both the
     /// `MAXIMA_WINE_PREFIX` setting and the prefix recorded at install time
     /// (see `unix::prefix` for the precedence). `None` lets the platform
@@ -154,14 +232,10 @@ pub struct ActiveGameContext {
     injections: Vec<LibraryInjection>,
     cloud_saves: bool,
     /// The Steam App ID this launch came from, if any. Threaded through
-    /// from `LaunchOptions.steam_app_id` so the LSX request handlers
-    /// (specifically `GetProfile` and `GetAllGameInfo`) can return
-    /// consistent values for `IsSteamSubscriber` / `EntitlementSource`
-    /// without resorting to reading `env::var("SteamAppId")` from the
-    /// serve process (which doesn't have it — those env vars are set
-    /// directly on the spawned game's `Command`, not on the parent).
+    /// from `LaunchOptions.steam_app_id` (the env vars it sets live on the
+    /// spawned game's `Command`, not on this process).
     ///
-    /// `None` means this is an EA-Desktop-style launch (TF2 emitting
+    /// `None` means this is an EA-Desktop-style launch (a game emitting
     /// `link2ea://launchgame/Origin.OFR.…` mid-run, or maxima-cli launch
     /// with an Origin offer ID slug).
     steam_app_id: Option<String>,
@@ -172,6 +246,7 @@ pub struct ActiveGameContext {
     /// license requests over LSX) uses it instead of any process-wide
     /// selection.
     wine_prefix: Option<PathBuf>,
+    entitlement_override: Option<EntitlementSource>,
     process: Child,
     started: bool,
 }
@@ -187,6 +262,7 @@ impl ActiveGameContext {
         steam_app_id: Option<String>,
         slug: Option<String>,
         wine_prefix: Option<PathBuf>,
+        entitlement_override: Option<EntitlementSource>,
         process: Child,
     ) -> Self {
         Self {
@@ -200,9 +276,16 @@ impl ActiveGameContext {
             steam_app_id,
             slug,
             wine_prefix,
+            entitlement_override,
             process,
             started: false,
         }
+    }
+
+    /// The single source of truth for what the game is told about where its
+    /// entitlement comes from.
+    pub fn entitlement_source(&self) -> EntitlementSource {
+        EntitlementSource::resolve(self.entitlement_override, self.steam_app_id.as_deref())
     }
 
     pub fn set_started(&mut self) {
@@ -486,7 +569,12 @@ pub async fn start_game(
         game_args.append(&mut parse_arguments(args.as_str()));
     }
 
-    let is_steam_launch = options.steam_app_id.is_some();
+    let steam_app_id = options.steam_app_id.clone().or_else(steam_app_id_from_env);
+    let entitlement_override = options
+        .entitlement_source
+        .or_else(EntitlementSource::from_env);
+    let source_tag =
+        EntitlementSource::resolve(entitlement_override, steam_app_id.as_deref()).env_tag();
 
     if !bootstrap_path()?.exists() {
         return Err(LaunchError::BootstrapMissing);
@@ -537,12 +625,8 @@ pub async fn start_game(
     let launch_id = Uuid::new_v4().to_string();
 
     // Source / owner / entitlement env vars: "EA" for EA-Desktop-launched
-    // games, "Steam" for games launched via Steam (the user clicked Play in
-    // Steam). When mismatched, TF2 (and likely other EA-on-Steam titles)
-    // throws a "corrupted game files" error because its DRM stub expects
-    // the ownership tag to match its install context.
-    let source_tag = if is_steam_launch { "Steam" } else { "EA" };
-
+    // games, "Steam" for games launched via Steam. Some EA-on-Steam titles'
+    // DRM stubs expect the ownership tag to match their install context.
     child
         .current_dir(PathBuf::from(path).safe_parent()?)
         .env("MXLaunchId", launch_id.to_owned())
@@ -587,7 +671,7 @@ pub async fn start_game(
     // `SteamClientLaunch` and `SteamPath` are normally set by Steam's
     // own runtime; we default-fill them from the parent env (if Steam
     // really did launch us) or to safe constants otherwise.
-    if let Some(ref app_id) = options.steam_app_id {
+    if let Some(ref app_id) = steam_app_id {
         child.env("SteamAppId", app_id).env("SteamGameId", app_id);
         let inherited_client_launch = env::var("SteamClientLaunch").ok();
         child.env(
@@ -660,9 +744,10 @@ pub async fn start_game(
         &content_id,
         offer,
         mode,
-        options.steam_app_id.clone(),
+        steam_app_id,
         slug,
         wine_prefix,
+        entitlement_override,
         child,
     ));
 
@@ -819,5 +904,38 @@ mod wine_prefix_tests {
             parse_arguments(r#"-a "b c" -d"#),
             vec!["-a".to_string(), "b c".to_string(), "-d".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod entitlement_tests {
+    use super::*;
+
+    #[test]
+    fn entitlement_source_resolution() {
+        assert_eq!(EntitlementSource::resolve(None, None), EntitlementSource::Ea);
+        assert_eq!(
+            EntitlementSource::resolve(None, Some("12345")),
+            EntitlementSource::Steam
+        );
+        assert_eq!(
+            EntitlementSource::resolve(Some(EntitlementSource::Ea), Some("12345")),
+            EntitlementSource::Ea
+        );
+        assert_eq!(
+            EntitlementSource::resolve(Some(EntitlementSource::Steam), None),
+            EntitlementSource::Steam
+        );
+    }
+
+    #[test]
+    fn entitlement_source_parsing_and_tags() {
+        assert_eq!(EntitlementSource::parse(" Steam "), Some(EntitlementSource::Steam));
+        assert_eq!(EntitlementSource::parse("EA"), Some(EntitlementSource::Ea));
+        assert_eq!(EntitlementSource::parse("origin"), None);
+        assert_eq!(EntitlementSource::Steam.env_tag(), "Steam");
+        assert_eq!(EntitlementSource::Steam.lsx_tag(), "STEAM");
+        assert_eq!(EntitlementSource::Ea.env_tag(), "EA");
+        assert_eq!(EntitlementSource::Ea.lsx_tag(), "EA");
     }
 }

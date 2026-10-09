@@ -23,7 +23,7 @@ use anyhow::Result;
 use log::{error, info, warn};
 use maxima::core::{
     cloudsync::CloudSyncLockMode,
-    launch::{self, LaunchMode, LaunchOptions},
+    launch::{self, EntitlementSource, LaunchMode, LaunchOptions},
     manifest, LockedMaxima, Maxima, MaximaEvent,
 };
 use maxima::rtm::client::RichPresence;
@@ -472,8 +472,25 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
         Request::GameImages { slug } => {
             game_images(state, &slug).await.map(|i| json!({ "images": i }))
         }
-        Request::Launch { slug, args, exe_override, cloud_saves, wine_prefix, wine_dll_overrides } => cmd_launch(
-            state, slug, args, exe_override, cloud_saves, wine_prefix, wine_dll_overrides,
+        Request::Launch {
+            slug,
+            args,
+            exe_override,
+            cloud_saves,
+            wine_prefix,
+            wine_dll_overrides,
+            steam_app_id,
+            entitlement_source,
+        } => cmd_launch(
+            state,
+            slug,
+            args,
+            exe_override,
+            cloud_saves,
+            wine_prefix,
+            wine_dll_overrides,
+            steam_app_id,
+            entitlement_source,
         )
         .await
         .map(|_| json!({})),
@@ -783,6 +800,8 @@ async fn cmd_launch(
     cloud_saves: bool,
     wine_prefix: Option<String>,
     wine_dll_overrides: Vec<String>,
+    steam_app_id: Option<String>,
+    entitlement_source: Option<maxima_proto::EntitlementSource>,
 ) -> Result<()> {
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
     let prefix = prepare_prefix(&slug, &wine_prefix).await?;
@@ -797,7 +816,11 @@ async fn cmd_launch(
             path_override,
             arguments: args,
             cloud_saves,
-            steam_app_id: None,
+            steam_app_id,
+            entitlement_source: entitlement_source.map(|s| match s {
+                maxima_proto::EntitlementSource::Ea => EntitlementSource::Ea,
+                maxima_proto::EntitlementSource::Steam => EntitlementSource::Steam,
+            }),
             wine_prefix: prefix,
             wine_dll_overrides,
         },
