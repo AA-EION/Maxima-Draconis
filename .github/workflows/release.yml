@@ -52,7 +52,8 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        # The exact nightly pinned in rust-toolchain.toml.
+        run: rustup toolchain install
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
