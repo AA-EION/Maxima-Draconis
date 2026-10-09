@@ -16,7 +16,7 @@ use std::{
 use winapi::{
     shared::windef::HWND,
     um::{
-        libloaderapi::{GetModuleFileNameW, GetModuleHandleW},
+        libloaderapi::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress},
         wincon::GetConsoleWindow,
         winuser::{
             EnumWindows, FindWindowA, GetWindowThreadProcessId, IsWindowVisible,
@@ -322,6 +322,22 @@ pub fn maxima_logs_dir() -> Result<PathBuf, NativeError> {
     let path = maxima_logs_path()?;
     create_dir_all(&path)?;
     Ok(path)
+}
+
+/// Whether Windows code is being executed by a Wine-based runtime. Non-Windows
+/// hosts return `true`, since any Windows game they launch runs under one.
+#[cfg(windows)]
+pub fn is_wine_environment() -> bool {
+    let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    unsafe {
+        let module = GetModuleHandleW(ntdll.as_ptr());
+        !module.is_null() && !GetProcAddress(module, c"wine_get_version".as_ptr()).is_null()
+    }
+}
+
+#[cfg(unix)]
+pub fn is_wine_environment() -> bool {
+    true
 }
 
 #[cfg(unix)]

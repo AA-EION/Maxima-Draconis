@@ -24,6 +24,7 @@ use tokio::{
 use xz2::read::XzDecoder;
 
 use crate::util::{
+    dll_overrides::{requested_wine_dll_overrides, resolve_wine_dll_overrides},
     github::{fetch_github_release, fetch_github_releases, github_download_asset, GithubRelease},
     native::{maxima_cache_dir, maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
     registry::RegistryError,
@@ -83,14 +84,14 @@ pub const CROSSOVER_WINE: &str =
 /// CrossOver owning the process tree. Running wine directly works from a
 /// shell but freezes the game's renderer (blank window right after LSX
 /// GetAllGameInfo) when Maxima itself is a `.app`-launched GUI — the same
-/// failure Draconis solved by delegating to cxstart. Env vars still
+/// failure avoided by delegating to cxstart. Env vars still
 /// propagate into the Windows environment through cxstart (verified).
 #[cfg(target_os = "macos")]
 pub const CROSSOVER_CXSTART: &str =
     "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxstart";
 
-/// posix_spawn with the exact attribute set Draconis's CleanSpawn uses for
-/// its (working) game launches from a `.app`: `POSIX_SPAWN_CLOEXEC_DEFAULT`
+/// posix_spawn with the attribute set that works for game launches from a
+/// `.app`: `POSIX_SPAWN_CLOEXEC_DEFAULT`
 /// + `POSIX_SPAWN_SETSID` + `responsibility_spawnattrs_setdisclaim`, with
 /// /dev/null stdio. The disclaim must be applied at THIS hop: the game
 /// inherits its "responsible process" from cxstart, and disclaiming only an
@@ -141,7 +142,7 @@ fn spawn_disclaimed(
         );
 
         // Private but stable since 10.14; resolved dynamically so a future
-        // macOS removing it degrades gracefully. Same call Draconis makes.
+        // macOS removing it degrades gracefully.
         let disclaim_sym = libc::dlsym(
             libc::RTLD_DEFAULT,
             c"responsibility_spawnattrs_setdisclaim".as_ptr(),
@@ -187,6 +188,7 @@ async fn run_via_cxstart(
     prefix: &std::path::Path,
     exe: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
+    dll_overrides: &str,
 ) -> Result<String, NativeError> {
     let bottle = prefix
         .file_name()
@@ -199,8 +201,12 @@ async fn run_via_cxstart(
         exe, bottle
     );
 
-    let mut cx_args: Vec<std::ffi::OsString> =
-        vec!["--bottle".into(), bottle.clone().into(), exe.clone()];
+    let mut cx_args: Vec<std::ffi::OsString> = vec!["--bottle".into(), bottle.clone().into()];
+    if !dll_overrides.is_empty() {
+        cx_args.push("--env".into());
+        cx_args.push(format!("WINEDLLOVERRIDES={}", dll_overrides).into());
+    }
+    cx_args.push(exe.clone());
     cx_args.extend(args);
 
     let pid = spawn_disclaimed(CROSSOVER_CXSTART, &cx_args)?;
@@ -228,7 +234,7 @@ async fn run_via_cxstart(
     // Detect the game via `pgrep -f`, NOT sysinfo: on macOS sysinfo can't
     // read the command line of wine's (Rosetta-hosted) processes, so a
     // sysinfo scan never sees the game and the poll below always ran out its
-    // full timeout. `pgrep -f <basename>` matches the game (`C:\…\Titanfall2
+    // full timeout. `pgrep -f <basename>` matches the game (`C:\…\game
     // .exe`) and its winewrapper — which exit together — and nothing else
     // (the bootstrap's argv is an opaque base64 blob). It returns exit 0
     // when a match exists, 1 when none.
@@ -242,7 +248,7 @@ async fn run_via_cxstart(
     for tick in 0u32.. {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         // tokio::process (not std) so the poll doesn't block a Tokio worker
-        // while pgrep runs. -i: case-insensitive (proc is "Titanfall2.exe").
+        // while pgrep runs. -i: case-insensitive (proc is "Game.exe").
         let running = tokio::process::Command::new("/usr/bin/pgrep")
             .arg("-if")
             .arg(&needle)
@@ -446,6 +452,20 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     command_type: CommandType,
     prefix: &Path,
 ) -> Result<String, NativeError> {
+    run_wine_command_with_overrides(arg, args, cwd, want_output, command_type, prefix, &[]).await
+}
+
+/// Like [`run_wine_command`], with extra `dll[,dll]=mode` overrides layered on
+/// top of the built-in defaults and `MAXIMA_WINE_DLL_OVERRIDES`.
+pub async fn run_wine_command_with_overrides<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
+    arg: T,
+    args: Option<I>,
+    cwd: Option<PathBuf>,
+    want_output: bool,
+    command_type: CommandType,
+    prefix: &Path,
+    dll_overrides: &[String],
+) -> Result<String, NativeError> {
     let proton_path = proton_dir()?;
     let proton_prefix_path = prefix.to_path_buf();
     let eac_path = eac_dir()?;
@@ -470,7 +490,13 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             })
             .unwrap_or_default();
         let _ = command_type; // cxstart has no verb concept
-        return run_via_cxstart(&proton_prefix_path, exe, arg_vec).await;
+        return run_via_cxstart(
+            &proton_prefix_path,
+            exe,
+            arg_vec,
+            &resolve_wine_dll_overrides(dll_overrides),
+        )
+        .await;
     }
 
     let wine_path = env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| {
@@ -499,11 +525,12 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .arg(arg);
 
     if !wine_path.ends_with("umu-run") {
-        // wsock32 is used as a proxy for Northstar (Titanfall 2). TODO: provide user-facing option for this!
-        child = child.env(
-            "WINEDLLOVERRIDES",
-            "CryptBase,wsock32,bcrypt,dxgi,d3d11,d3d12,d3d12core=n,b;winemenubuilder.exe=d",
-        );
+        child = child.env("WINEDLLOVERRIDES", resolve_wine_dll_overrides(dll_overrides));
+    } else {
+        let requested = requested_wine_dll_overrides(dll_overrides);
+        if !requested.is_empty() {
+            child = child.env("WINEDLLOVERRIDES", requested);
+        }
     }
 
     // CrossOver's wine wrapper selects bottles by name (CX_BOTTLE); derive it
@@ -547,7 +574,7 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     } else {
         // No output wanted → give wine null stdio instead of inheriting.
         // Inherited descriptors from a GUI frontend (JSONL pipes, app fds)
-        // reach the game and confuse wine's macOS driver (TF2 freezes after
+        // reach the game and confuse wine's macOS driver (games can freeze after
         // LSX GetAllGameInfo — see launch.rs bootstrap spawn note), and
         // wine's fixme spam would otherwise pollute a parent's stdout
         // protocol. Wine's own logs (CX_LOG / maxima log files) keep the
@@ -777,7 +804,7 @@ pub async fn setup_wine_registry(prefix: &Path) -> Result<(), NativeError> {
         ),
         // The key Origin-era titles actually read: real Origin is a 32-bit
         // app, so on 64-bit Windows its install info lives at the BARE
-        // Wow6432Node\Origin (no Electronic Arts\ prefix). TF2 shows
+        // Wow6432Node\Origin (no Electronic Arts\ prefix). some games show
         // "Failed to initialize Origin: The Origin installation couldn't be
         // found [a0020008]" without it. Same key the NSIS installer writes
         // (installer/maxima-setup.nsi, SetRegView 64) for the in-bottle flow.

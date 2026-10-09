@@ -291,17 +291,17 @@ mod tests {
     #[test]
     fn roundtrip_keeps_every_field() {
         let tmp = dir();
-        let info = GameInstallInfo::new("/games/tf2".into(), Some("/bottles/Maxima-tf2".into()))
-            .with_offer("Origin.OFR.50.0001456", Some("123"))
+        let info = GameInstallInfo::new("/games/example-game".into(), Some("/bottles/Maxima-example-game".into()))
+            .with_offer("Origin.OFR.50.0000001", Some("123"))
             .with_locale("en_US")
             .with_exclude(vec!["*.bik".into()]);
-        info.save_in(tmp.path(), "titanfall-2").unwrap();
+        info.save_in(tmp.path(), "example-game").unwrap();
 
-        let back = load_from(tmp.path(), "titanfall-2").unwrap();
-        assert_eq!(back.path, PathBuf::from("/games/tf2"));
-        assert_eq!(back.wine_prefix, Some(PathBuf::from("/bottles/Maxima-tf2")));
-        assert_eq!(back.slug.as_deref(), Some("titanfall-2"));
-        assert_eq!(back.offer_id.as_deref(), Some("Origin.OFR.50.0001456"));
+        let back = load_from(tmp.path(), "example-game").unwrap();
+        assert_eq!(back.path, PathBuf::from("/games/example-game"));
+        assert_eq!(back.wine_prefix, Some(PathBuf::from("/bottles/Maxima-example-game")));
+        assert_eq!(back.slug.as_deref(), Some("example-game"));
+        assert_eq!(back.offer_id.as_deref(), Some("Origin.OFR.50.0000001"));
         assert_eq!(back.build_id.as_deref(), Some("123"));
         assert_eq!(back.locale.as_deref(), Some("en_US"));
         assert_eq!(back.exclude, vec!["*.bik".to_string()]);

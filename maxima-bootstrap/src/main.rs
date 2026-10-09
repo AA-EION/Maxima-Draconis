@@ -28,9 +28,9 @@ mod macos;
 /// 1. **EA Origin offer id** — `Origin.OFR.<digits>.<digits>` (e.g.
 ///    `Origin.OFR.50.0002694`). Emitted by EA Desktop and by games launched
 ///    directly outside Steam.
-/// 2. **Pure-numeric Steam App ID** — e.g. `1237970` (Titanfall 2 on Steam).
+/// 2. **Pure-numeric Steam App ID** — e.g. `12345`.
 ///    Emitted by EA-published games when launched from inside Steam, where
-///    the URL looks like `link2ea://launchgame/1237970?platform=steam&theme=tf2`.
+///    the URL looks like `link2ea://launchgame/12345?platform=steam`.
 ///    `maxima-cli`'s exhaustive library lookup resolves these against the
 ///    user's owned games (matching against `product.id`, `offer.content_id`,
 ///    etc., not just the slug).
@@ -107,7 +107,7 @@ fn authorize_endpoint() -> Option<(u16, String)> {
 /// (which starts the server if needed) when none is serving yet.
 ///
 /// The fall-back path preserves the upstream behavior (and the `link2ea`
-/// flow Draconis used before `serve`-mode existed), so this rewrite
+/// flow used before `serve`-mode existed), so this rewrite
 /// doesn't regress users who never type `maxima-cli serve` — they just
 /// don't get the benefit of the always-on auth server.
 ///
@@ -132,7 +132,7 @@ async fn handle_protocol_authorize(
     if let Some((port, token)) = authorize_endpoint() {
         // Forward to the running Maxima. The server will refresh the
         // `.dlf`, set the EA-* env vars, and spawn the game executable
-        // via `launch::start_game` — that's the chain TF2's Origin
+        // via `launch::start_game` — that's the chain a game's Origin
         // DRM stub expects when it emits `link2ea://` and exits.
         let mut url = format!(
             "http://127.0.0.1:{}/authorize?offer_id={}",
@@ -175,7 +175,7 @@ async fn handle_protocol_authorize(
         // Server is alive but rejected the request. Don't fall back to
         // spawning `maxima-cli launch` — that would just re-attempt the
         // same operation through a different code path and produce a
-        // duplicate side-effect (a second TF2 process) without resolving
+        // duplicate side-effect (a second game process) without resolving
         // the underlying problem (not logged in, offer not in library).
         log_event(&format!(
             "Auth server rejected {} authorize for {} ({}, body: {})",
@@ -418,6 +418,24 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     let mut binding = Command::new(&args.path);
     let child = binding.args(&args.args);
 
+    // Inside a Wine prefix, forward only what was explicitly requested; the
+    // bottle keeps its own defaults.
+    if maxima::util::native::is_wine_environment() {
+        let requested = maxima::util::dll_overrides::requested_wine_dll_overrides(
+            &args.wine_dll_overrides,
+        );
+        if !requested.is_empty() {
+            let inherited = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
+            child.env(
+                "WINEDLLOVERRIDES",
+                maxima::util::dll_overrides::merge_dll_overrides([
+                    inherited.as_str(),
+                    requested.as_str(),
+                ]),
+            );
+        }
+    }
+
     let temp_dir = std::env::temp_dir();
     let debug_log = temp_dir.join("maxima_execution.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -448,7 +466,7 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
 async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     use maxima::unix::{
         prefix,
-        wine::{run_wine_command, CommandType},
+        wine::{run_wine_command_with_overrides, CommandType},
     };
 
     // The launcher names the prefix in the payload; a payload from an older
@@ -458,13 +476,14 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
         None => prefix::ambient()?,
     };
 
-    run_wine_command(
+    run_wine_command_with_overrides(
         args.path,
         Some(args.args),
         None,
         false,
         CommandType::WaitForExitAndRun,
         &wine_prefix,
+        &args.wine_dll_overrides,
     )
     .await?;
 

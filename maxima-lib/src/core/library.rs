@@ -103,6 +103,16 @@ pub enum LibraryError {
     NoVersion(String),
 }
 
+/// The last component of a Windows or Unix style path, registry prefix
+/// (`[HKLM\...\Install Dir]\game.exe`) included.
+fn file_name_of(path: &str) -> Option<String> {
+    path.rsplit(['\\', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Getters)]
 pub struct OwnedOffer {
     slug: String,
@@ -220,6 +230,24 @@ impl OwnedOffer {
         } else {
             Err(LibraryError::NoPath(self.slug.clone()))
         }
+    }
+
+    /// The game executable's file name according to the offer's own data:
+    /// the catalog's execute path, else the local installer manifest. Needs
+    /// no install on disk, so it also works for copies EA has no record of.
+    pub async fn exe_file_name(&self) -> Option<String> {
+        if let Some(name) = self
+            .offer
+            .execute_path_override()
+            .as_deref()
+            .and_then(file_name_of)
+        {
+            return Some(name);
+        }
+        self.execute_path(false)
+            .await
+            .ok()
+            .and_then(|path| path.to_str().and_then(file_name_of))
     }
 
     pub async fn installed_version(&self) -> Result<String, LibraryError> {
@@ -692,5 +720,17 @@ mod tests {
             r"[HKEY_LOCAL_MACHINE\SOFTWARE\X\Install Dir]\game.exe"
         )));
         assert!(!is_unresolved_registry_path(Path::new("/games/x")));
+    }
+
+    #[test]
+    fn file_name_of_handles_registry_and_plain_paths() {
+        assert_eq!(
+            file_name_of(r"[HKEY_LOCAL_MACHINE\SOFTWARE\X\Install Dir]\bin\game.exe"),
+            Some("game.exe".to_string())
+        );
+        assert_eq!(file_name_of("/games/x/run.exe"), Some("run.exe".to_string()));
+        assert_eq!(file_name_of("game.exe"), Some("game.exe".to_string()));
+        assert_eq!(file_name_of(r"C:\Games\"), None);
+        assert_eq!(file_name_of(""), None);
     }
 }

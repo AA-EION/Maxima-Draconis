@@ -7,6 +7,7 @@ use crate::core::service_layer::{
     SERVICE_REQUEST_GETMYFRIENDS,
 };
 use crate::{
+    core::launch::EntitlementSource,
     lsx::{
         connection::LockedConnectionState,
         request::LSXRequestError,
@@ -40,24 +41,14 @@ pub async fn handle_profile_request(
     let name = player.unique_name();
     debug!("Got profile for {} {:?}", &name, path);
 
-    // When the game was launched from a Steam context, the user IS a Steam
-    // subscriber for this title — and the EntitlementSource in GetAllGameInfo
-    // also reports "STEAM" so we keep the two consistent here. TF2's DRM stub
-    // treats any contradiction between those two fields (e.g. entitlement
-    // says Steam, profile says "not a Steam subscriber") as a tamper signal
-    // and shows "Engine Error: File corruption detected".
-    //
-    // Read the launch context from `Maxima.playing()` — populated by
-    // `launch::start_game` with `LaunchOptions.steam_app_id`. This used to
-    // read `env::var("SteamAppId")` directly, which worked when maxima-cli
-    // set the env var on its own process, but stopped working once
-    // `launch::start_game` started setting it on the spawned game's Command
-    // only (not the parent serve process where this handler runs).
-    let is_steam_launch = maxima
+    // `IsSteamSubscriber` mirrors the `EntitlementSource` reported by
+    // GetAllGameInfo (both from `ActiveGameContext::entitlement_source`) so
+    // the two never contradict each other. `IsSubscriber` is an EA Play
+    // subscription, which a launch can't tell us anything about.
+    let is_steam_entitlement = maxima
         .playing()
         .as_ref()
-        .and_then(|p| p.steam_app_id().as_ref())
-        .is_some();
+        .is_some_and(|p| p.entitlement_source() == EntitlementSource::Steam);
 
     make_lsx_handler_response!(Response, GetProfileResponse, {
        attr_Persona: name.to_owned(),
@@ -68,8 +59,8 @@ pub async fn handle_profile_request(
        attr_UserId: user.id().parse::<u64>()?,
        attr_GeoCountry: "US".to_string(),
        attr_AvatarId: path.safe_str()?.to_string(),
-       attr_IsSubscriber: is_steam_launch,
-       attr_IsSteamSubscriber: is_steam_launch,
+       attr_IsSubscriber: false,
+       attr_IsSteamSubscriber: is_steam_entitlement,
        attr_PersonaId: player.psd().parse::<u64>()?,
        attr_IsUnderAge: false,
        attr_UserIndex: 0,
@@ -111,8 +102,8 @@ pub async fn handle_set_presence_request(
     let arc = state.write().await.maxima_arc();
     let mut maxima = arc.lock().await;
 
-    // When LSX connects from an externally-launched game (e.g. Steam Northstar
-    // mode), maxima.playing() is None because the game wasn't started through
+    // When LSX connects from an externally-launched game (e.g. started by Steam or
+    // a launcher), maxima.playing() is None because the game wasn't started through
     // maxima-cli. Return a harmless success response so the connection stays
     // alive rather than panicking. (Upstream PR #42 / catornot patch-external-lsx)
     let Some(playing) = maxima.playing().as_ref() else {
@@ -360,8 +351,8 @@ mod presence_tests {
     fn in_game() -> RichPresence {
         RichPresence::new(
             BasicPresence::Online,
-            "Titanfall 2: In the menus".into(),
-            Some("Origin.OFR.50.0001456".into()),
+            "Example Game: In the menus".into(),
+            Some("Origin.OFR.50.0000001".into()),
         )
     }
 
@@ -385,8 +376,8 @@ mod presence_tests {
         assert_eq!(entries[0].attr_UserId, 1);
         assert_eq!(entries[0].attr_Persona, "pilot");
         assert_eq!(entries[0].attr_Presence, LSXPresence::Ingame);
-        assert_eq!(entries[0].attr_RichPresence, "Titanfall 2: In the menus");
-        assert_eq!(entries[0].attr_GamePresence, "Origin.OFR.50.0001456");
+        assert_eq!(entries[0].attr_RichPresence, "Example Game: In the menus");
+        assert_eq!(entries[0].attr_GamePresence, "Origin.OFR.50.0000001");
     }
 
     #[test]

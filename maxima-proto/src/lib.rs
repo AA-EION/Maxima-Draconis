@@ -16,10 +16,11 @@ pub mod instance;
 pub mod message;
 pub mod types;
 
-pub use client::{ClientError, InstallOptions, MaximaClient};
+pub use client::{ClientError, InstallOptions, LaunchParams, MaximaClient};
 pub use instance::{discover, Discovery, InstanceInfo, InstanceState, PROTO_VERSION};
 pub use message::{
-    ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope, ServerMessage,
+    EntitlementSource, ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
+    ServerMessage,
 };
 pub use types::{
     BottleInfoDto, ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, PresenceDto,

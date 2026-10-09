@@ -407,8 +407,8 @@ mod tests {
     fn menu_update() -> PresenceUpdate {
         PresenceUpdate {
             basic: BasicPresence::Online,
-            offer_id: "Origin.OFR.50.0001456".into(),
-            game_title: "Titanfall 2".into(),
+            offer_id: "Origin.OFR.50.0000001".into(),
+            game_title: "Example Game".into(),
             rich_presence: "In the menus".into(),
             ..Default::default()
         }
@@ -420,10 +420,10 @@ mod tests {
         assert_eq!(built.status, "");
         assert_eq!(built.basic_presence_type, BasicPresenceType::Online as i32);
         let rich = built.rich_presence.unwrap();
-        assert_eq!(rich.game, "Titanfall 2: In the menus");
+        assert_eq!(rich.game, "Example Game: In the menus");
         assert_eq!(
             rich.custom_rich_presence_data,
-            r#"{"gameProductId":"Origin.OFR.50.0001456","version":1}"#
+            r#"{"gameProductId":"Origin.OFR.50.0000001","version":1}"#
         );
     }
 
@@ -431,7 +431,7 @@ mod tests {
     fn antelope_dialect_sends_availability_json_and_the_game_name() {
         let built = build_presence_update(RtmDialect::Antelope, &menu_update()).unwrap();
         assert_eq!(built.status, r#"{"presenceavailability":"online"}"#);
-        assert_eq!(built.rich_presence.unwrap().game, "Titanfall 2");
+        assert_eq!(built.rich_presence.unwrap().game, "Example Game");
 
         let bare = PresenceUpdate {
             basic: BasicPresence::Away,
@@ -468,8 +468,8 @@ mod tests {
     fn presence_from_rtm_keeps_game_and_status() {
         let presence = PresenceV1 {
             rich_presence: Some(RichPresenceV1 {
-                game: "Titanfall 2: In the menus".into(),
-                custom_rich_presence_data: r#"{"gameProductId":"Origin.OFR.50.0001456","version":1}"#.into(),
+                game: "Example Game: In the menus".into(),
+                custom_rich_presence_data: r#"{"gameProductId":"Origin.OFR.50.0000001","version":1}"#.into(),
                 ..Default::default()
             }),
             basic_presence_type: BasicPresenceType::Online as i32,
@@ -477,7 +477,7 @@ mod tests {
         };
         let rich = RichPresence::from(&presence);
         assert_eq!(*rich.basic(), BasicPresence::Online);
-        assert_eq!(rich.status(), "Titanfall 2: In the menus");
-        assert_eq!(rich.game().as_deref(), Some("Origin.OFR.50.0001456"));
+        assert_eq!(rich.status(), "Example Game: In the menus");
+        assert_eq!(rich.game().as_deref(), Some("Origin.OFR.50.0000001"));
     }
 }

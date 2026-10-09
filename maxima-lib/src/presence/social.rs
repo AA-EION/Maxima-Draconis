@@ -277,10 +277,10 @@ mod tests {
             true,
             vec![
                 prop_int(KEY_AVAILABILITY, AVAILABILITY_ONLINE),
-                prop_str(KEY_PRODUCT_ID, "Origin.OFR.50.0001456"),
-                prop_str(KEY_GAME_TITLE, "Titanfall 2"),
+                prop_str(KEY_PRODUCT_ID, "Origin.OFR.50.0000001"),
+                prop_str(KEY_GAME_TITLE, "Example Game"),
                 prop_str(KEY_RICH_PRESENCE, "In the menus"),
-                prop_str(KEY_PRESENCE_STATUS, "Titanfall 2 In the menus"),
+                prop_str(KEY_PRESENCE_STATUS, "Example Game In the menus"),
                 prop_str(KEY_MULTIPLAYER_ID, "1039093"),
                 prop_int(KEY_JOINABLE, 1),
                 prop_str("ea_app.somethingNew", "ignored"),
@@ -289,9 +289,9 @@ mod tests {
         let (id, presence) = presence_from_notification(&n).unwrap();
         assert_eq!(id, "1000");
         assert_eq!(*presence.basic(), BasicPresence::Online);
-        assert_eq!(presence.status(), "Titanfall 2 In the menus");
-        assert_eq!(presence.game().as_deref(), Some("Origin.OFR.50.0001456"));
-        assert_eq!(presence.game_title().as_deref(), Some("Titanfall 2"));
+        assert_eq!(presence.status(), "Example Game In the menus");
+        assert_eq!(presence.game().as_deref(), Some("Origin.OFR.50.0000001"));
+        assert_eq!(presence.game_title().as_deref(), Some("Example Game"));
         assert_eq!(presence.multiplayer_id().as_deref(), Some("1039093"));
         assert!(*presence.joinable());
         assert!(!*presence.joinable_invite_only());
@@ -354,8 +354,8 @@ mod tests {
     fn local_update_uses_ea_app_property_keys() {
         let update = PresenceUpdate {
             basic: BasicPresence::Online,
-            offer_id: "Origin.OFR.50.0001456".into(),
-            game_title: "Titanfall 2".into(),
+            offer_id: "Origin.OFR.50.0000001".into(),
+            game_title: "Example Game".into(),
             rich_presence: "In the menus".into(),
             session_id: Some("g-1".into()),
             joinable: true,
@@ -374,11 +374,11 @@ mod tests {
         };
         assert_eq!(
             get(KEY_PRODUCT_ID),
-            Some(ValueKind::StringValue("Origin.OFR.50.0001456".into()))
+            Some(ValueKind::StringValue("Origin.OFR.50.0000001".into()))
         );
         assert_eq!(
             get(KEY_PRESENCE_STATUS),
-            Some(ValueKind::StringValue("Titanfall 2 In the menus".into()))
+            Some(ValueKind::StringValue("Example Game In the menus".into()))
         );
         assert_eq!(get(KEY_JOINABLE), Some(ValueKind::IntegerValue(1)));
         assert_eq!(
@@ -402,7 +402,7 @@ mod tests {
         let original = ConnectToPresenceSessionResponse {
             presence_notification: Some(notification(
                 true,
-                vec![prop_str(KEY_GAME_TITLE, "Titanfall 2")],
+                vec![prop_str(KEY_GAME_TITLE, "Example Game")],
             )),
         };
         let bytes = original.encode_to_vec();
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(decoded, original);
         let (_, presence) =
             presence_from_notification(&decoded.presence_notification.unwrap()).unwrap();
-        assert_eq!(presence.game_title().as_deref(), Some("Titanfall 2"));
+        assert_eq!(presence.game_title().as_deref(), Some("Example Game"));
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
                 token: vec![1, 2, 3],
             }),
             presence_update: Some(proto_update(&PresenceUpdate {
-                offer_id: "Origin.OFR.50.0001456".into(),
+                offer_id: "Origin.OFR.50.0000001".into(),
                 ..Default::default()
             })),
         };
@@ -437,7 +437,7 @@ mod tests {
     fn unknown_fields_such_as_timestamps_are_skipped_on_decode() {
         // PresenceNotification field 3 (lastSeenOnline, a Timestamp we don't
         // model) must not break decoding of the fields we do read.
-        let mut bytes = notification(true, vec![prop_str(KEY_GAME_TITLE, "TF2")]).encode_to_vec();
+        let mut bytes = notification(true, vec![prop_str(KEY_GAME_TITLE, "EG")]).encode_to_vec();
         bytes.extend_from_slice(&[0x1a, 0x02, 0x08, 0x01]);
         let decoded = PresenceNotification::decode(bytes.as_slice()).unwrap();
         assert!(presence_from_notification(&decoded).is_some());

@@ -241,11 +241,11 @@ mod tests {
     #[test]
     fn legacy_status_matches_the_historic_format() {
         let with_title = PresenceUpdate {
-            game_title: "Titanfall 2".into(),
+            game_title: "Example Game".into(),
             rich_presence: "In the menus".into(),
             ..Default::default()
         };
-        assert_eq!(with_title.legacy_status(), "Titanfall 2: In the menus");
+        assert_eq!(with_title.legacy_status(), "Example Game: In the menus");
 
         let bare = PresenceUpdate {
             rich_presence: "Online".into(),

@@ -344,13 +344,13 @@ mod tests {
         client.login_through(&[Legacy], build).await.unwrap();
 
         client
-            .set_presence(BasicPresence::Online, "In the menus", "Origin.OFR.50.0001456")
+            .set_presence(BasicPresence::Online, "In the menus", "Origin.OFR.50.0000001")
             .await
             .unwrap();
         let sent = updates.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].rich_presence, "In the menus");
-        assert_eq!(sent[0].offer_id, "Origin.OFR.50.0001456");
+        assert_eq!(sent[0].offer_id, "Origin.OFR.50.0000001");
 
         // The backend's friend update reached the shared store and stream.
         assert!(client.presence_store().lock().await.get("friend").is_some());

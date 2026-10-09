@@ -1,6 +1,6 @@
 use derive_getters::Getters;
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use quick_xml::DeError;
 use regex::Regex;
 use std::{io::ErrorKind, path::PathBuf, sync::Arc};
@@ -198,13 +198,11 @@ pub struct ConnectionState {
     pid: u32,
     /// Game version reported by the client in the LSX challenge response.
     /// Captured during challenge so subsequent handlers (e.g. GetAllGameInfo)
-    /// can reflect the real version back instead of the hardcoded "0" /
-    /// "1.0.1.3" — TF2 reads InstalledVersion / AvailableVersion to verify
-    /// its install isn't tampered with, and mismatches trigger an "Engine
-    /// Error: File corruption detected" dialog.
+    /// can reflect the real version back; some games compare
+    /// InstalledVersion / AvailableVersion against their own and treat a
+    /// mismatch as a tampered install.
     game_version: Option<String>,
-    /// Title reported by the client in the LSX challenge response (e.g.
-    /// "Titanfall2"). Used for diagnostic output and reflected in
+    /// Title reported by the client in the LSX challenge response. Used for diagnostic output and reflected in
     /// GetAllGameInfoResponse.
     game_title: Option<String>,
     /// Encoded (serialized, encrypted if enabled, NUL-terminated) messages
@@ -240,10 +238,7 @@ impl ConnectionState {
 
     pub fn queue_message(&mut self, message: LSX) -> Result<(), LSXConnectionError> {
         let mut str = quick_xml::se::to_string(&message)?;
-        // Same rationale as the `info!("Received LSX Message: …")` log
-        // above — paired here so the trace shows the request/response
-        // sequence in order.
-        info!("Queuing LSX Message: {}", str);
+        debug!("Queuing LSX Message: {}", str);
 
         if let EncryptionState::Enabled(key) = self.encryption {
             str = simple_encrypt(str.as_bytes(), &key)
@@ -353,15 +348,15 @@ impl Connection {
         let maxima: MutexGuard<'_, Maxima> = maxima_arc.lock().await;
         match maxima.playing() {
             None => {
-                // Game was launched externally (e.g. Steam Northstar mode via
-                // `steam.exe -applaunch 1237970 -northstar`) rather than
-                // through `maxima-cli launch`. Accept the connection anyway —
+                // Game was launched externally (e.g. through Steam's
+                // `applaunch` or a launcher) rather than through
+                // `maxima-cli launch`. Accept the connection anyway —
                 // LSX only needs the TCP socket; the PID/Kyber path is skipped
                 // because there is no ActiveGameContext to interrogate.
                 //
-                // Without this, TF2 + Northstar launched via Steam would have
-                // its LSX connection rejected immediately, preventing online
-                // play even when Maxima is running in the background.
+                // Without this, a game launched via Steam would have its LSX
+                // connection rejected immediately, preventing online play
+                // even when Maxima is running in the background.
                 //
                 // Ported from catornot/Maxima@patch-external-lsx, which itself
                 // originated as upstream PR #42 (p0358).
@@ -510,14 +505,7 @@ impl Connection {
     }
 
     async fn process_message(state: &LockedConnectionState, message: &str) {
-        // Promoted from `debug!` to `info!` so the per-launch LSX trace
-        // is captured in `maxima-cli.log` by default. The XML payload is
-        // typically <500 bytes per message and we receive ~15 messages
-        // per TF2 launch, so the volume is fine. Lets us diagnose exactly
-        // which LSX request TF2 sends last before disconnecting (the
-        // "File corruption" symptom kills the connection mid-flow and
-        // the last successful request tells us where to look next).
-        info!("Received LSX Message: {}", message);
+        debug!("Received LSX Message: {}", message);
 
         let cleaned = message.replace("version=\"\" ", "");
         let lsx_message: LSX = match quick_xml::de::from_str(cleaned.as_str()) {

@@ -56,7 +56,9 @@ pub async fn start_game_request(
             // receives a Steam App ID. Steam-Play handoffs come through
             // `link2ea://` to the bootstrap, not the UI's Play button.
             steam_app_id: None,
+            entitlement_source: None,
             wine_prefix,
+            wine_dll_overrides: Vec::new(),
         },
     )
     .await

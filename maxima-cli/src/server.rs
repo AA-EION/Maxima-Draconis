@@ -154,7 +154,7 @@ pub async fn forward_streaming(request: Request, terminal: &[&str], json_out: bo
 // Pure-client command runners. Each ensures a server is up (spawning
 // `maxima-server` if needed) and forwards the request — the CLI holds no
 // session of its own. Streaming commands translate the server's proto
-// notifications back into the exact JSONL shapes consumers (Draconis) expect.
+// notifications back into the exact JSONL shapes consumers expect.
 // ---------------------------------------------------------------------------
 
 pub async fn run_list_games(json: bool) -> Result<()> {

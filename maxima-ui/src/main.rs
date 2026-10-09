@@ -112,7 +112,7 @@ struct Args {
     /// External-command: on startup, log in (if not already) then
     /// auto-queue an install of this game slug. The UI navigates to
     /// the Downloads view so the user sees progress. Used by external
-    /// launchers (e.g. Draconis) that want to drive a headless-feel
+    /// launchers that want to drive a headless-feel
     /// install without the user manually clicking through the library.
     ///
     /// Requires `--install-path`. The slug is resolved against the

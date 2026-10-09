@@ -655,8 +655,8 @@ mod tests {
             Some(r"SOFTWARE\WOW6432Node\Origin")
         );
         assert_eq!(
-            wow6432_variant(r"Software\Respawn\Titanfall2").as_deref(),
-            Some(r"Software\WOW6432Node\Respawn\Titanfall2")
+            wow6432_variant(r"Software\Vendor\Game").as_deref(),
+            Some(r"Software\WOW6432Node\Vendor\Game")
         );
         assert_eq!(wow6432_variant(r"SOFTWARE\Wow6432Node\Origin"), None);
         assert_eq!(wow6432_variant(r"SYSTEM\CurrentControlSet"), None);

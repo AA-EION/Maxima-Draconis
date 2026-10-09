@@ -18,6 +18,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Where a launched game's entitlement is reported to come from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EntitlementSource {
+    Ea,
+    Steam,
+}
+
 /// A client → server request. `cmd` is the tag; per-command fields sit
 /// alongside it. Wrapped in [`RequestEnvelope`] to carry the correlation id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -55,6 +63,16 @@ pub enum Request {
         /// game's own. Omitted = the server picks per game.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wine_prefix: Option<String>,
+        /// Extra Wine DLL overrides for this launch, each `dll[,dll]=mode`.
+        #[serde(default)]
+        wine_dll_overrides: Vec<String>,
+        /// Steam App ID to expose to the game (`SteamAppId` / `SteamGameId`).
+        #[serde(default)]
+        steam_app_id: Option<String>,
+        /// Overrides the entitlement source otherwise derived from
+        /// `steam_app_id` (Steam when set, EA when not).
+        #[serde(default)]
+        entitlement_source: Option<EntitlementSource>,
     },
     Install {
         slug: String,
@@ -270,18 +288,49 @@ mod tests {
         let env = RequestEnvelope {
             id: 7,
             request: Request::Launch {
-                slug: "titanfall-2".into(),
-                args: vec!["-northstar".into()],
+                slug: "example-game".into(),
+                args: vec!["--flag".into()],
                 exe_override: None,
                 cloud_saves: true,
                 wine_prefix: None,
+                wine_dll_overrides: vec!["wsock32=n,b".into()],
+                steam_app_id: Some("12345".into()),
+                entitlement_source: Some(EntitlementSource::Steam),
             },
         };
         let s = serde_json::to_string(&env).unwrap();
         // id + flattened tagged command, matching the historical wire.
         assert!(s.contains("\"id\":7"));
         assert!(s.contains("\"cmd\":\"launch\""));
-        assert!(s.contains("\"slug\":\"titanfall-2\""));
+        assert!(s.contains("\"slug\":\"example-game\""));
+        assert!(s.contains("\"wine_dll_overrides\":[\"wsock32=n,b\"]"));
+        assert!(s.contains("\"steam_app_id\":\"12345\""));
+        assert!(s.contains("\"entitlement_source\":\"steam\""));
+    }
+
+    #[test]
+    fn launch_optional_fields_default() {
+        let req: RequestEnvelope =
+            serde_json::from_str(r#"{"id":1,"cmd":"launch","slug":"example-game"}"#).unwrap();
+        match req.request {
+            Request::Launch {
+                args,
+                exe_override,
+                cloud_saves,
+                wine_dll_overrides,
+                steam_app_id,
+                entitlement_source,
+                ..
+            } => {
+                assert!(args.is_empty());
+                assert!(exe_override.is_none());
+                assert!(cloud_saves);
+                assert!(wine_dll_overrides.is_empty());
+                assert!(steam_app_id.is_none());
+                assert!(entitlement_source.is_none());
+            }
+            _ => panic!("expected launch"),
+        }
     }
 
     #[test]
