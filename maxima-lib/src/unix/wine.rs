@@ -24,6 +24,7 @@ use tokio::{
 use xz2::read::XzDecoder;
 
 use crate::util::{
+    dll_overrides::{requested_wine_dll_overrides, resolve_wine_dll_overrides},
     github::{fetch_github_release, fetch_github_releases, github_download_asset, GithubRelease},
     native::{maxima_cache_dir, maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
     registry::RegistryError,
@@ -187,6 +188,7 @@ async fn run_via_cxstart(
     prefix: &std::path::Path,
     exe: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
+    dll_overrides: &str,
 ) -> Result<String, NativeError> {
     let bottle = prefix
         .file_name()
@@ -199,8 +201,12 @@ async fn run_via_cxstart(
         exe, bottle
     );
 
-    let mut cx_args: Vec<std::ffi::OsString> =
-        vec!["--bottle".into(), bottle.clone().into(), exe.clone()];
+    let mut cx_args: Vec<std::ffi::OsString> = vec!["--bottle".into(), bottle.clone().into()];
+    if !dll_overrides.is_empty() {
+        cx_args.push("--env".into());
+        cx_args.push(format!("WINEDLLOVERRIDES={}", dll_overrides).into());
+    }
+    cx_args.push(exe.clone());
     cx_args.extend(args);
 
     let pid = spawn_disclaimed(CROSSOVER_CXSTART, &cx_args)?;
@@ -446,6 +452,20 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     command_type: CommandType,
     prefix: &Path,
 ) -> Result<String, NativeError> {
+    run_wine_command_with_overrides(arg, args, cwd, want_output, command_type, prefix, &[]).await
+}
+
+/// Like [`run_wine_command`], with extra `dll[,dll]=mode` overrides layered on
+/// top of the built-in defaults and `MAXIMA_WINE_DLL_OVERRIDES`.
+pub async fn run_wine_command_with_overrides<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
+    arg: T,
+    args: Option<I>,
+    cwd: Option<PathBuf>,
+    want_output: bool,
+    command_type: CommandType,
+    prefix: &Path,
+    dll_overrides: &[String],
+) -> Result<String, NativeError> {
     let proton_path = proton_dir()?;
     let proton_prefix_path = prefix.to_path_buf();
     let eac_path = eac_dir()?;
@@ -470,7 +490,13 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             })
             .unwrap_or_default();
         let _ = command_type; // cxstart has no verb concept
-        return run_via_cxstart(&proton_prefix_path, exe, arg_vec).await;
+        return run_via_cxstart(
+            &proton_prefix_path,
+            exe,
+            arg_vec,
+            &resolve_wine_dll_overrides(dll_overrides),
+        )
+        .await;
     }
 
     let wine_path = env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| {
@@ -499,11 +525,12 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .arg(arg);
 
     if !wine_path.ends_with("umu-run") {
-        // wsock32 is used as a proxy for Northstar (Titanfall 2). TODO: provide user-facing option for this!
-        child = child.env(
-            "WINEDLLOVERRIDES",
-            "CryptBase,wsock32,bcrypt,dxgi,d3d11,d3d12,d3d12core=n,b;winemenubuilder.exe=d",
-        );
+        child = child.env("WINEDLLOVERRIDES", resolve_wine_dll_overrides(dll_overrides));
+    } else {
+        let requested = requested_wine_dll_overrides(dll_overrides);
+        if !requested.is_empty() {
+            child = child.env("WINEDLLOVERRIDES", requested);
+        }
     }
 
     // CrossOver's wine wrapper selects bottles by name (CX_BOTTLE); derive it

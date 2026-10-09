@@ -472,8 +472,8 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
         Request::GameImages { slug } => {
             game_images(state, &slug).await.map(|i| json!({ "images": i }))
         }
-        Request::Launch { slug, args, exe_override, cloud_saves, wine_prefix } => cmd_launch(
-            state, slug, args, exe_override, cloud_saves, wine_prefix,
+        Request::Launch { slug, args, exe_override, cloud_saves, wine_prefix, wine_dll_overrides } => cmd_launch(
+            state, slug, args, exe_override, cloud_saves, wine_prefix, wine_dll_overrides,
         )
         .await
         .map(|_| json!({})),
@@ -782,6 +782,7 @@ async fn cmd_launch(
     exe_override: Option<String>,
     cloud_saves: bool,
     wine_prefix: Option<String>,
+    wine_dll_overrides: Vec<String>,
 ) -> Result<()> {
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
     let prefix = prepare_prefix(&slug, &wine_prefix).await?;
@@ -798,6 +799,7 @@ async fn cmd_launch(
             cloud_saves,
             steam_app_id: None,
             wine_prefix: prefix,
+            wine_dll_overrides,
         },
     )
     .await?;

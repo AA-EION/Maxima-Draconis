@@ -27,6 +27,30 @@ use crate::types::{
 /// surgical installs) wait for as long as the connection stays up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Options for [`MaximaClient::launch_with`].
+#[derive(Debug, Clone)]
+pub struct LaunchParams {
+    pub args: Vec<String>,
+    pub exe_override: Option<String>,
+    pub cloud_saves: bool,
+    /// Wine prefix (unix hosts); omitted = the server picks per game.
+    pub wine_prefix: Option<String>,
+    /// Wine DLL overrides, each `dll[,dll]=mode`.
+    pub wine_dll_overrides: Vec<String>,
+}
+
+impl Default for LaunchParams {
+    fn default() -> Self {
+        Self {
+            args: Vec::new(),
+            exe_override: None,
+            cloud_saves: true,
+            wine_prefix: None,
+            wine_dll_overrides: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("i/o: {0}")]
@@ -297,7 +321,11 @@ impl MaximaClient {
         exe_override: Option<String>,
         cloud_saves: bool,
     ) -> Result<(), ClientError> {
-        self.launch_in(slug, args, exe_override, cloud_saves, None).await
+        self.launch_with(
+            slug,
+            LaunchParams { args, exe_override, cloud_saves, ..Default::default() },
+        )
+        .await
     }
 
     /// [`launch`](Self::launch) in an explicit Wine prefix (unix hosts).
@@ -309,12 +337,22 @@ impl MaximaClient {
         cloud_saves: bool,
         wine_prefix: Option<String>,
     ) -> Result<(), ClientError> {
+        self.launch_with(
+            slug,
+            LaunchParams { args, exe_override, cloud_saves, wine_prefix, ..Default::default() },
+        )
+        .await
+    }
+
+    /// Launch with the full option set.
+    pub async fn launch_with(&self, slug: &str, params: LaunchParams) -> Result<(), ClientError> {
         self.request(Request::Launch {
             slug: slug.to_owned(),
-            args,
-            exe_override,
-            cloud_saves,
-            wine_prefix,
+            args: params.args,
+            exe_override: params.exe_override,
+            cloud_saves: params.cloud_saves,
+            wine_prefix: params.wine_prefix,
+            wine_dll_overrides: params.wine_dll_overrides,
         })
         .await
         .map(|_| ())

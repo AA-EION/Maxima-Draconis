@@ -57,6 +57,7 @@ pub async fn start_game_request(
             // `link2ea://` to the bootstrap, not the UI's Play button.
             steam_app_id: None,
             wine_prefix,
+            wine_dll_overrides: Vec::new(),
         },
     )
     .await

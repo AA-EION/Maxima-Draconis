@@ -55,6 +55,9 @@ pub enum Request {
         /// game's own. Omitted = the server picks per game.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wine_prefix: Option<String>,
+        /// Extra Wine DLL overrides for this launch, each `dll[,dll]=mode`.
+        #[serde(default)]
+        wine_dll_overrides: Vec<String>,
     },
     Install {
         slug: String,
@@ -270,18 +273,35 @@ mod tests {
         let env = RequestEnvelope {
             id: 7,
             request: Request::Launch {
-                slug: "titanfall-2".into(),
-                args: vec!["-northstar".into()],
+                slug: "example-game".into(),
+                args: vec!["--flag".into()],
                 exe_override: None,
                 cloud_saves: true,
                 wine_prefix: None,
+                wine_dll_overrides: vec!["wsock32=n,b".into()],
             },
         };
         let s = serde_json::to_string(&env).unwrap();
         // id + flattened tagged command, matching the historical wire.
         assert!(s.contains("\"id\":7"));
         assert!(s.contains("\"cmd\":\"launch\""));
-        assert!(s.contains("\"slug\":\"titanfall-2\""));
+        assert!(s.contains("\"slug\":\"example-game\""));
+        assert!(s.contains("\"wine_dll_overrides\":[\"wsock32=n,b\"]"));
+    }
+
+    #[test]
+    fn launch_optional_fields_default() {
+        let req: RequestEnvelope =
+            serde_json::from_str(r#"{"id":1,"cmd":"launch","slug":"example-game"}"#).unwrap();
+        match req.request {
+            Request::Launch { args, exe_override, cloud_saves, wine_dll_overrides, .. } => {
+                assert!(args.is_empty());
+                assert!(exe_override.is_none());
+                assert!(cloud_saves);
+                assert!(wine_dll_overrides.is_empty());
+            }
+            _ => panic!("expected launch"),
+        }
     }
 
     #[test]

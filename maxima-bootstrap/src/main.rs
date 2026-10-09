@@ -418,6 +418,24 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     let mut binding = Command::new(&args.path);
     let child = binding.args(&args.args);
 
+    // Inside a Wine prefix, forward only what was explicitly requested; the
+    // bottle keeps its own defaults.
+    if maxima::util::native::is_wine_environment() {
+        let requested = maxima::util::dll_overrides::requested_wine_dll_overrides(
+            &args.wine_dll_overrides,
+        );
+        if !requested.is_empty() {
+            let inherited = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
+            child.env(
+                "WINEDLLOVERRIDES",
+                maxima::util::dll_overrides::merge_dll_overrides([
+                    inherited.as_str(),
+                    requested.as_str(),
+                ]),
+            );
+        }
+    }
+
     let temp_dir = std::env::temp_dir();
     let debug_log = temp_dir.join("maxima_execution.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -448,7 +466,7 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
 async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     use maxima::unix::{
         prefix,
-        wine::{run_wine_command, CommandType},
+        wine::{run_wine_command_with_overrides, CommandType},
     };
 
     // The launcher names the prefix in the payload; a payload from an older
@@ -458,13 +476,14 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
         None => prefix::ambient()?,
     };
 
-    run_wine_command(
+    run_wine_command_with_overrides(
         args.path,
         Some(args.args),
         None,
         false,
         CommandType::WaitForExitAndRun,
         &wine_prefix,
+        &args.wine_dll_overrides,
     )
     .await?;
 

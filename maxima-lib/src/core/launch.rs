@@ -118,6 +118,10 @@ pub struct LaunchOptions {
     /// (see `unix::prefix` for the precedence). `None` lets the platform
     /// pick per game. Ignored on Windows.
     pub wine_prefix: Option<PathBuf>,
+    /// Extra Wine DLL overrides for this launch, each `dll[,dll]=mode`
+    /// (e.g. `wsock32=n,b`), layered on top of the built-in defaults and
+    /// `MAXIMA_WINE_DLL_OVERRIDES`. Ignored by hosts that don't use Wine.
+    pub wine_dll_overrides: Vec<String>,
 }
 
 pub enum LaunchMode {
@@ -219,6 +223,8 @@ pub struct BootstrapLaunchArgs {
     /// to its ambient prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_prefix: Option<String>,
+    #[serde(default)]
+    pub wine_dll_overrides: Vec<String>,
 }
 
 impl Display for LaunchMode {
@@ -521,6 +527,7 @@ pub async fn start_game(
         wine_prefix: wine_prefix
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+        wine_dll_overrides: options.wine_dll_overrides.clone(),
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&bootstrap_args)?);
@@ -796,6 +803,7 @@ mod wine_prefix_tests {
             path: "game.exe".into(),
             args: vec![],
             wine_prefix: Some("/prefixes/a".into()),
+            wine_dll_overrides: vec![],
         };
         let json = serde_json::to_string(&with).unwrap();
         let back: BootstrapLaunchArgs = serde_json::from_str(&json).unwrap();

@@ -85,6 +85,12 @@ enum Mode {
         #[arg(last = true)]
         trailing_args: Vec<String>,
 
+        /// Wine DLL override for this launch, `dll[,dll]=mode` (repeatable),
+        /// e.g. `--wine-dll-override wsock32=n,b`. Layered on top of the
+        /// built-in defaults and `MAXIMA_WINE_DLL_OVERRIDES`.
+        #[arg(long = "wine-dll-override", value_name = "SPEC")]
+        wine_dll_override: Vec<String>,
+
         /// Emit structured launch lifecycle events as JSONL on stdout
         /// (log output suppressed): `{"event":"launched",...}` once the
         /// game process is spawned, `{"event":"exited","elapsed_secs":…}`
@@ -750,6 +756,7 @@ async fn startup(args: Args) -> Result<()> {
             game_args,
             login: None,
             trailing_args,
+            wine_dll_override,
             json,
             wine_prefix,
         }) => {
@@ -761,6 +768,7 @@ async fn startup(args: Args) -> Result<()> {
                 exe_override: game_path.clone(),
                 cloud_saves: true,
                 wine_prefix: wine_prefix.clone(),
+                wine_dll_overrides: wine_dll_override.clone(),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -831,6 +839,7 @@ async fn startup(args: Args) -> Result<()> {
             game_args,
             login: Some(login),
             trailing_args,
+            wine_dll_override,
             json,
             wine_prefix,
         } => {
@@ -844,6 +853,7 @@ async fn startup(args: Args) -> Result<()> {
                 Some(login),
                 None,
                 wine_prefix.map(PathBuf::from),
+                wine_dll_override,
                 maxima_arc.clone(),
                 json,
             )
@@ -982,7 +992,18 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         game.base_offer().offer_id().to_owned()
     };
 
-    start_game(&offer_id, None, Vec::new(), None, None, None, maxima_arc.clone(), false).await?;
+    start_game(
+        &offer_id,
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        maxima_arc.clone(),
+        false,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1352,6 +1373,7 @@ async fn start_game(
     login: Option<String>,
     steam_app_id: Option<String>,
     wine_prefix: Option<PathBuf>,
+    wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1365,6 +1387,7 @@ async fn start_game(
         login,
         steam_app_id,
         wine_prefix,
+        wine_dll_overrides,
         maxima_arc,
         json,
     )
@@ -1401,6 +1424,7 @@ async fn start_game_inner(
     login: Option<String>,
     steam_app_id: Option<String>,
     wine_prefix: Option<PathBuf>,
+    wine_dll_overrides: Vec<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1435,6 +1459,7 @@ async fn start_game_inner(
         cloud_saves: true,
         steam_app_id,
         wine_prefix,
+        wine_dll_overrides,
     };
 
     if login.is_none() {

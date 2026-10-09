@@ -399,6 +399,7 @@ async fn handle_authorize(
         // The game's own prefix (recorded at install, else its per-game
         // default) is picked inside `start_game`.
         wine_prefix: None,
+        wine_dll_overrides: Vec::new(),
     };
 
     // Phase 3: hand off to the upstream launch flow. This refreshes the
