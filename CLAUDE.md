@@ -1017,7 +1017,7 @@ When TF2 emits `link2ea://`, bootstrap forwards to the running `serve` and exits
 
 History of significant changes since this fork was forked. Not a substitute for `git log` but useful for "when did X land" questions.
 
-### 2026-10-09 — the server does everything; one macOS app
+### 2026-10-09 — v0.16.0: the server does everything; one macOS app
 
 - **Login through the server** — clients send `login` (proto v3); the server runs the OAuth flow and broadcasts `ready` or `login-failed`. It no longer opens the browser by itself at startup. CLI / TUI call `login_and_await_ready`.
 - **Download queue on the server** — `install` joins the content manager's queue instead of preempting; `download-queue` / `cancel-install` / `pause-install` / `resume-install` / `move-install-to-top` RPCs (`maxima-cli downloads [cancel|pause|resume|top]`); `download-queue` events carry `paused`; `install-progress` carries `bytes` / `bytes_total`; cancelling the running download starts the next. `install` answers with the canonical slug so `maxima-cli install` only follows its own game.
