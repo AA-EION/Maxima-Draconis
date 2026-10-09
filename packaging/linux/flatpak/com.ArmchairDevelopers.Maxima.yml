@@ -42,7 +42,6 @@ finish-args:
   # Skip the binaries' own maxima-<scheme>.desktop registration (it would write
   # to the sandbox, not the host) and the host-handler check that goes with it.
   - --env=MAXIMA_PACKAGED=1
-  - --env=MAXIMA_DISABLE_QRC=1
 
 build-options:
   append-path: /usr/lib/sdk/rust-nightly/bin

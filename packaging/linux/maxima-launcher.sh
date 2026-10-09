@@ -30,12 +30,10 @@ else
 fi
 
 export PATH="$BIN:$PATH"
-# The .desktop file shipped in the AppImage already declares the URL scheme
+# The .desktop file shipped in the package already declares the URL scheme
 # handlers. Keep the binaries from writing their own maxima-<scheme>.desktop
-# files (they would point at a temporary /tmp/.mount_* path) and from warning
-# on every start that the differently named handler is missing.
+# files, which would point at a temporary /tmp/.mount_* path.
 export MAXIMA_PACKAGED=1
-export MAXIMA_DISABLE_QRC=1
 
 APP_ID="com.ArmchairDevelopers.Maxima"
 SCHEMES="x-scheme-handler/link2ea x-scheme-handler/origin2 x-scheme-handler/qrc"

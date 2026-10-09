@@ -92,8 +92,8 @@ with `Exec=... %u`, the same scheme handlers `maxima-lib` registers itself
 `Exec=<maxima-bootstrap> %u`, see `register_custom_protocol` in
 `maxima-lib/src/util/registry.rs`). Because an AppImage path is not stable, the
 launcher sets `MAXIMA_PACKAGED=1` (skip that self-registration, the existing
-switch for packaged builds) and `MAXIMA_DISABLE_QRC=1` (skip the check that
-looks for a handler literally named `maxima-qrc.desktop`).
+switch for packaged builds). The startup handler check accepts either
+`maxima-qrc.desktop` or the package's `com.ArmchairDevelopers.Maxima.desktop`.
 
 The handlers become active when the AppImage is integrated by AppImageLauncher /
 appimaged, or by hand:
@@ -131,7 +131,7 @@ vendored sources and `cargo --offline`. For publishing, replace the local
 
 Permissions (`finish-args`): `--share=network` (EA, CDN; the loopback services
 are covered by it), `--filesystem=~/Games:create` for downloads, and the
-`MAXIMA_PACKAGED`/`MAXIMA_DISABLE_QRC` environment. Settings, tokens and the
+`MAXIMA_PACKAGED=1` environment. Settings, tokens and the
 cache live in the sandbox's own `~/.var/app/com.ArmchairDevelopers.Maxima`
 directories, which need no permission. URL scheme handling comes from the
 exported `.desktop` file, and the login page is opened through the OpenURI

@@ -592,13 +592,12 @@ fn verify_protocol_handler(protocol: &str) -> Result<bool, RegistryError> {
         return Err(RegistryError::XdgQueryFailed);
     }
 
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    if output_str.is_empty() {
-        return Ok(false);
-    }
-
-    let expected = format!("maxima-{}.desktop\n", protocol);
-    Ok(output_str == expected)
+    // Either the per-scheme file Maxima writes itself, or the single desktop
+    // file the AppImage/Flatpak packages ship for all three schemes.
+    let handler = String::from_utf8_lossy(&output.stdout);
+    let handler = handler.trim();
+    Ok(handler == format!("maxima-{protocol}.desktop")
+        || handler == format!("{}.desktop", crate::util::native::APP_ID))
 }
 
 #[cfg(target_os = "macos")]
