@@ -69,7 +69,7 @@ jobs:
         # accesskit_unix → zbus → async-io), so Windows compiles cleanly.
         # NSIS pulls maxima-tui.exe and maxima.exe in via `File /nonfatal`,
         # so users get the complete app — the UI is wired up for future use
-        # even if Draconis currently invokes only the CLI side.
+        # even if consumers currently invoke only the CLI side.
         run: cargo build --release
 
       - name: Install NSIS

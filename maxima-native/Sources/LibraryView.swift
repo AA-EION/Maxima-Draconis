@@ -183,7 +183,7 @@ struct GameSettingsSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Launch arguments")
                     .font(.callout)
-                TextField("-novid -northstar …", text: $settings.launchArgs)
+                TextField("--flag …", text: $settings.launchArgs)
                     .textFieldStyle(.roundedBorder)
                 Text("Passed to the game verbatim, space-separated.")
                     .font(.caption)

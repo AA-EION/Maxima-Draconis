@@ -102,8 +102,8 @@ pub async fn handle_set_presence_request(
     let arc = state.write().await.maxima_arc();
     let mut maxima = arc.lock().await;
 
-    // When LSX connects from an externally-launched game (e.g. Steam Northstar
-    // mode), maxima.playing() is None because the game wasn't started through
+    // When LSX connects from an externally-launched game (e.g. started by Steam or
+    // a launcher), maxima.playing() is None because the game wasn't started through
     // maxima-cli. Return a harmless success response so the connection stays
     // alive rather than panicking. (Upstream PR #42 / catornot patch-external-lsx)
     let Some(playing) = maxima.playing().as_ref() else {
@@ -351,8 +351,8 @@ mod presence_tests {
     fn in_game() -> RichPresence {
         RichPresence::new(
             BasicPresence::Online,
-            "Titanfall 2: In the menus".into(),
-            Some("Origin.OFR.50.0001456".into()),
+            "Example Game: In the menus".into(),
+            Some("Origin.OFR.50.0000001".into()),
         )
     }
 
@@ -376,8 +376,8 @@ mod presence_tests {
         assert_eq!(entries[0].attr_UserId, 1);
         assert_eq!(entries[0].attr_Persona, "pilot");
         assert_eq!(entries[0].attr_Presence, LSXPresence::Ingame);
-        assert_eq!(entries[0].attr_RichPresence, "Titanfall 2: In the menus");
-        assert_eq!(entries[0].attr_GamePresence, "Origin.OFR.50.0001456");
+        assert_eq!(entries[0].attr_RichPresence, "Example Game: In the menus");
+        assert_eq!(entries[0].attr_GamePresence, "Origin.OFR.50.0000001");
     }
 
     #[test]

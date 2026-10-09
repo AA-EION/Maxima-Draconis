@@ -39,7 +39,7 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             .unwrap();
 
                         // External-command auto-install: if the user
-                        // (or an external launcher like Draconis)
+                        // (or an external launcher)
                         // passed `--install <slug>` on the command
                         // line, fire it now that the login has
                         // landed. `take()` so we never re-fire on a

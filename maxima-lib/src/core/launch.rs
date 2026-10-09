@@ -570,9 +570,8 @@ pub async fn start_game(
     // runs as a GUI frontend's child (ui-backend under maxima-native, or a
     // one-shot launch spawned by an app), inherited pipes/descriptors
     // connected to that app reach wine and the game — and wine's macOS
-    // driver chokes on GUI-app descriptors: TF2 reproducibly freezes right
-    // after LSX GetAllGameInfo. Same root cause Draconis documents in its
-    // CleanSpawn service; files-or-null stdio is the shell-equivalent
+    // driver chokes on GUI-app descriptors: games can freeze right after
+    // LSX GetAllGameInfo. Files-or-null stdio is the shell-equivalent
     // context wine expects. Diagnostics are unaffected: bootstrap and wine
     // log to files. Windows keeps console inheritance (useful there, no
     // wine involved).

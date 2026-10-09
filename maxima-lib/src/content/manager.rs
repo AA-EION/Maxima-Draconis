@@ -40,7 +40,7 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 /// Filename of the completion marker written into a game's install
 /// directory when ContentManager observes the download as `is_done()`.
 ///
-/// External launchers (notably Draconis on macOS/CrossOver) poll for
+/// External launchers (e.g. on macOS/CrossOver) poll for
 /// this file's presence to decide that an install is **truly**
 /// complete — not just that the game's exe exists. "Exe exists" can
 /// be true mid-download for size-padded files or partially-extracted
@@ -65,7 +65,7 @@ pub struct InstallMarker {
     /// ignore unknown fields.
     pub schema: u32,
     /// The offer the install was queued against (e.g.
-    /// `Origin.OFR.50.0001456` for Titanfall 2).
+    /// `Origin.OFR.50.0000001`).
     pub offer_id: String,
     /// The build that landed on disk (lets consumers tell whether the
     /// installed copy matches the current live build later).
@@ -416,7 +416,7 @@ impl GameDownloader {
         // single retried file pushed the counter past `total_bytes` and
         // `is_done()` returned false forever — install hung silently
         // forever after "Installation finished!" landed in the log.
-        // Found while debugging a TF2 install where `general_stream_patch_2.mstr`
+        // Found while debugging an install where `general_stream_patch_2.mstr`
         // hit 6 retries and over-counted by ~25MB.
         self.completed_bytes.load(Ordering::SeqCst) >= self.total_bytes
     }

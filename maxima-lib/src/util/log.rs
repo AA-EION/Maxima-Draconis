@@ -20,7 +20,7 @@ pub static LOGGER: SimpleLogger = SimpleLogger;
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// When true, the logger writes ONLY to the file sink — stdout stays clean.
-/// Used by `--json` subcommands so callers (Draconis, scripts) can parse
+/// Used by `--json` subcommands so callers (launchers, scripts) can parse
 /// stdout as a single JSON document without log noise. The file sink keeps
 /// receiving everything so debugging isn't affected.
 static SUPPRESS_STDOUT: AtomicBool = AtomicBool::new(false);

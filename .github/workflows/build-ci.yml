@@ -113,7 +113,7 @@ jobs:
 
     - name: Build Maxima
       if: runner.os == 'Linux'
-      # Build the Draconis-relevant crates + the server. maxima-ui pulls
+      # Build the consumer-facing crates + the server. maxima-ui pulls
       # accesskit_unix → zbus 3 → async-io 1.13 → rustix 0.37.28, which doesn't
       # build on modern nightly (uses `rustc_attrs`, now a reserved namespace).
       # maxima-service is windows-only. We skip both here.
@@ -379,7 +379,7 @@ jobs:
         cargo check -p maxima-ui --features bg-videos
 
   # ── MaximaSetup.exe under Wine on macOS ──────────────────────────────────
-  # The in-bottle mode Draconis uses: install MaximaSetup.exe into a fresh
+  # The in-bottle mode consumer launchers use: install MaximaSetup.exe into a fresh
   # Wine prefix on a macOS runner, then check the installed layout and that
   # the thin-client CLI really spawns maxima-server.exe. Intel runner so the
   # x86_64 Windows binaries run without Rosetta.

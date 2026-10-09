@@ -5,7 +5,7 @@
 //! Upstream's bootstrap treats `link2ea://launchgame/<offer_id>` as
 //! "launch this game" — it spawns a fresh `maxima-cli launch <offer_id>`
 //! which in turn calls `launch::start_game`, spawning the game executable.
-//! That works as a one-shot but doesn't compose: if Draconis already has
+//! That works as a one-shot but doesn't compose: if a consumer launcher already has
 //! a long-running Maxima session in the bottle (cached login, RTM, etc.),
 //! every protocol-handler invocation re-bootstraps from scratch.
 //!
@@ -47,7 +47,7 @@
 //!
 //! ### Why /authorize spawns the game (not just preflight)
 //!
-//! Empirically, Titanfall 2's Origin DRM stub emits `link2ea://` and
+//! Empirically, some games' Origin DRM stubs emit `link2ea://` and
 //! **exits**, expecting whoever handles the URL to re-launch it with
 //! EA auth context (`EAGenericAuthToken` etc.) in the environment. A
 //! preflight-only endpoint would refresh the `.dlf` but leave the game

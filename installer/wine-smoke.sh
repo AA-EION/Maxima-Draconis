@@ -1,6 +1,6 @@
 #!/bin/bash
 # Smoke-test MaximaSetup.exe in a throwaway Wine prefix — the in-bottle mode
-# Draconis drives through CrossOver. No EA login is possible on CI, so this
+# a consumer launcher drives through CrossOver. No EA login is possible on CI, so this
 # checks what can fail without one: the installed layout, the protocol
 # handlers, that the Run-key autostart is skipped under Wine, and that the
 # thin-client CLI really spawns maxima-server.exe (and that the server, waiting

@@ -245,7 +245,7 @@ Section "Maxima Core" SEC_CORE
     ;
     ; This is the critical fix for the v0.2.0 -> v0.2.1 upgrade regression
     ; where view-64 leaked into HKCR writes and left 32-bit consumers
-    ; (Titanfall2.exe, Origin emitting link2ea://) looking at stale or
+    ; (games, Origin emitting link2ea://) looking at stale or
     ; missing handlers.
     SetRegView default
     !insertmacro BackupProtocol "qrc"
@@ -303,7 +303,7 @@ Section "Maxima Core" SEC_CORE
     ; boots, so the server would be started by whatever host process happened
     ; to boot the bottle. On macOS that parent's App Nap / responsibility state
     ; then cascades onto every game the server launches (the GUI-launch freeze
-    ; Draconis works around with a disclaimed spawn). In a bottle the CLI
+    ; consumers work around with a disclaimed spawn). In a bottle the CLI
     ; spawns the server on demand from the consumer's disclaimed context.
     IfFileExists "$WINDIR\system32\wineboot.exe" skip_server_autostart
     ClearErrors

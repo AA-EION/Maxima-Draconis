@@ -4,7 +4,7 @@ import os.log
 
 // MaximaHelper — silent background agent for macOS/CrossOver login flow.
 //
-// Registered as the qrc:// URL scheme handler by Draconis on first setup.
+// Registered as the qrc:// URL scheme handler by the consuming launcher on first setup.
 // When EA's OAuth flow redirects to qrc://, macOS launches this app with the
 // URL as an Apple Event. MaximaHelper forwards it to Maxima's TCP listener
 // inside the CrossOver/Wine bottle.

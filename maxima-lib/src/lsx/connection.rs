@@ -348,15 +348,15 @@ impl Connection {
         let maxima: MutexGuard<'_, Maxima> = maxima_arc.lock().await;
         match maxima.playing() {
             None => {
-                // Game was launched externally (e.g. Steam Northstar mode via
-                // `steam.exe -applaunch 1237970 -northstar`) rather than
-                // through `maxima-cli launch`. Accept the connection anyway —
+                // Game was launched externally (e.g. through Steam's
+                // `applaunch` or a launcher) rather than through
+                // `maxima-cli launch`. Accept the connection anyway —
                 // LSX only needs the TCP socket; the PID/Kyber path is skipped
                 // because there is no ActiveGameContext to interrogate.
                 //
-                // Without this, TF2 + Northstar launched via Steam would have
-                // its LSX connection rejected immediately, preventing online
-                // play even when Maxima is running in the background.
+                // Without this, a game launched via Steam would have its LSX
+                // connection rejected immediately, preventing online play
+                // even when Maxima is running in the background.
                 //
                 // Ported from catornot/Maxima@patch-external-lsx, which itself
                 // originated as upstream PR #42 (p0358).
