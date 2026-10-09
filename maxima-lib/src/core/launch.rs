@@ -784,3 +784,39 @@ pub fn parse_arguments(input: &str) -> Vec<String> {
 
     args
 }
+
+#[cfg(test)]
+mod wine_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_payload_from_an_older_launcher_has_no_prefix() {
+        let payload = r#"{"path":"C:\\Game\\game.exe","args":["-a"]}"#;
+        let args: BootstrapLaunchArgs = serde_json::from_str(payload).unwrap();
+        assert_eq!(args.wine_prefix, None);
+        assert_eq!(args.args, vec!["-a".to_string()]);
+    }
+
+    #[test]
+    fn bootstrap_payload_carries_the_prefix_and_omits_it_when_unset() {
+        let with = BootstrapLaunchArgs {
+            path: "game.exe".into(),
+            args: vec![],
+            wine_prefix: Some("/prefixes/a".into()),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: BootstrapLaunchArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wine_prefix.as_deref(), Some("/prefixes/a"));
+
+        let without = BootstrapLaunchArgs::default();
+        assert!(!serde_json::to_string(&without).unwrap().contains("wine_prefix"));
+    }
+
+    #[test]
+    fn parse_arguments_groups_quotes() {
+        assert_eq!(
+            parse_arguments(r#"-a "b c" -d"#),
+            vec!["-a".to_string(), "b c".to_string(), "-d".to_string()]
+        );
+    }
+}

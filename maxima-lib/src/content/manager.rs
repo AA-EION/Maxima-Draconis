@@ -79,7 +79,7 @@ pub struct InstallMarker {
     pub maxima_lib_version: String,
 }
 
-#[derive(Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Builder, Getters, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedGame {
     offer_id: String,
     build_id: String,
@@ -658,7 +658,12 @@ mod tests {
     use super::*;
 
     fn game(id: &str) -> QueuedGame {
-        QueuedGame { offer_id: id.into(), build_id: "b".into(), path: PathBuf::from("/g") }
+        QueuedGame {
+            offer_id: id.into(),
+            build_id: "b".into(),
+            path: PathBuf::from("/g"),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -687,5 +692,71 @@ mod tests {
         queue.forget("a");
         assert!(queue.current.is_none());
         assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn queue_entries_saved_by_older_versions_still_load() {
+        // download_queue.json from before slugs / prefixes / exclusion existed.
+        let old = r#"{
+            "current": {"offer_id": "Origin.OFR.1", "build_id": "7", "path": "/g/one"},
+            "paused": false,
+            "queued": [{"offer_id": "Origin.OFR.2", "build_id": "8", "path": "/g/two"}],
+            "completed": []
+        }"#;
+        let queue: DownloadQueue = serde_json::from_str(old).unwrap();
+        let current = queue.current.unwrap();
+        assert_eq!(current.slug, "");
+        assert_eq!(current.wine_prefix, None);
+        assert!(current.exclude.is_empty());
+        assert_eq!(current.locale, None);
+        assert_eq!(queue.queued.len(), 1);
+    }
+
+    #[test]
+    fn two_games_queue_with_their_own_prefixes() {
+        let a = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.1".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/a".into())
+            .slug("game-a".to_owned())
+            .wine_prefix(Some("/prefixes/a".into()))
+            .exclude(vec!["*.bik".to_owned()])
+            .build()
+            .unwrap();
+        let b = QueuedGameBuilder::default()
+            .offer_id("Origin.OFR.2".to_owned())
+            .build_id("1".to_owned())
+            .path("/g/b".into())
+            .slug("game-b".to_owned())
+            .wine_prefix(Some("/prefixes/b".into()))
+            .build()
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.wine_prefix(), &Some(PathBuf::from("/prefixes/a")));
+        assert_eq!(b.wine_prefix(), &Some(PathBuf::from("/prefixes/b")));
+
+        // They survive the on-disk queue round trip independently.
+        let queue = DownloadQueue {
+            current: Some(a.clone()),
+            paused: false,
+            queued: vec![b.clone()],
+            completed: vec![],
+        };
+        let back: DownloadQueue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert_eq!(back.current.as_ref(), Some(&a));
+        assert_eq!(back.queued, vec![b]);
+    }
+
+    #[test]
+    fn builder_defaults_keep_existing_call_sites_valid() {
+        let game = QueuedGameBuilder::default()
+            .offer_id("o".to_owned())
+            .build_id("b".to_owned())
+            .path("/p".into())
+            .build()
+            .unwrap();
+        assert_eq!(game.slug(), "");
+        assert_eq!(game.wine_prefix(), &None);
     }
 }
