@@ -26,6 +26,12 @@ pub enum RtmError {
     V1(proto::ErrorV1),
     #[error("RTM login failed")]
     Login,
+    #[error("presence is not logged in")]
+    NotLoggedIn,
+    #[error("presence backend error: {0}")]
+    Presence(String),
+    #[error("timed out waiting for the RTM server")]
+    Timeout,
     #[error("RTM response had no body")]
     NoBody,
     #[error("invalid or missing RTM client version")]

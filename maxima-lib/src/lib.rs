@@ -9,6 +9,7 @@ pub mod content;
 pub mod core;
 pub mod lsx;
 pub mod ooa;
+pub mod presence;
 pub mod rtm;
 pub mod server_client;
 pub mod steam;

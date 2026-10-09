@@ -12,6 +12,12 @@ repository = "https://github.com/ArmchairDevelopers/Maxima"
 documentation = "https://docs.rs/maxima"
 rust-version = "1.81.0"
 
+[features]
+default = []
+# EA's social gRPC presence service (upstream PR 67). Pulls tonic/prost 0.13/
+# rustls 0.23; selected at runtime with MAXIMA_PRESENCE_BACKEND=grpc|auto.
+presence-grpc = []
+
 [dependencies]
 maxima-proto = { path = "../maxima-proto" }
 tokio = { version = "1.28.2", features = [

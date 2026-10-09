@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use log::{debug, info, warn};
 
 use crate::core::service_layer::{
@@ -17,7 +19,7 @@ use crate::{
         },
     },
     make_lsx_handler_response,
-    rtm::client::{BasicPresence, RichPresenceBuilder},
+    presence::{BasicPresence, PresenceUpdate, RichPresence},
     util::native::{platform_path, NativeError, SafeStr},
 };
 
@@ -128,62 +130,130 @@ pub async fn handle_set_presence_request(
     let name = offer.display_name().to_owned();
 
     if let Some(presence) = request.attr_RichPresence {
+        let update = PresenceUpdate {
+            basic: BasicPresence::Online,
+            offer_id,
+            game_title: name,
+            rich_presence: presence,
+            game_presence: request.attr_GamePresence,
+            session_id: request.attr_SessionId,
+            joinable: matches!(
+                request.attr_Presence,
+                LSXPresence::Joinable | LSXPresence::JoinableInviteOnly
+            ),
+            joinable_invite_only: request.attr_Presence == LSXPresence::JoinableInviteOnly,
+        };
+
         // Presence is cosmetic: don't hand the game an error (and risk it
-        // tearing down the LSX session) when RTM is unavailable.
-        if let Err(err) = maxima
-            .rtm()
-            .set_presence(
-                BasicPresence::Online,
-                &format!("{}: {}", name, presence),
-                &offer_id,
-            )
-            .await
-        {
-            warn!("Failed to update RTM presence: {}", err);
+        // tearing down the LSX session) when the presence backend is down.
+        if let Err(err) = maxima.rtm().update_presence(&update).await {
+            warn!("Failed to update presence: {}", err);
         }
     }
 
     make_lsx_handler_response!(Response, ErrorSuccess, { attr_Code: 0, attr_Description: String::new() })
 }
 
+/// What the game is told about a friend's presence.
+fn lsx_presence_of(presence: &RichPresence) -> LSXPresence {
+    if presence.game().as_deref().is_some_and(|game| !game.is_empty()) {
+        if *presence.joinable_invite_only() {
+            LSXPresence::JoinableInviteOnly
+        } else if *presence.joinable() {
+            LSXPresence::Joinable
+        } else {
+            LSXPresence::Ingame
+        }
+    } else {
+        match presence.basic() {
+            BasicPresence::Unknown => LSXPresence::Unknown,
+            BasicPresence::Offline => LSXPresence::Offline,
+            BasicPresence::Dnd => LSXPresence::Busy,
+            BasicPresence::Away => LSXPresence::Idle,
+            BasicPresence::Online => LSXPresence::Online,
+        }
+    }
+}
+
+fn lsx_friend(
+    user_id: u64,
+    persona: String,
+    persona_id: String,
+    avatar_id: String,
+    state: LSXFriendState,
+    presence: &RichPresence,
+) -> LSXFriend {
+    LSXFriend {
+        attr_TitleId: "".to_string(),
+        attr_MultiplayerId: presence.multiplayer_id().clone().unwrap_or_default(),
+        attr_Persona: persona,
+        attr_RichPresence: presence.status().to_string(),
+        attr_GamePresence: presence
+            .game_presence()
+            .clone()
+            .or_else(|| presence.game().clone())
+            .unwrap_or_default(),
+        attr_Title: "".to_string(),
+        attr_UserId: user_id,
+        attr_PersonaId: persona_id,
+        attr_AvatarId: avatar_id,
+        attr_Group: presence.group_name().clone().unwrap_or_default(),
+        attr_GroupId: presence.group_id().clone().unwrap_or_default(),
+        attr_Presence: lsx_presence_of(presence),
+        attr_State: state,
+    }
+}
+
+/// Entries for the users the game asked about. A user we have no presence for
+/// is simply left out: a game asking about someone who isn't a friend (or
+/// hasn't been seen yet) gets a successful, shorter answer, never an error.
+fn query_presence_entries(
+    users: &[u64],
+    lookup: impl Fn(&str) -> Option<RichPresence>,
+    personas: &HashMap<String, String>,
+) -> Vec<LSXFriend> {
+    users
+        .iter()
+        .filter_map(|user| {
+            let key = user.to_string();
+            let presence = lookup(&key)?;
+            let persona = personas
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| "------".to_string());
+            Some(lsx_friend(
+                *user,
+                persona,
+                "0".to_string(),
+                "".to_string(),
+                LSXFriendState::None,
+                &presence,
+            ))
+        })
+        .collect()
+}
+
 pub async fn handle_query_presence_request(
     state: LockedConnectionState,
     request: LSXQueryPresence,
 ) -> Result<Option<LSXResponseType>, LSXRequestError> {
-    let mut friends = Vec::new();
-
     let mut state = state.write().await;
     let mut maxima = state.maxima().await;
+
+    // Names are a nicety; never fail the query over them.
+    let personas: HashMap<String, String> = match maxima.friends(0).await {
+        Ok(friends) => friends
+            .iter()
+            .map(|f| (f.id().to_owned(), f.unique_name().to_string()))
+            .collect(),
+        Err(err) => {
+            debug!("Friends unavailable for QueryPresence: {}", err);
+            HashMap::new()
+        }
+    };
+
     let presence_store = maxima.rtm().presence_store().lock().await;
-
-    for user in request.Users {
-        let presence = match presence_store.get(&user.to_string()) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let game = if let Some(game) = presence.game() {
-            game.to_owned()
-        } else {
-            String::new()
-        };
-
-        friends.push(LSXFriend {
-            attr_TitleId: "".to_string(),
-            attr_MultiplayerId: "".to_string(),
-            attr_Persona: "------".to_string(),
-            attr_RichPresence: presence.status().to_string(),
-            attr_GamePresence: game,
-            attr_Title: "".to_string(),
-            attr_UserId: user,
-            attr_PersonaId: "0".to_string(),
-            attr_AvatarId: "".to_string(),
-            attr_Group: "".to_string(),
-            attr_GroupId: "".to_string(),
-            attr_Presence: LSXPresence::Ingame,
-            attr_State: LSXFriendState::None,
-        });
-    }
+    let friends = query_presence_entries(&request.Users, |id| presence_store.get(id), &personas);
 
     make_lsx_handler_response!(Response, QueryPresenceResponse, { friend: friends })
 }
@@ -204,48 +274,18 @@ pub async fn handle_query_friends_request(
             continue;
         }
 
-        let mut presence = presence_store.get(ele.id()).unwrap_or_else(|| {
-            RichPresenceBuilder::default()
-                .basic(BasicPresence::Offline)
-                .status(String::new())
-                .game(None)
-                .build()
-                .unwrap()
-        });
+        let presence = presence_store
+            .get(ele.id())
+            .unwrap_or_else(RichPresence::offline);
 
-        let mut lsx_presence = match presence.basic() {
-            BasicPresence::Unknown => LSXPresence::Unknown,
-            BasicPresence::Offline => LSXPresence::Offline,
-            BasicPresence::Dnd => LSXPresence::Busy,
-            BasicPresence::Away => LSXPresence::Idle,
-            BasicPresence::Online => LSXPresence::Online,
-        };
-
-        let game = if let Some(game) = presence.game() {
-            game.to_owned()
-        } else {
-            String::new()
-        };
-
-        if !game.is_empty() {
-            lsx_presence = LSXPresence::Ingame;
-        }
-
-        lsx_friends.push(LSXFriend {
-            attr_TitleId: "".to_string(),
-            attr_MultiplayerId: "".to_string(),
-            attr_Persona: ele.unique_name().to_string(),
-            attr_RichPresence: presence.status().to_string(),
-            attr_GamePresence: game,
-            attr_Title: "".to_string(),
-            attr_UserId: ele.id().parse()?,
-            attr_PersonaId: ele.pd().parse()?,
-            attr_AvatarId: format!("user:{}", ele.id()).to_string(),
-            attr_Group: "".to_string(),
-            attr_GroupId: "".to_string(),
-            attr_Presence: lsx_presence,
-            attr_State: LSXFriendState::Mutual,
-        });
+        lsx_friends.push(lsx_friend(
+            ele.id().parse()?,
+            ele.unique_name().to_string(),
+            ele.pd().parse()?,
+            format!("user:{}", ele.id()),
+            LSXFriendState::Mutual,
+            &presence,
+        ));
     }
 
     make_lsx_handler_response!(Response, QueryFriendsResponse, { friend: lsx_friends })
@@ -311,4 +351,84 @@ pub async fn handle_query_image_request(
     });
 
     make_lsx_handler_response!(Response, QueryImageResponse, { attr_Result: 1, image: images, })
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    fn in_game() -> RichPresence {
+        RichPresence::new(
+            BasicPresence::Online,
+            "Titanfall 2: In the menus".into(),
+            Some("Origin.OFR.50.0001456".into()),
+        )
+    }
+
+    #[test]
+    fn unknown_users_get_an_empty_successful_answer() {
+        let personas = HashMap::new();
+        let entries = query_presence_entries(&[42, 43], |_| None, &personas);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn known_users_are_answered_and_unknown_ones_skipped() {
+        let mut personas = HashMap::new();
+        personas.insert("1".to_string(), "pilot".to_string());
+        let entries = query_presence_entries(
+            &[1, 2],
+            |id| (id == "1").then(in_game),
+            &personas,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].attr_UserId, 1);
+        assert_eq!(entries[0].attr_Persona, "pilot");
+        assert_eq!(entries[0].attr_Presence, LSXPresence::Ingame);
+        assert_eq!(entries[0].attr_RichPresence, "Titanfall 2: In the menus");
+        assert_eq!(entries[0].attr_GamePresence, "Origin.OFR.50.0001456");
+    }
+
+    #[test]
+    fn persona_falls_back_when_the_friends_list_is_unavailable() {
+        let entries = query_presence_entries(&[7], |_| Some(in_game()), &HashMap::new());
+        assert_eq!(entries[0].attr_Persona, "------");
+    }
+
+    #[test]
+    fn presence_mapping_covers_joinable_and_basic_states() {
+        assert_eq!(
+            lsx_presence_of(&in_game().with_joinable(true, false)),
+            LSXPresence::Joinable
+        );
+        assert_eq!(
+            lsx_presence_of(&in_game().with_joinable(true, true)),
+            LSXPresence::JoinableInviteOnly
+        );
+        assert_eq!(
+            lsx_presence_of(&RichPresence::new(BasicPresence::Away, String::new(), None)),
+            LSXPresence::Idle
+        );
+        assert_eq!(lsx_presence_of(&RichPresence::offline()), LSXPresence::Offline);
+    }
+
+    #[test]
+    fn rich_backend_fields_reach_the_game() {
+        let presence = in_game()
+            .with_multiplayer_id(Some("1039093".into()))
+            .with_game_presence(Some("blob".into()))
+            .with_group(Some("g-1".into()), Some("squad".into()));
+        let friend = lsx_friend(
+            9,
+            "p".into(),
+            "0".into(),
+            "".into(),
+            LSXFriendState::Mutual,
+            &presence,
+        );
+        assert_eq!(friend.attr_MultiplayerId, "1039093");
+        assert_eq!(friend.attr_GamePresence, "blob");
+        assert_eq!(friend.attr_Group, "squad");
+        assert_eq!(friend.attr_GroupId, "g-1");
+    }
 }

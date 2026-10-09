@@ -50,3 +50,20 @@ message PresenceV1 {
 	optional string clientVersion = 9;
 	optional PlatformV1 platform = 10;
 }
+
+message PresenceUpdateErrorV1 {
+	string errorCode = 1;
+	string errorMessage = 2;
+}
+
+message PresenceSubscriptionErrorV1 {
+	string personaId = 1;
+	string errorCode = 2;
+	string errorMessage = 3;
+	Player player = 4;
+}
+
+message PresenceSubscriptionAllFriendsErrorV1 {
+	string errorCode = 1;
+	string errorMessage = 2;
+}
