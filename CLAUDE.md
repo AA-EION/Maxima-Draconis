@@ -118,7 +118,7 @@ Key entry points:
 | `maxima-cli/src/main.rs`                      | CLI argparse + subcommand dispatch (Launch, Serve, ListGames, …)   |
 | `maxima-bootstrap/src/main.rs`                | Protocol URL parser + auth-server probe + HTTP forward / spawn     |
 | `maxima-lib/src/auth_server.rs`               | token-checked `POST /authorize?offer_id=X` on a free loopback port |
-| `maxima-lib/src/steam.rs`                     | `STEAM_GAMES` table, Steam install path discovery (registry + VDF) |
+| `maxima-lib/src/steam.rs`                     | Steam app id → offer (`game-overrides.json`, `appmanifest_*.acf`), Steam library discovery |
 | `maxima-lib/src/core/launch.rs`               | `start_game()` — license preflight, env vars, spawn the game       |
 | `maxima-lib/src/core/auth/login.rs`           | OAuth flow + `remid`-cookie fallback for macOS/CrossOver           |
 | `maxima-lib/src/core/mod.rs`                  | `Maxima` struct, `start_lsx` (with probe), `start_auth_server`     |
@@ -257,7 +257,7 @@ server ready for the next launch.
 │     │     │     NO → bind ourselves                                  │
 │     │     └── listening                                              │
 │     ├── resolve slug → offer_id (EA library / Origin pattern /       │
-│     │                            STEAM_GAMES table)                  │
+│     │              game-overrides.json / Steam appmanifest)          │
 │     ├── set SteamAppId / SteamGameId env vars if slug is numeric     │
 │     ├── launch::start_game(LaunchOptions { steam_launch })           │
 │     │     ├── request_and_save_license → .dlf on disk                │
@@ -360,7 +360,7 @@ game in bottle emits link2ea://…
 
 **Feature parity between the two Maxima UIs**: the wine-engine picker also exists in the egui UI's settings view (persisted in `FrontendSettings.wine_command`, applied live via the same `MAXIMA_WINE_COMMAND`), along with an auto-detection status line and the CrossOver bottles-dir display. The egui (`maxima-ui`) path is maintained, not replaced — it remains the cross-platform launcher upstream ships; `maxima-native` is the macOS-first face.
 
-Known gaps in native mode: Northstar untested on this path (consumer-side: `wsock32=n,b` is already in the wine DLL overrides, so dropping Northstar files into the game dir and launching with `-- -northstar` is the expected recipe); Draconis not yet wired to the native binaries; `maxima-native` has no box art (list-games --json carries no image URLs yet) and no per-game settings sheet (launch args / exe override) — both natural next steps.
+Known gaps in native mode: mods that ship a proxy DLL are untested on this path (consumer-side: pass the override per launch, e.g. `--wine-dll-override wsock32=n,b` — Maxima's default overrides carry no game-specific DLLs); Draconis not yet wired to the native binaries; `maxima-native` has no box art (list-games --json carries no image URLs yet) and no per-game settings sheet (launch args / exe override) — both natural next steps.
 
 ---
 
@@ -383,7 +383,7 @@ MaximaHelper.app's bundle id is `com.armchairdevelopers.maxima.helper`. **The Dr
 
 | Thing                     | TF2 value                               |
 |---------------------------|-----------------------------------------|
-| Steam App ID              | `1237970` (resolved via `STEAM_GAMES` table when EA library lookup fails) |
+| Steam App ID              | `1237970` (resolved via `game-overrides.json` or Steam's `appmanifest_1237970.acf` name when needed) |
 | EA Origin offer id        | `Origin.OFR.50.0001456` (real TF2 offer id, NOT `0002694` / `0002148` which are Apex / Battlefront 2) |
 | MaximaHelper bundle id    | `com.armchairdevelopers.maxima.helper`  |
 | MaximaHelper qrc port     | `127.0.0.1:31033` inside Wine            |
@@ -421,9 +421,9 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 - **NEW:** Panic hook writing to `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.panic.log` before unwinding — catches panics that fire before the regular logger is initialized.
 - **NEW:** `main()` is plain `fn`, builds tokio runtime manually with `Builder::new_multi_thread().enable_all()`. The previous `#[tokio::main]` macro built the runtime before user code, which defeated the panic hook.
 - **`Mode::Launch`** (legacy path B) now:
-  - Resolves slug via EA library lookup, then EA-offer passthrough, then `STEAM_GAMES` table fallback for Steam-only owners with unlinked accounts.
+  - Resolves slug via EA library lookup, then EA-offer passthrough, then (numeric Steam app ids) `game-overrides.json` / Steam's `appmanifest_<id>.acf` matched against library names.
   - Sets `SteamAppId` / `SteamGameId` / `SteamClientLaunch` / `SteamPath` env vars when slug matches `<1..=10 digits>` (Steam App ID pattern).
-  - Resolves Steam install path via `lookup_steam_game` + `resolve_steam_install_path` (registry + `libraryfolders.vdf` parse) when no `--game-path` is given.
+  - Resolves the Steam install path from Steam's own records (registry / `libraryfolders.vdf` / `appmanifest`, also inside a Wine prefix) when no `--game-path` is given.
   - Per-game launch args (e.g. `-noOriginStartup` for Northstar, `-multiple` for Source-engine titles) are NOT auto-injected. Callers pass them via `--game-args`, `MAXIMA_LAUNCH_ARGS`, or `cmd_params` on the `link2ea://` URL — Maxima stays universal.
 - `Mode::GetGameBySlug` actually prints slug/offer_id/content_id/display_name/installed (was a no-op stub upstream).
 - **`Mode::ListGames { json }`** — when `--json` is passed, emits a JSON array on stdout (slug, name, offer_id, content_id, installed, install_path, version, has_cloud_save, extra_offers) and suppresses the logger's stdout output for the duration of the command. Designed for Draconis pre-flight detection: "what does Maxima know about this user's library, in machine-readable form?". File-sink logging is unaffected, so debugging traces still land in `%LOCALAPPDATA%\Maxima\Logs\maxima-cli.log`. Per-title-specific detection (TF2 binaries, Northstar markers, etc.) is intentionally kept out of Maxima — that's the consumer's job, since Maxima needs to remain universal across EA titles.
@@ -434,9 +434,8 @@ Everything below is on top of upstream `master` at `cbde5f0`. Categorized so we 
 
 #### Steam helpers — new module (`maxima-lib/src/steam.rs`)
 - Lifted from `maxima-cli/src/main.rs` so the auth server can use it too. Contains:
-  - `STEAM_GAMES` table (currently just TF2: app id `1237970` → `Origin.OFR.50.0001456`, `Titanfall2/Titanfall2.exe`).
-  - `lookup_steam_game(steam_app_id)`, `lookup_steam_game_by_offer(origin_offer_id)` (reverse lookup, used by `auth_server`).
-  - `resolve_steam_install_path(SteamGameEntry)` — Steam install discovery: registry (`HKLM\SOFTWARE\(Wow6432Node\)Valve\Steam\InstallPath`), then `Program Files (x86)\Steam` / `Program Files\Steam` defaults, then `libraryfolders.vdf` parse. **Windows only**; returns `None` on other targets (Wine builds use the cfg(windows) path).
+  - No per-title table: a Steam app id resolves through an optional `game-overrides.json` in the data dir (`MAXIMA_GAME_OVERRIDES`; entries `{offer_id, steam_app_id?, exe?, install_dir?}`), else Steam's `appmanifest_<id>.acf` name matched against the EA library. Unresolved ids get a 404 instead of being passed through as offer ids.
+  - Steam root discovery: registry, then the default install dirs, then `libraryfolders.vdf`; on non-Windows hosts the same lookup runs inside the game's Wine prefix.
   - `EA_OFFER_ID_PATTERN`, `STEAM_APP_ID_PATTERN` regexes.
 
 #### Authorize HTTP server — new module (`maxima-lib/src/auth_server.rs`)
@@ -959,7 +958,6 @@ Tracked from PR #4 (Gemini review) and reaffirmed during the Session 2026-05-18 
 - **DLL injection on macOS / CrossOver** — `maxima-service`'s injector is Windows-only by design. Wine doesn't support `CreateRemoteThread`-style injection. The service is installed by NSIS but its injection path is never exercised in the Draconis flow.
 - **Cloud saves, downloads, friends** — implemented upstream and present in the codebase, but untested in the Draconis / CrossOver configuration.
 - **Offline mode after first launch** — `LaunchMode::Offline` path exists but Draconis doesn't expose it. License cache lives at `C:/ProgramData/Electronic Arts/EA Services/License/<content_id>.dlf` and is valid for approximately two weeks.
-- **`STEAM_GAMES` table is TF2-only** — `lookup_steam_game(steam_app_id)` only has an entry for `1237970`. Other EA-on-Steam titles would not resolve via the fallback. Extend per title we validate.
 - **No registry-driven UI-vs-CLI auth provider selector** — the user previously proposed `HKLM\Software\Maxima\AuthProvider = "UI"|"CLI"` that bootstrap would read when no auth server is running. Not implemented; the current fallback path simply spawns `maxima-cli launch` unconditionally. Becomes meaningful once we want bootstrap to auto-start `serve` if it can't find one running.
 - **Auth-server endpoint not on UI yet** — `maxima.exe` doesn't bring up `/authorize`. If a user runs the UI without `serve`, bootstrap falls through to Path B (spawn). Easy fix; just hasn't been wired.
 - **TF2's LSX-polling timeout, if any, is undocumented.** Path A relies on TF2 retrying indefinitely while bootstrap forwards. If TF2 has a finite timeout (we suspect it doesn't but haven't measured), `serve` cold-starts could miss the window.
@@ -1026,6 +1024,7 @@ History of significant changes since this fork was forked. Not a substitute for 
 - **Presence backends** (upstream PRs 67 + 70): `presence::PresenceClient` behind `Maxima::rtm()`, `MAXIMA_PRESENCE_BACKEND=legacy|antelope|grpc|auto` (default legacy, wire-identical to before). Antelope is PR 70's renamed RTM protocol (payload dialect only); the social gRPC service from PR 67 is behind the off-by-default `presence-grpc` cargo feature. RTM gained reconnect backoff and bounded waits; QueryPresence for unknown users returns an empty success.
 - **Download queue** (from upstream PR 70, reworked): FIFO order, cancel / pause / resume / move-to-top, failed files fail the install (`MaximaEvent::InstallFailed` → `install-error`) instead of reporting success, corrupt `download_queue.json` kept as `.bak`.
 - **Windows hardening**: touchup elevates through the UAC consent prompt (`util/elevation.rs`) instead of PR 70's SYSTEM `/touchup` endpoint; the background service only answers requests with the `x-maxima-client` header and no browser `Origin`; registry reads fall back to `WOW6432Node`.
+- **No game- or launcher-specific code**: the `STEAM_GAMES` table, TF2 literals in `GetAllGameInfo` and the built-in `wsock32` DLL override are gone. Per-launch options replace them: `--wine-dll-override <dll=mode>` / `MAXIMA_WINE_DLL_OVERRIDES` (applied on both the wine and cxstart paths), `--steam-app-id` / `MAXIMA_STEAM_APP_ID`, `--entitlement-source ea|steam` / `MAXIMA_ENTITLEMENT_SOURCE` (one helper feeds the launch env, `GetAllGameInfo` and `GetProfile`; `IsSubscriber` is now always false), plus `game-overrides.json`. The Steam-library warning is neutral and only shown under Wine; per-message LSX logs are `debug!` again.
 - **Linux packages** (upstream PR 51): `packaging/linux/` (container build, AppImage, Flatpak + metainfo, shared launcher), `linux-packages` CI job; the qrc handler check accepts the packaged desktop file.
 
 ### 2026-10-08 — upstream fix ports
