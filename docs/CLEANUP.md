@@ -16,7 +16,7 @@ remembers). When you notice new leftovers, add a row.
 > **Status:** §1 and §2 below are **DONE** (commit `refactor(cli): delete dead
 > in-process product commands; forward locate-game`) — kept here as a record of
 > what was removed. §5 (status icon) is **DONE** (server owns the icon on all
-> OSes). §3, §4, §6 remain.
+> OSes). §3, §4 remain.
 
 ## 1. `maxima-cli` — dormant in-process implementations (DEAD) — ✅ removed
 
@@ -95,17 +95,12 @@ proto would mean adding RPCs nobody but a developer calls. Left as-is.
 `logo.ico`), macOS spawns the `Maxima.app --menubar` host, Linux SNI tray behind
 the off-by-default `linux-tray` feature. See [MACOS_BUNDLING.md](MACOS_BUNDLING.md).
 
-## 6. egui `maxima-ui` — still an in-process session (HALF-DONE, task #24)
+## 6. egui `maxima-ui` — DONE
 
-The egui UI is the last frontend that still holds its own `Maxima` and only
-defers LSX to the server. The server side is ready (proto has `who-am-i`,
-`game-images`, `game-details`, `friends` + avatars, launch/install/verify/…).
-Remaining is purely inside `maxima-ui`: rewire `bridge_thread` / `event_thread`
-/ `bridge/*` onto a `MaximaClient`, and change two response types
-(`InteractThreadLoginResponse.you: ServicePlayer` → persona/id strings;
-`GameInfo.dlc: Vec<OwnedOffer>` → `Vec<ExtraOfferDto>`). Tracked separately;
-it's ~600 lines across a working 5.5k-line UI, so it's staged, not rushed.
+The egui UI is a thin client: `bridge_thread` talks to the server through a
+`MaximaClient` (login, library, friends, presence, launch, install, locate,
+download queue); the `bridge/*` handlers and the RTM event thread are gone.
 
-Once §6 lands, `maxima-lib` is depended on by *only* `maxima-server` (+ the
+Since §6 landed, `maxima-lib` is depended on by *only* `maxima-server` (+ the
 build-time host utilities the clients use: logging, registry check). That's the
 PR #23 end state.

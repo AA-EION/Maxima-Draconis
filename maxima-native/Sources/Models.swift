@@ -64,7 +64,13 @@ enum GameStatus: Equatable {
     case notInstalled
     case installed
     case installing(Double) // percent, 0–100
+    case queued
     case running
+
+    var isInstalling: Bool {
+        if case .installing = self { return true }
+        return false
+    }
 }
 
 /// A friend from the backend's `friends` response.

@@ -335,6 +335,8 @@ jobs:
       run: |
         bash maxima-bootstrap/build-app.sh
         bash maxima-native/build.sh
+        /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes' \
+          maxima-native/build/Maxima.app/Contents/Info.plist | grep -q link2ea
 
     - name: Smoke-test the native CLI
       # No login is available on CI, so only exercise commands that are pure
@@ -347,7 +349,7 @@ jobs:
         echo "$out" | grep -q '"running":false'
         test -x maxima-native/build/Maxima.app/Contents/MacOS/Maxima
         test -x maxima-native/build/Maxima.app/Contents/Resources/maxima-server
-        test -d maxima-native/build/Maxima.app/Contents/Resources/bundle/osx/MaximaBootstrap.app
+        test -x maxima-native/build/Maxima.app/Contents/Resources/maxima-bootstrap
         codesign --verify --deep maxima-native/build/Maxima.app
         echo "✓ native macOS build looks healthy"
 

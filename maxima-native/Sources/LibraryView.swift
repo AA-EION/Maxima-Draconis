@@ -126,6 +126,8 @@ struct GameCard: View {
             pill("Running", color: maximaOrange)
         case .installing:
             pill("Installing", color: .blue)
+        case .queued:
+            pill("Queued", color: .blue)
         case .notInstalled, .unknown:
             pill("Not installed", color: .secondary)
         }
@@ -167,6 +169,11 @@ struct GameCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        case .queued:
+            Label("Queued", systemImage: "clock")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
         case .running:
             Label("Game is running", systemImage: "circle.fill")
                 .font(.callout)

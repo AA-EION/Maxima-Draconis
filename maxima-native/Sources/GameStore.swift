@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Central UI state, fed by ONE persistent `maxima-cli ui-backend` process
-/// (login, LSX, RTM presence held open — the same session model as the egui
-/// UI). All mutations on the main actor.
+/// Central UI state, fed by the shared `maxima-server` session.
+/// All mutations on the main actor.
 @MainActor
 final class GameStore: ObservableObject {
     @Published var backendState: BackendState = .connecting
@@ -12,16 +11,19 @@ final class GameStore: ObservableObject {
     @Published var presences: [String: Presence] = [:]
     @Published var errorMessage: String?
     @Published var loading = false
+    @Published var currentDownload: String?
+    @Published var queuedDownloads: [String] = []
+    @Published var downloadsPaused = false
 
     private let backend = Backend()
     private var lastLaunched: String?
 
-    var activeInstalls: [(game: Game, percent: Double)] {
-        games.compactMap { game in
-            if case .installing(let pct) = statuses[game.slug] ?? .unknown {
-                return (game, pct)
-            }
-            return nil
+    var activeInstalls: [(game: Game, percent: Double?)] {
+        ([currentDownload].compactMap { $0 } + queuedDownloads).compactMap {
+            slug -> (game: Game, percent: Double?)? in
+            guard let game = games.first(where: { $0.slug == slug }) else { return nil }
+            if case .installing(let pct) = statuses[slug] ?? .unknown { return (game, pct) }
+            return (game, nil)
         }
     }
 
@@ -104,6 +106,10 @@ final class GameStore: ObservableObject {
                 statuses[slug] = .installed
                 lastLaunched = nil
             }
+        case "download-queue":
+            applyQueue(current: event["current"] as? String,
+                       queued: event["queued"] as? [String] ?? [],
+                       paused: event["paused"] as? Bool ?? false)
         case "error":
             errorMessage = event["message"] as? String
         default:
@@ -126,13 +132,14 @@ final class GameStore: ObservableObject {
             games = list
             for game in list {
                 switch statuses[game.slug] {
-                case .installing, .running:
+                case .installing, .queued, .running:
                     continue
                 default:
                     statuses[game.slug] = derivedStatus(for: game)
                 }
             }
             friends = try await backend.friends()
+            applyQueue(try await backend.request(["cmd": "download-queue"]))
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -207,8 +214,47 @@ final class GameStore: ObservableObject {
         }
     }
 
+    private func applyQueue(_ response: [String: Any]) {
+        let queue = response["queue"] as? [String: Any] ?? [:]
+        let slug = { (entry: Any?) in (entry as? [String: Any])?["slug"] as? String }
+        applyQueue(current: slug(queue["current"]),
+                   queued: (queue["queued"] as? [Any] ?? []).compactMap { slug($0) },
+                   paused: queue["paused"] as? Bool ?? false)
+    }
+
+    private func applyQueue(current: String?, queued: [String], paused: Bool) {
+        let tracked = Set(queued + [current].compactMap { $0 })
+        for (slug, status) in statuses where !tracked.contains(slug) {
+            switch status {
+            case .installing, .queued:
+                statuses[slug] = games.first { $0.slug == slug }.map { derivedStatus(for: $0) } ?? .unknown
+            default:
+                break
+            }
+        }
+        for slug in queued { statuses[slug] = .queued }
+        if let current, !(statuses[current]?.isInstalling ?? false) {
+            statuses[current] = .installing(0)
+        }
+        currentDownload = current
+        queuedDownloads = queued
+        downloadsPaused = paused
+    }
+
+    func queueAction(_ cmd: String, slug: String? = nil) {
+        Task {
+            var body: [String: Any] = ["cmd": cmd]
+            if let slug { body["slug"] = slug }
+            do {
+                applyQueue(try await backend.request(body))
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     func install(_ game: Game) {
-        statuses[game.slug] = .installing(0)
+        statuses[game.slug] = .queued
         Task {
             do {
                 try await backend.install(slug: game.slug, path: nil)
