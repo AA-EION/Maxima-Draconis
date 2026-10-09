@@ -43,8 +43,9 @@ runtime model in ways a good consumer accounts for:
    from the server process, not the per-command CLI.
 
 2. **A background process outlives your command.** `maxima-cli list-games --json`
-   returns, but `maxima-server` keeps running (holding LSX :3216, authorize
-   :13219, RTM, and the control port :13220). This is intended — it's what lets a
+   returns, but `maxima-server` keeps running (holding LSX, `/authorize`, RTM
+   and the control port; their real ports are in `instance.json` in the
+   context's data directory, and LSX prefers :3216). This is intended — it's what lets a
    subsequent `launch` reuse the logged-in session and what serves the LSX auth
    when the game emits `link2ea://`. A consumer that wants to stop it calls
    `maxima-cli server-stop`; to check it, `maxima-cli server-status [--json]`.
@@ -91,7 +92,7 @@ Draconis → maxima-cli launch <slug> --json
              → server: license preflight + EA env + cxstart-disclaimed spawn
              → {"event":"launched","offer_id":…,"wine_prefix":…}
    game emits link2ea:// → winebrowser → host `open` → MaximaBootstrap.app
-             → probes :13219 → forwards to the *same* server's /authorize
+             → reads instance.json → forwards to the *same* server's /authorize
    game exits → server detects (pgrep) → {"event":"exited","elapsed_secs":…}
 ```
 

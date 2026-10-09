@@ -27,7 +27,9 @@ The deep engineering reference (sequence diagrams, gotchas, changelog) is [`CLAU
 
 ## The core idea: one server, thin clients
 
-Maxima runs as **one background process — `maxima-server` — that does everything**: it holds the logged-in EA session, the LSX auth listener (port 3216), the `/authorize` HTTP endpoint (13219), RTM friends presence, and all downloads/installs/launches. Every user-facing surface (CLI, TUI, the graphical UIs) is a **thin client** that talks to it over a small typed RPC on a loopback socket (13220). This is upstream PR [#23](https://github.com/ArmchairDevelopers/Maxima/pull/23)'s "Maxima Server" design.
+Maxima runs as **one background process — `maxima-server` — that does everything**: it holds the logged-in EA session, the LSX auth listener (3216 when free), the `/authorize` HTTP endpoint, RTM friends presence, and all downloads/installs/launches. Every user-facing surface (CLI, TUI, the graphical UIs) is a **thin client** that talks to it over a small typed RPC on a loopback socket.
+
+Each installation context — your user account, and every Wine prefix with Maxima installed inside it — runs **its own** server. A server binds free ports and publishes them, with a random per-run token, in `instance.json` in that context's data directory; clients read the file from their own data directory and must present the token in their first message. Wine prefixes share the host loopback, so this is what stops a Maxima in one prefix (or on the host, or a web page) from talking to another one. `MAXIMA_DATA_DIR` starts a fully separate instance. This is upstream PR [#23](https://github.com/ArmchairDevelopers/Maxima/pull/23)'s "Maxima Server" design.
 
 ```
                          ┌──────────────────────────────┐
@@ -36,7 +38,7 @@ Maxima runs as **one background process — `maxima-server` — that does everyt
    Maxima.app  ─────┤    │   everything: session, LSX,  │      (CrossOver
    maxima.exe  ─────┘    │   /authorize, RTM, installs) │       / Wine)
      (clients)           └──────────────────────────────┘
-        via maxima-proto (typed JSON RPC over 127.0.0.1:13220)
+        via maxima-proto (typed JSON RPC over loopback, port + token from instance.json)
 ```
 
 Clients never talk to EA directly and never hold their own session — they connect to the server (spawning it on demand if it isn't running). The server owns a **status-bar icon** on every OS so you can open a UI or stop it without a terminal.
@@ -151,10 +153,9 @@ For the **in-bottle** flow, `MaximaSetup.exe` inside the bottle + `MaximaHelper.
 # Is MaximaHelper registered for qrc:// on the host?
 swift -e 'import AppKit; print(NSWorkspace.shared.urlForApplication(toOpen: URL(string:"qrc://x")!)?.path ?? "NONE")'
 
-# Is the server up? (loopback ports — Wine forwards them to the host)
-nc -zv 127.0.0.1 3216     # LSX
-nc -zv 127.0.0.1 13219    # /authorize
-maxima-cli server-status  # session state + client count
+# Is the server up? Ports and realm come from this context's instance.json
+maxima-cli server-status  # realm, port, login state, client count
+cat "$HOME/Library/Application Support/com.ArmchairDevelopers.Maxima/instance.json"  # macOS
 ```
 
 More recipes in [`CLAUDE.md`](./CLAUDE.md#diagnostics).
