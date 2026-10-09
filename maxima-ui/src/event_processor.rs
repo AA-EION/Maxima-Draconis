@@ -11,10 +11,8 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                         continue;
                     }
 
-                    friend.online = res.presence.basic().clone();
-                    if res.presence.game().is_some() {
-                        friend.game = Some(res.presence.status().clone());
-                    }
+                    friend.online = res.basic.clone();
+                    friend.game = res.game.is_some().then(|| res.status.clone());
                 }
                 ctx.request_repaint();
             }

@@ -25,9 +25,9 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                         }
                         let res = res.unwrap();
 
-                        info!("Logged in as {}!", &res.you.display_name());
-                        app.user_name = res.you.display_name().clone();
-                        app.user_id = res.you.id().clone();
+                        info!("Logged in as {}!", &res.name);
+                        app.user_name = res.name;
+                        app.user_id = res.id;
                         app.backend_state = BackendStallState::BingChilling;
                         app.backend
                             .backend_commander
@@ -75,7 +75,18 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                             app.page_view = PageType::Downloads;
                         }
                     }
-                    LoginCacheEmpty => app.backend_state = BackendStallState::UserNeedsToLogIn,
+                    LoginCacheEmpty => {
+                        app.backend_state = BackendStallState::UserNeedsToLogIn;
+                        // `--install` (Draconis onboarding) logs in without a click, once.
+                        if app.pending_install.is_some() && !app.auto_login_sent {
+                            app.auto_login_sent = true;
+                            let _ = app
+                                .backend
+                                .backend_commander
+                                .send(bridge_thread::MaximaLibRequest::LoginRequestOauth);
+                            app.backend_state = BackendStallState::LoggingIn;
+                        }
+                    }
                     ServiceNeedsStarting => {
                         app.backend_state = BackendStallState::UserNeedsToInstallService
                     }
@@ -111,63 +122,32 @@ pub fn frontend_processor(app: &mut MaximaEguiApp, ctx: &egui::Context) {
                         app.installer_state.locate_response = Some(res);
                         app.installer_state.locating = false;
                     }
-                    DownloadProgressChanged(offer_id, progress) => {
-                        if let Some(dl_ing) = app.installing_now.as_mut() {
-                            if dl_ing.offer == offer_id {
-                                dl_ing.downloaded_bytes = progress.bytes;
-                                dl_ing.total_bytes = progress.bytes_total;
-                            }
+                    DownloadProgressChanged(slug, progress) => {
+                        if let Some(dl_ing) = app.installing_now.as_mut().filter(|d| d.slug == slug) {
+                            dl_ing.percent = progress.percent;
+                            dl_ing.downloaded_bytes = progress.bytes;
+                            dl_ing.total_bytes = progress.bytes_total;
                         }
                     }
-                    DownloadFinished(_) => {
-                        // idk
-                    }
-                    DownloadQueueUpdate(current, queue) => {
-                        if let Some(current) = current {
-                            if !app.installing_now.as_ref().is_some_and(|n| n.offer == current) {
-                                app.installing_now = Some(QueuedDownload {
-                                    slug: {
-                                        // This sucks!
-                                        let mut rtn: String = String::new();
-                                        for (slug, game) in &app.games {
-                                            if game.offer.eq(&current) {
-                                                // "but it's less code in the nest"
-                                                // "WHO CARES"
-                                                // (it was the same amount overall)
-                                                rtn = slug.to_string();
-                                                break;
-                                            }
-                                        }
-                                        rtn
-                                    },
-                                    offer: current,
-                                    downloaded_bytes: 0,
-                                    total_bytes: 0,
-                                })
+                    DownloadFinished(_) => {}
+                    DownloadQueueUpdate(current, queue, paused) => {
+                        let queued = |slug: String| QueuedDownload {
+                            offer: app.games.get(&slug).map(|g| g.offer.clone()).unwrap_or_default(),
+                            slug,
+                            percent: 0.0,
+                            downloaded_bytes: 0,
+                            total_bytes: 0,
+                        };
+                        let now = match current {
+                            Some(slug) if app.installing_now.as_ref().is_some_and(|n| n.slug == slug) => {
+                                app.installing_now.take()
                             }
-                        } else {
-                            app.installing_now = None;
-                        }
-
-                        app.install_queue.clear();
-                        for offer in queue {
-                            let i_fucking_hate_this = QueuedDownload {
-                                slug: {
-                                    let mut rtn: String = String::new();
-                                    for (slug, game) in &app.games {
-                                        if game.offer.eq(&offer) {
-                                            rtn = slug.to_string();
-                                            break;
-                                        }
-                                    }
-                                    rtn
-                                },
-                                offer: offer.clone(),
-                                downloaded_bytes: 0,
-                                total_bytes: 0,
-                            };
-                            app.install_queue.insert(offer, i_fucking_hate_this);
-                        }
+                            Some(slug) => Some(queued(slug)),
+                            None => None,
+                        };
+                        app.install_queue = queue.into_iter().map(queued).collect();
+                        app.installing_now = now;
+                        app.downloads_paused = paused;
                     }
                 }
                 ctx.request_repaint();

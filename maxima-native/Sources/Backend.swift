@@ -39,12 +39,13 @@ actor Backend {
     }
 
     /// Control-protocol version this client speaks (`maxima_proto::PROTO_VERSION`).
-    static let protoVersion = 2
+    static let protoVersion = 3
 
     /// Where the running server listens and the token it expects.
     struct Instance {
         let port: UInt16
         let token: String
+        let authorizePort: UInt16?
     }
 
     /// The running server's `instance.json`, or nil when no server holds the
@@ -62,7 +63,8 @@ actor Backend {
               let port = (obj["control_port"] as? NSNumber)?.uint16Value,
               let token = obj["token"] as? String
         else { return nil }
-        return Instance(port: port, token: token)
+        return Instance(port: port, token: token,
+                        authorizePort: (obj["authorize_port"] as? NSNumber)?.uint16Value)
     }
 
     private var writeHandle: FileHandle?
@@ -96,7 +98,7 @@ actor Backend {
                 // can offer a "Start Server" action.
                 throw BackendError.serverUnavailable
             }
-            try spawnServer()
+            try Self.spawnServer()
             // The server publishes its port before logging in, so this is quick.
             for _ in 0..<60 where found == nil {
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -240,7 +242,7 @@ actor Backend {
     /// app's lifecycle. This is only the *fallback* path — when the launchd
     /// service is installed (Settings → boot policy), the server is owned by
     /// launchd and this never runs.
-    private func spawnServer() throws {
+    private nonisolated static func spawnServer() throws {
         guard let server = MaximaCLI.locateServer() else { throw BackendError.cliNotFound }
         let path = server.path
 

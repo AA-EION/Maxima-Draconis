@@ -71,10 +71,10 @@ this recipe does not bundle libraries for.
 Running it:
 
 ```sh
-./Maxima-0.15.2-x86_64.AppImage                   # interactive maxima-cli menu
-./Maxima-0.15.2-x86_64.AppImage launch <slug>     # any maxima-cli arguments
-./Maxima-0.15.2-x86_64.AppImage server            # maxima-server (also: tui, bootstrap, cli)
-./Maxima-0.15.2-x86_64.AppImage link2ea://...     # URLs go to maxima-bootstrap
+./Maxima-0.16.0-x86_64.AppImage                   # interactive maxima-cli menu
+./Maxima-0.16.0-x86_64.AppImage launch <slug>     # any maxima-cli arguments
+./Maxima-0.16.0-x86_64.AppImage server            # maxima-server (also: tui, bootstrap, cli)
+./Maxima-0.16.0-x86_64.AppImage link2ea://...     # URLs go to maxima-bootstrap
 ```
 
 Dispatch (`maxima-launcher.sh`): invoked as `maxima-cli`/`maxima-server`/
@@ -99,8 +99,8 @@ The handlers become active when the AppImage is integrated by AppImageLauncher /
 appimaged, or by hand:
 
 ```sh
-./Maxima-0.15.2-x86_64.AppImage --install-handlers     # writes ~/.local/share/applications/com.ArmchairDevelopers.Maxima.desktop, runs xdg-mime default
-./Maxima-0.15.2-x86_64.AppImage --uninstall-handlers
+./Maxima-0.16.0-x86_64.AppImage --install-handlers     # writes ~/.local/share/applications/com.ArmchairDevelopers.Maxima.desktop, runs xdg-mime default
+./Maxima-0.16.0-x86_64.AppImage --uninstall-handlers
 ```
 
 Without any registration, login still works through the paste-the-redirect-URL

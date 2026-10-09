@@ -75,7 +75,7 @@ async fn connect_ready() -> Result<Arc<MaximaClient>> {
     if client.persona().is_empty() {
         info!("Waiting for the Maxima server to finish the EA login (check your browser)...");
     }
-    match tokio::time::timeout(LOGIN_TIMEOUT, client.await_ready()).await {
+    match tokio::time::timeout(LOGIN_TIMEOUT, client.login_and_await_ready()).await {
         Ok(Ok(_)) => Ok(client),
         Ok(Err(_)) => anyhow::bail!(
             "maxima-server stopped before the login finished — login failed or was cancelled; \
@@ -250,11 +250,21 @@ pub async fn run_install(
 ) -> Result<()> {
     let client = connect_ready().await?;
     let mut events = client.subscribe();
-    client.install_with(slug, options).await?;
+    let slug = client.install_with(slug, options).await?;
     loop {
         let Some(note) = next_event(&client, &mut events).await else {
             anyhow::bail!(SERVER_GONE);
         };
+        let ours = match &note {
+            Notification::InstallProgress { slug: s, .. } => *s == slug,
+            Notification::InstallDone { slug: s } | Notification::InstallError { slug: s, .. } => {
+                s.as_deref().map_or(true, |s| s == slug)
+            }
+            _ => false,
+        };
+        if !ours {
+            continue;
+        }
         match note {
             Notification::InstallProgress { percent, .. } => {
                 if json {
@@ -279,6 +289,28 @@ pub async fn run_install(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+pub async fn run_downloads(request: Request, json: bool) -> Result<()> {
+    let queue = connect_ready().await?.queue(request).await?;
+    if json {
+        println!("{}", serde_json::to_string(&queue)?);
+        return Ok(());
+    }
+    match &queue.current {
+        Some(c) => println!(
+            "downloading: {} ({:.1}%) -> {}",
+            c.slug,
+            queue.percent.unwrap_or(0.0),
+            c.path
+        ),
+        None if queue.paused => println!("paused"),
+        None => println!("nothing downloading"),
+    }
+    for (i, q) in queue.queued.iter().enumerate() {
+        println!("{:>3}. {} -> {}", i + 1, q.slug, q.path);
     }
     Ok(())
 }
@@ -352,6 +384,7 @@ fn notification_event_name(note: &Notification) -> &'static str {
     match note {
         Notification::Ready { .. } => "ready",
         Notification::LoginRequired => "login-required",
+        Notification::LoginFailed { .. } => "login-failed",
         Notification::Presence { .. } => "presence",
         Notification::InstallProgress { .. } => "install-progress",
         Notification::InstallDone { .. } => "install-done",

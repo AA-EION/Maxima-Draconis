@@ -31,7 +31,9 @@ use maxima_proto::instance::{token_matches, InstanceGuard, InstanceState, PROTO_
 use maxima_proto::message::{
     ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
 };
-use maxima_proto::types::{ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, StatusDto};
+use maxima_proto::types::{
+    ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, QueueDto, QueueEntryDto, StatusDto,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,12 +45,15 @@ struct ServerState {
     token: String,
     /// The EA login has finished and the session services are up.
     ready: AtomicBool,
-    installing: Mutex<Option<String>>,
+    login_requested: Notify,
+    logging_in: AtomicBool,
     /// Serialized [`Notification`] lines, broadcast to every client.
     events: broadcast::Sender<String>,
     shutdown: Notify,
     persona: Mutex<String>,
     clients: AtomicUsize,
+    /// Last presence per friend, replayed to clients as they connect.
+    presence: Mutex<HashMap<String, Notification>>,
 }
 
 impl ServerState {
@@ -90,11 +95,13 @@ pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> R
         realm: guard.info().realm.clone(),
         token: guard.info().token.clone(),
         ready: AtomicBool::new(false),
-        installing: Mutex::new(None),
+        login_requested: Notify::new(),
+        logging_in: AtomicBool::new(false),
         events: events_tx,
         shutdown: Notify::new(),
         persona: Mutex::new(String::new()),
         clients: AtomicUsize::new(0),
+        presence: Mutex::new(HashMap::new()),
     });
 
     // Serve before logging in: a first-run login waits on the user in the
@@ -145,7 +152,25 @@ pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> R
 /// Log in, then bring up LSX, `/authorize` and RTM, and announce `ready`.
 async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> Result<()> {
     let maxima_arc = &state.maxima;
-    crate::log_in(maxima_arc).await?;
+    // A client asks for the login (`login`); the server never opens a browser
+    // on its own. A failed login waits for the next request.
+    while !crate::saved_login(maxima_arc).await? {
+        state.notify(Notification::LoginRequired);
+        state.login_requested.notified().await;
+        if crate::saved_login(maxima_arc).await? {
+            break;
+        }
+        state.logging_in.store(true, Ordering::Release);
+        let result = crate::oauth_login(maxima_arc).await;
+        state.logging_in.store(false, Ordering::Release);
+        match result {
+            Ok(()) => break,
+            Err(err) => {
+                warn!("Login failed: {}", err);
+                state.notify(Notification::LoginFailed { error: err.to_string() });
+            }
+        }
+    }
 
     let (persona, lsx_port, authorize_port) = {
         let mut maxima = maxima_arc.lock().await;
@@ -202,28 +227,26 @@ async fn tick_loop(state: Arc<ServerState>) {
     let mut prev_presence: HashMap<String, RichPresence> = HashMap::new();
     let mut was_playing = false;
     let mut last_percent = -1.0_f64;
+    let mut last_queue: Option<QueueDto> = None;
 
     loop {
         tick.tick().await;
         let mut maxima = state.maxima.lock().await;
 
+        let finishing = queue_snapshot(&mut maxima).current.map(|c| c.slug);
         maxima.update().await;
 
-        // After update(), so an install that ended this tick is reported by its
-        // event, never mistaken for success by the "download vanished" check below.
         for event in maxima.consume_pending_events() {
             let notification = match event {
                 MaximaEvent::InstallFinished(_) => {
-                    Notification::InstallDone { slug: state.installing.lock().await.take() }
+                    Notification::InstallDone { slug: finishing.clone() }
                 }
-                MaximaEvent::InstallFailed { message, .. } => Notification::InstallError {
-                    slug: state.installing.lock().await.take(),
-                    message,
-                },
+                MaximaEvent::InstallFailed { message, .. } => {
+                    Notification::InstallError { slug: finishing.clone(), message }
+                }
                 MaximaEvent::ReceivedLSXRequest(..) => continue,
             };
             state.notify(notification);
-            state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
             last_percent = -1.0;
         }
 
@@ -233,29 +256,27 @@ async fn tick_loop(state: Arc<ServerState>) {
         }
         was_playing = playing_now;
 
-        let installing = state.installing.lock().await.clone();
-        if let Some(slug) = installing {
-            match maxima.content_manager().current() {
-                Some(download) => {
-                    let pct = download.percentage_done();
-                    if (pct - last_percent).abs() > 0.05 {
-                        state.notify(Notification::InstallProgress {
-                            slug: slug.clone(),
-                            percent: pct,
-                        });
-                        last_percent = pct;
-                    }
-                }
-                None => {
-                    *state.installing.lock().await = None;
-                    state.notify(Notification::InstallError {
-                        slug: Some(slug),
-                        message: "the download stopped before it finished".into(),
-                    });
-                    state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
-                    last_percent = -1.0;
-                }
+        let queue = queue_snapshot(&mut maxima);
+        if let (Some(current), Some(download)) = (&queue.current, maxima.content_manager().current()) {
+            let pct = download.percentage_done();
+            if (pct - last_percent).abs() > 0.05 {
+                state.notify(Notification::InstallProgress {
+                    slug: current.slug.clone(),
+                    percent: pct,
+                    bytes: download.bytes_downloaded() as u64,
+                    bytes_total: download.bytes_total() as u64,
+                });
+                last_percent = pct;
             }
+        }
+        let shape = QueueDto { percent: None, ..queue };
+        if last_queue.as_ref() != Some(&shape) {
+            state.notify(Notification::DownloadQueue {
+                current: shape.current.as_ref().map(|c| c.slug.clone()),
+                queued: shape.queued.iter().map(|q| q.slug.clone()).collect(),
+                paused: shape.paused,
+            });
+            last_queue = Some(shape);
         }
 
         let _ = maxima.rtm().heartbeat().await;
@@ -267,12 +288,14 @@ async fn tick_loop(state: Arc<ServerState>) {
                 if prev_presence.get(&id) == Some(&presence) {
                     continue;
                 }
-                state.notify(Notification::Presence {
+                let note = Notification::Presence {
                     id: id.clone(),
                     basic: format!("{:?}", presence.basic()),
                     status: presence.status().clone(),
                     game: presence.game().clone(),
-                });
+                };
+                state.presence.lock().await.insert(id.clone(), note.clone());
+                state.notify(note);
                 prev_presence.insert(id, presence);
             }
         }
@@ -323,6 +346,9 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
     if state.is_ready() {
         let persona = state.persona.lock().await.clone();
         send(&out_tx, &Notification::Ready { persona });
+        for note in state.presence.lock().await.values() {
+            send(&out_tx, note);
+        }
     } else {
         send(&out_tx, &Notification::LoginRequired);
     }
@@ -426,6 +452,17 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             return ResponseEnvelope::fail(id, ErrorKind::Invalid, "already identified")
         }
         Request::Status | Request::Shutdown => {}
+        Request::Login => {
+            let status = if state.is_ready() {
+                "logged-in"
+            } else if state.logging_in.load(Ordering::Acquire) {
+                "in-progress"
+            } else {
+                state.login_requested.notify_one();
+                "started"
+            };
+            return ResponseEnvelope::ok(id, json!({ "login": status }));
+        }
         _ if !state.is_ready() => {
             return ResponseEnvelope::fail(
                 id,
@@ -437,7 +474,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
     }
 
     let result: Result<serde_json::Value> = match request {
-        Request::Hello { .. } => unreachable!("handled above"),
+        Request::Hello { .. } | Request::Login => unreachable!("handled above"),
         Request::Status => Ok(json!({ "status": status(state).await })),
         Request::Shutdown => Ok(json!({ "stopping": true })),
         Request::ListGames => {
@@ -513,7 +550,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             exclude,
         )
         .await
-        .map(|_| json!({})),
+        .map(|slug| json!({ "slug": slug })),
         Request::LocateGame { path, slug, wine_prefix } => {
             cmd_locate(state, &path, slug, wine_prefix).await.map(|_| json!({}))
         }
@@ -534,6 +571,13 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             cmd_bottle_info(state, &slug, wine_prefix).await.map(|b| json!({ "bottle": b }))
         }
         Request::RegisterProtocols => cmd_register_protocols().await.map(|_| json!({})),
+        Request::DownloadQueue
+        | Request::CancelInstall { .. }
+        | Request::PauseInstall
+        | Request::ResumeInstall
+        | Request::MoveInstallToTop { .. } => {
+            cmd_queue(state, request).await.map(|q| json!({ "queue": q }))
+        }
     };
 
     match result {
@@ -554,7 +598,11 @@ async fn status(state: &Arc<ServerState>) -> StatusDto {
     StatusDto {
         persona: state.persona.lock().await.clone(),
         playing,
-        installing: state.installing.lock().await.clone(),
+        installing: if logged_in {
+            queue_snapshot(&mut *state.maxima.lock().await).current.map(|c| c.slug)
+        } else {
+            None
+        },
         lsx_port,
         clients: state.clients.load(Ordering::SeqCst) as u64,
         realm: state.realm.clone(),
@@ -674,6 +722,12 @@ async fn game_images(state: &Arc<ServerState>, slug: &str) -> Result<maxima_prot
         hero: pick_hero(&images),
         logo: pick_logo(&images),
         background: pick_bg(&heroes),
+        background_video: heroes
+            .as_ref()
+            .and_then(|h| h.items().get(0))
+            .and_then(|hub| hub.background_video().as_ref())
+            .and_then(|video| video.url().clone())
+            .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
     })
 }
 
@@ -872,7 +926,7 @@ async fn cmd_install(
     only_listed_files: bool,
     wine_prefix: Option<String>,
     exclude: Vec<String>,
-) -> Result<()> {
+) -> Result<String> {
     use maxima::content::manager::QueuedGameBuilder;
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
@@ -941,19 +995,27 @@ async fn cmd_install(
             state.notify(Notification::InstallProgress {
                 slug: slug.clone(),
                 percent: (idx as f64 / total as f64) * 100.0,
+                bytes: 0,
+                bytes_total: 0,
             });
             downloader.download_single_file(entry, None).await?;
         }
-        state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 100.0 });
-        state.notify(Notification::InstallDone { slug: Some(slug) });
-        return Ok(());
+        state.notify(Notification::InstallProgress {
+            slug: slug.clone(),
+            percent: 100.0,
+            bytes: 0,
+            bytes_total: 0,
+        });
+        state.notify(Notification::InstallDone { slug: Some(slug.clone()) });
+        return Ok(slug);
     }
 
-    // Full install: queue it; the tick loop broadcasts progress.
-    if state.installing.lock().await.is_some() {
-        return Err(Busy("another install is already running".into()).into());
-    }
+    // Full install: queue it; the tick loop broadcasts queue and progress.
     let mut maxima = state.maxima.lock().await;
+    let queue = queue_snapshot(&mut maxima);
+    if queue.current.iter().chain(&queue.queued).any(|q| q.offer_id == offer_id) {
+        return Ok(slug);
+    }
     let locale = maxima.locale().full_str().to_owned();
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
@@ -964,13 +1026,55 @@ async fn cmd_install(
         .exclude(exclude)
         .locale(Some(locale))
         .build()?;
-    maxima.content_manager().install_now(game).await?;
-    drop(maxima);
+    maxima.content_manager().add_install(game).await?;
+    Ok(slug)
+}
 
-    *state.installing.lock().await = Some(slug.clone());
-    state.notify(Notification::InstallProgress { slug: slug.clone(), percent: 0.0 });
-    state.notify(Notification::DownloadQueue { current: Some(slug), queued: vec![] });
-    Ok(())
+fn queue_entry(game: &maxima::content::manager::QueuedGame) -> QueueEntryDto {
+    QueueEntryDto {
+        slug: if game.slug().is_empty() { game.offer_id().clone() } else { game.slug().clone() },
+        offer_id: game.offer_id().clone(),
+        path: game.path().to_string_lossy().into_owned(),
+    }
+}
+
+fn queue_snapshot(maxima: &mut Maxima) -> QueueDto {
+    let manager = maxima.content_manager();
+    let queue = manager.queue();
+    QueueDto {
+        current: queue.current().as_ref().map(queue_entry),
+        percent: manager.current().as_ref().map(|d| d.percentage_done()),
+        queued: queue.queued().iter().map(queue_entry).collect(),
+        paused: *queue.paused(),
+    }
+}
+
+async fn cmd_queue(state: &Arc<ServerState>, request: Request) -> Result<QueueDto> {
+    let mut maxima = state.maxima.lock().await;
+    let offer_of = |maxima: &mut Maxima, slug: &str| -> Result<String> {
+        let queue = queue_snapshot(maxima);
+        queue
+            .current
+            .iter()
+            .chain(&queue.queued)
+            .find(|q| q.slug == slug || q.offer_id == slug)
+            .map(|q| q.offer_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("'{}' is not in the download queue", slug))
+    };
+    match request {
+        Request::CancelInstall { slug } => {
+            let offer = offer_of(&mut maxima, &slug)?;
+            maxima.content_manager().cancel_install(&offer).await?;
+        }
+        Request::MoveInstallToTop { slug } => {
+            let offer = offer_of(&mut maxima, &slug)?;
+            maxima.content_manager().move_install_to_top(&offer).await?;
+        }
+        Request::PauseInstall => maxima.content_manager().pause_install().await?,
+        Request::ResumeInstall => maxima.content_manager().resume_queue().await?,
+        _ => {}
+    }
+    Ok(queue_snapshot(&mut maxima))
 }
 
 /// Size-verify a game's files against the build manifest; `repair`
@@ -1328,6 +1432,12 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
             None
         };
         let record = base.install_info();
+        let downloads = base.offer().downloads();
+        let live = if downloads.len() == 1 {
+            downloads.first()
+        } else {
+            downloads.iter().find(|d| d.download_type() == "LIVE")
+        };
         let extra_offers = title
             .extra_offers()
             .iter()
@@ -1354,6 +1464,8 @@ async fn games_json(maxima: &mut Maxima) -> Result<Vec<GameDto>> {
                 .as_ref()
                 .and_then(|r| r.wine_prefix.as_ref())
                 .map(|p| p.display().to_string()),
+            latest_version: live.map(|d| d.version().to_owned()),
+            mandatory_update: live.map_or(false, |d| *d.treat_updates_as_mandatory()),
         });
     }
     Ok(out)

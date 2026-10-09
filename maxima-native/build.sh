@@ -2,9 +2,10 @@
 # Maxima native macOS UI — build script.
 #
 # Assembles Maxima.app (SwiftUI, Liquid Glass, macOS 26+) from
-# Sources/*.swift, and bundles the native maxima-cli / maxima-bootstrap /
-# MaximaBootstrap.app into Contents/Resources when they've been built —
-# making the .app self-contained. Without bundled binaries the app falls
+# Sources/*.swift, and bundles the native maxima-server / maxima-cli /
+# maxima-bootstrap into Contents/Resources when they've been built —
+# making the .app self-contained. The app itself handles qrc:// / link2ea:// /
+# origin2://. Without bundled binaries the app falls
 # back to the dev-tree target/release lookup (see MaximaCLI.locate()).
 #
 # Usage: bash maxima-native/build.sh [--skip-bundle-binaries]
@@ -87,6 +88,19 @@ cat > "${APP}/Contents/Info.plist" <<'PLIST'
     <true/>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.games</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.armchairdevelopers.maxima.native</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>qrc</string>
+                <string>link2ea</string>
+                <string>origin2</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
@@ -101,16 +115,6 @@ if $BUNDLE_BINARIES; then
             echo "  - ${bin} not built (cargo build --release -p ${bin}); app will use the dev-tree fallback"
         fi
     done
-    # register-protocols expects the bundle next to the CLI:
-    # <cli dir>/bundle/osx/MaximaBootstrap.app
-    if [[ -d "${RELEASE_DIR}/bundle/osx/MaximaBootstrap.app" ]]; then
-        mkdir -p "${APP}/Contents/Resources/bundle/osx"
-        cp -R "${RELEASE_DIR}/bundle/osx/MaximaBootstrap.app" \
-              "${APP}/Contents/Resources/bundle/osx/"
-        echo "  + MaximaBootstrap.app"
-    else
-        echo "  - MaximaBootstrap.app not built (bash maxima-bootstrap/build-app.sh)"
-    fi
 else
     echo "[3/4] Skipping binary bundling (--skip-bundle-binaries)"
 fi

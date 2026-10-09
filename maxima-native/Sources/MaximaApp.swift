@@ -48,6 +48,18 @@ private let napPreventionToken: NSObjectProtocol = ProcessInfo.processInfo.begin
 /// windowed app from the start.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let menubarMode = CommandLine.arguments.contains("--menubar")
+
+    // Before launch finishes, so the URL that launched the app isn't dropped.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleGetURL(_:withReply:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleGetURL(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
+        guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue else { return }
+        Task { await ProtocolHandler.handle(raw) }
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if AppDelegate.menubarMode {
             NSApp.setActivationPolicy(.accessory)
@@ -75,6 +87,7 @@ struct MaximaApp: App {
         // In menu-bar mode the window is suppressed at launch; "Open Maxima"
         // opens it on demand.
         .defaultLaunchBehavior(AppDelegate.menubarMode ? .suppressed : .automatic)
+        .handlesExternalEvents(matching: [])
 
         // macOS's idiomatic "bar icon": a menu-bar extra reflecting the
         // shared server, with the same three actions the Windows tray and
@@ -94,6 +107,8 @@ struct MaximaApp: App {
                 Text(persona.isEmpty ? "Connected" : "Signed in as \(persona)")
             case .connecting:
                 Text("Connecting…")
+            case .loginRequired:
+                Button("Log in to EA…") { store.login() }
             case .stopped:
                 Text("Server stopped")
             }
@@ -202,6 +217,9 @@ struct ContentView: View {
             case .connecting:
                 ProgressView().controlSize(.mini)
                 Text("Connecting…").font(.caption)
+            case .loginRequired:
+                Circle().fill(.orange).frame(width: 7, height: 7)
+                Text("Not logged in").font(.caption)
             case .ready(let persona):
                 Circle().fill(.green).frame(width: 7, height: 7)
                 Text(persona.isEmpty ? "Connected" : persona)

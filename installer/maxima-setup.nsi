@@ -152,7 +152,7 @@
 !define PRODUCT_NAME "Maxima"
 !define PRODUCT_PUBLISHER "Armchair Developers"
 !define PRODUCT_WEB_SITE "https://github.com/ArmchairDevelopers/Maxima"
-!define PRODUCT_VERSION "0.15.2"
+!define PRODUCT_VERSION "0.16.0"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
 
@@ -212,6 +212,12 @@ Section "Maxima Core" SEC_CORE
 
     SetOutPath "$INSTDIR"
     SetOverwrite on
+
+    ; A server left running by the previous version would refuse the new
+    ; clients (protocol mismatch) and keeps its exe locked.
+    IfFileExists "$INSTDIR\maxima-cli.exe" 0 +3
+        nsExec::ExecToLog '"$INSTDIR\maxima-cli.exe" server-stop'
+        Sleep 1500
 
     ; Install binaries
     File "${BIN_DIR}\maxima-bootstrap.exe"

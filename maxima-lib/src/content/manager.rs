@@ -513,7 +513,8 @@ impl ContentManager {
         Ok(())
     }
 
-    /// Stop the download of `offer_id` if it's running and drop it from the queue.
+    /// Stop the download of `offer_id` if it's running, drop it from the queue
+    /// and start the next one unless the queue is paused.
     pub async fn cancel_install(&mut self, offer_id: &str) -> Result<(), ContentManagerError> {
         if self.current.as_ref().is_some_and(|c| c.offer_id == offer_id) {
             if let Some(current) = self.current.take() {
@@ -521,7 +522,8 @@ impl ContentManager {
             }
         }
         self.queue.forget(offer_id);
-        self.queue.save().await
+        self.queue.save().await?;
+        self.advance().await
     }
 
     /// Stop the running download and hold the queue until `resume_queue`.

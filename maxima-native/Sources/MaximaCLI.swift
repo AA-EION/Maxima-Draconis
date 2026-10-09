@@ -197,10 +197,6 @@ enum MaximaCLI {
         return try JSONDecoder().decode(BottleInfo.self, from: data)
     }
 
-    static func registerProtocols() async throws {
-        _ = try await run(["register-protocols"])
-    }
-
     // Background service ---------------------------------------------------
 
     /// Register the server with the OS + set the boot policy

@@ -14,7 +14,7 @@ use egui::{
     Response, Rounding, Stroke, Style, TextureId, Ui, Vec2, ViewportBuilder, Visuals, Widget,
 };
 use log::error;
-use maxima::{core::library::OwnedOffer, util::log::init_logger};
+use maxima::util::log::init_logger;
 use std::{collections::HashMap, default::Default, ops::RangeInclusive, path::PathBuf};
 use strum_macros::EnumIter;
 use ui_image::{UIImageCache, UIImageType};
@@ -39,7 +39,6 @@ use game_view_bg_renderer::GameViewBgRenderer;
 use renderers::{app_bg_renderer, game_view_bg_renderer};
 use translation_manager::{positional_replace, TranslationManager};
 
-pub mod bridge;
 pub mod util;
 mod views;
 pub mod widgets;
@@ -139,11 +138,6 @@ fn main() {
     install_panic_hook();
     init_logger();
 
-    // Bring the Maxima server up if it isn't already (and wasn't started at
-    // logon), so its tray / menu-bar and any other clients are available.
-    // Best-effort; this UI keeps running its own in-process session and its
-    // start_lsx defers to the server's LSX when the port is already bound.
-    maxima::server_client::ensure_running();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -322,7 +316,7 @@ pub struct GameInfo {
     /// Game info
     details: GameDetailsWrapper,
     version: GameVersionInfo,
-    dlc: Vec<OwnedOffer>,
+    dlc: Vec<maxima_proto::ExtraOfferDto>,
     installed: bool,
     has_cloud_saves: bool,
 }
@@ -408,7 +402,8 @@ pub struct MaximaEguiApp {
     /// Currently downloading game
     installing_now: Option<QueuedDownload>,
     /// Queue of game installs, indexed by offer ID
-    install_queue: HashMap<String, QueuedDownload>,
+    install_queue: Vec<QueuedDownload>,
+    downloads_paused: bool,
     /// State for installer modal
     installer_state: InstallModalState,
     /// User Settings for the frontend
@@ -426,6 +421,7 @@ pub struct MaximaEguiApp {
     /// `take()`-d so we don't re-fire it on later login state
     /// changes. `None` for a normal interactive launch.
     pub pending_install: Option<(String, PathBuf)>,
+    auto_login_sent: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, EnumIter)]
@@ -631,11 +627,13 @@ impl MaximaEguiApp {
             backend_state: BackendStallState::Starting,
             playing_game: None,
             installing_now: None,
-            install_queue: HashMap::new(),
+            install_queue: Vec::new(),
+            downloads_paused: false,
             installer_state: InstallModalState::new(&settings),
             settings,
             swapchain_nudged: false,
             pending_install,
+            auto_login_sent: false,
         }
     }
 }
@@ -1062,11 +1060,6 @@ impl MaximaEguiApp {
                                     let valid = path.exists();
                                     ui.add_enabled_ui(valid, |ui| {
                                         if ui.add_sized(button_size, egui::Button::new(&self.locale.localization.modals.game_install.fresh_action)).clicked() {
-                                            if self.installing_now.is_none() {
-                                                self.installing_now = Some(QueuedDownload { slug: game.slug.clone(), offer: game.offer.clone(), downloaded_bytes: 0, total_bytes: 0 });
-                                            } else {
-                                                self.install_queue.insert(game.offer.clone(),QueuedDownload { slug: game.slug.clone(), offer: game.offer.clone(), downloaded_bytes: 0, total_bytes: 0 });
-                                            }
                                             self.backend.backend_commander.send(bridge_thread::MaximaLibRequest::InstallGameRequest(game.offer.clone(), path.join(slug))).unwrap();
 
                                             clear = true;

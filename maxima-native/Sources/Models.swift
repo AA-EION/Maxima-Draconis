@@ -64,7 +64,13 @@ enum GameStatus: Equatable {
     case notInstalled
     case installed
     case installing(Double) // percent, 0–100
+    case queued
     case running
+
+    var isInstalling: Bool {
+        if case .installing = self { return true }
+        return false
+    }
 }
 
 /// A friend from the backend's `friends` response.
@@ -92,6 +98,7 @@ struct GameLocalSettings: Codable, Equatable {
 
 enum BackendState: Equatable {
     case connecting
+    case loginRequired(error: String?)
     case ready(persona: String)
     case stopped(reason: String?)
 }

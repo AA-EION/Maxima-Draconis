@@ -24,5 +24,5 @@ pub use message::{
 };
 pub use types::{
     BottleInfoDto, ExtraOfferDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, PresenceDto,
-    StatusDto, UserDto, VerifyResultDto,
+    QueueDto, QueueEntryDto, StatusDto, UserDto, VerifyResultDto,
 };

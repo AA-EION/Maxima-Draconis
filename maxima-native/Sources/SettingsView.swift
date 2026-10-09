@@ -175,7 +175,7 @@ struct SettingsView: View {
         registerResult = nil
         Task {
             do {
-                try await MaximaCLI.registerProtocols()
+                try await ProtocolHandler.register()
                 registerResult = "Registered ✓"
             } catch {
                 registerResult = error.localizedDescription

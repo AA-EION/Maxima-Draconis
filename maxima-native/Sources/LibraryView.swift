@@ -20,6 +20,16 @@ struct LibraryView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 140)
+            case .loginRequired(let error):
+                VStack(spacing: 14) {
+                    Text("Log in to your EA account").font(.title3)
+                    if let error { Text(error).font(.caption).foregroundStyle(.secondary) }
+                    Button("Log in") { store.login() }
+                        .buttonStyle(.glassProminent)
+                        .tint(maximaOrange)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 140)
             case .stopped(let reason):
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
@@ -116,6 +126,8 @@ struct GameCard: View {
             pill("Running", color: maximaOrange)
         case .installing:
             pill("Installing", color: .blue)
+        case .queued:
+            pill("Queued", color: .blue)
         case .notInstalled, .unknown:
             pill("Not installed", color: .secondary)
         }
@@ -157,6 +169,11 @@ struct GameCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        case .queued:
+            Label("Queued", systemImage: "clock")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
         case .running:
             Label("Game is running", systemImage: "circle.fill")
                 .font(.callout)

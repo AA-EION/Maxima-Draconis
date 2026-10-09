@@ -49,7 +49,6 @@ for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
 done
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-BOOTSTRAP_APP="${RES}/bundle/osx/MaximaBootstrap.app"
 
 CONSOLE_USER="$(stat -f%Su /dev/console)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -x "$CLI" ]; then
@@ -58,11 +57,9 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -x "$CLI" ]; the
     # be on the sandboxed script's PATH).
     launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
         "$CLI" service install --boot on-demand || true
-    # Register qrc:// / link2ea:// / origin2:// (no login needed).
-    if [ -d "$BOOTSTRAP_APP" ]; then
-        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
-            "$LSREGISTER" -f "$BOOTSTRAP_APP" || true
-    fi
+    # Maxima.app itself claims qrc:// / link2ea:// / origin2://.
+    launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
+        "$LSREGISTER" -f /Applications/Maxima.app || true
 fi
 exit 0
 POST
