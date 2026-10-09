@@ -22,6 +22,7 @@
 pub mod backend;
 pub mod client;
 pub mod model;
+pub mod social;
 
 #[cfg(feature = "presence-grpc")]
 pub mod grpc;

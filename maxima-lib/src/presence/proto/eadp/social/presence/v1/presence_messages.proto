@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+// Reverse-engineered from EA app's social presence service (upstream Maxima
+// PR 67). Timestamp and Duration fields are deliberately omitted: nothing here
+// reads them, and protobuf decoding skips unknown fields, so the remaining
+// field numbers stay wire-compatible.
+
+import "eadp/common/v1/id.proto";
+import "eadp/common/v2/id.proto";
+
+package eadp.social.presence.v1;
+
+message Value {
+  oneof value {
+    string stringValue = 1;
+    string localizedStringValue = 2;
+    sint64 integerValue = 3;
+    float floatValue = 4;
+  }
+}
+
+message PresenceSessionToken {
+  bytes token = 1;
+}
+
+message CreatePresenceSessionResponse {
+  string presenceSessionId = 1;
+  PresenceSessionToken presenceSessionToken = 2;
+}
+
+message ClientInfo {
+  eadp.common.v1.PlayerNetworkId playerNetworkId = 1;
+  eadp.common.v1.ProductId productId = 2;
+  eadp.common.v1.DevicePlatformId devicePlatformId = 3;
+  string locale = 4;
+}
+
+message CreatePresenceSessionRequest {
+  ClientInfo clientInfo = 1;
+}
+
+message SubscribeToFriendsPresenceRequest {
+  PresenceSessionToken presenceSessionToken = 1;
+}
+
+message SubscribeToFriendsPresenceResponse { }
+
+message PresenceUpdate {
+  message PropertiesEnt {
+    string key = 1;
+    Value value = 2;
+  }
+
+  bool appearOffline = 1;
+
+  repeated PropertiesEnt properties = 2;
+}
+
+message ConnectToPresenceSessionRequest {
+  PresenceSessionToken presenceSessionToken = 1;
+  repeated PresenceUpdate presence = 2;
+}
+
+message PresenceSessionNotification {
+  message PropertiesEnt {
+    string key = 1;
+    Value value = 2;
+  }
+
+  string presenceSessionId = 1;
+  bool online = 2;
+  ClientInfo client = 4;
+  string activityDescription = 5;
+  string activityDetails = 6;
+  repeated PropertiesEnt properties = 7;
+  bool lookingForMore = 8;
+  bool joinable = 9;
+  repeated uint32 inputTypes = 10;
+  repeated string gameJoinTokenTypes = 11;
+  bool updated = 13;
+}
+
+message PresenceNotification {
+  eadp.common.v2.PlayerId playerId = 1;
+  bool playerOnline = 2;
+  PresenceSessionNotification sessionNotification = 4;
+}
+
+message ConnectToPresenceSessionResponse {
+  PresenceNotification presenceNotification = 1;
+}
+
+message PartialUpdatePresenceSessionRequest {
+  PresenceSessionToken presenceSessionToken = 1;
+  PresenceUpdate presenceUpdate = 2;
+}
+
+message PartialUpdatePresenceSessionResponse { }

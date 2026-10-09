@@ -14,9 +14,9 @@ rust-version = "1.81.0"
 
 [features]
 default = []
-# EA's social gRPC presence service (upstream PR 67). Pulls tonic/prost 0.13/
-# rustls 0.23; selected at runtime with MAXIMA_PRESENCE_BACKEND=grpc|auto.
-presence-grpc = []
+# EA's social gRPC presence service (upstream PR 67): the tonic transport.
+# Off by default; selected at runtime with MAXIMA_PRESENCE_BACKEND=grpc|auto.
+presence-grpc = ["dep:tonic"]
 
 [dependencies]
 maxima-proto = { path = "../maxima-proto" }
@@ -84,6 +84,17 @@ gethostname = "0.5.0"
 thiserror = "2.0.12"
 url = "2.5.2"
 http = "0.2.12"
+
+# Transport for the `presence-grpc` feature. The protobuf messages stay on the
+# workspace's prost 0.12 (see presence/grpc.rs for the codec that bridges the
+# two), so tonic's own `prost` feature is deliberately left off: enabling the
+# feature adds tonic + hyper/h2/tower and rustls 0.23, but no second prost.
+tonic = { version = "0.13.1", optional = true, default-features = false, features = [
+    "channel",
+    "codegen",
+    "tls-ring",
+    "tls-webpki-roots",
+] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [
