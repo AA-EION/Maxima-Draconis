@@ -78,6 +78,7 @@ gethostname = "0.5.0"
 thiserror = "2.0.12"
 url = "2.5.2"
 http = "0.2.12"
+globset = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = [
@@ -113,6 +114,9 @@ libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.12.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lib]
 name = "maxima"
