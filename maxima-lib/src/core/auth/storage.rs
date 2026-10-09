@@ -232,9 +232,25 @@ impl AuthStorage {
     }
 
     pub fn load() -> Result<LockedAuthStorage, AuthError> {
+        Ok(Arc::new(Mutex::new(Self::read_from_disk()?)))
+    }
+
+    /// Replace this storage with the saved one, e.g. after another process of
+    /// the same installation (the Maxima server) logged in.
+    pub fn reload(&mut self) -> Result<(), AuthError> {
+        *self = Self::read_from_disk()?;
+        Ok(())
+    }
+
+    /// When the saved login was last written, if there is one.
+    pub fn saved_at() -> Option<SystemTime> {
+        maxima_dir().ok()?.join(FILE).metadata().ok()?.modified().ok()
+    }
+
+    fn read_from_disk() -> Result<Self, AuthError> {
         let file = maxima_dir()?.join(FILE);
         if !file.exists() {
-            return Ok(Arc::new(Mutex::new(Self::default())));
+            return Ok(Self::default());
         }
 
         let data = fs::read_to_string(file)?;
@@ -244,7 +260,7 @@ impl AuthStorage {
         });
 
         storage.can_save = true;
-        Ok(Arc::new(Mutex::new(storage)))
+        Ok(storage)
     }
 
     pub fn save(&self) -> Result<(), TokenError> {

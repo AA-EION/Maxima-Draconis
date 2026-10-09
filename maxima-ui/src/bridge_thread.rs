@@ -6,7 +6,7 @@ use crate::bridge::get_games::get_game_bg_video_request;
 use crate::{
     bridge::{
         game_details::game_details_request, get_friends::get_friends_request,
-        get_games::get_games_request, login_oauth::login_oauth, start_game::start_game_request,
+        get_games::get_games_request, login_oauth::{login_oauth, saved_login_appeared}, start_game::start_game_request,
     },
     event_thread::{EventThread, MaximaEventRequest, MaximaEventResponse},
     ui_image::UIImageCacheLoaderCommand,
@@ -312,7 +312,7 @@ impl BridgeThread {
         )
         .await?;
 
-        let logged_in = {
+        let mut logged_in = {
             let maxima = maxima_arc.lock().await;
             maxima.start_lsx(maxima_arc.clone()).await?;
             info!("LSX started");
@@ -323,11 +323,22 @@ impl BridgeThread {
 
         if !logged_in {
             backend_responder.send(MaximaLibResponse::LoginCacheEmpty)?;
+            // The Maxima server started at launch logs in on its own; take its
+            // login as soon as it is saved, whether or not the user pressed
+            // our login button.
+            let saved_login = saved_login_appeared();
+            tokio::pin!(saved_login);
             'outer: loop {
                 let request = match backend_cmd_listener.try_recv() {
                     Ok(request) => Ok::<_, TryRecvError>(request),
                     Err(TryRecvError::Empty) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        tokio::select! {
+                            _ = &mut saved_login => {
+                                logged_in = true;
+                                break 'outer;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                        }
                         continue;
                     }
                     Err(TryRecvError::Disconnected) => return Ok(()),
@@ -338,14 +349,23 @@ impl BridgeThread {
                         let channel = backend_responder.clone();
                         let maxima = maxima_arc.clone();
                         let context = ctx.clone();
-                        async move { login_oauth(maxima, channel, &context).await }
-                            .await
-                            .expect("// TODO(headassbtw): panic message");
+                        tokio::select! {
+                            res = login_oauth(maxima, channel, &context) => {
+                                res.expect("// TODO(headassbtw): panic message");
+                            }
+                            _ = &mut saved_login => logged_in = true,
+                        }
                         break 'outer;
                     }
                     MaximaLibRequest::ShutdownRequest => return Ok(()),
                     _ => {}
                 }
+            }
+
+            if logged_in {
+                info!("Using the login saved by the Maxima server");
+                let maxima = maxima_arc.lock().await;
+                maxima.auth_storage().lock().await.reload()?;
             }
         }
 
