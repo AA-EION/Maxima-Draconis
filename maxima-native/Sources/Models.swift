@@ -92,6 +92,7 @@ struct GameLocalSettings: Codable, Equatable {
 
 enum BackendState: Equatable {
     case connecting
+    case loginRequired(error: String?)
     case ready(persona: String)
     case stopped(reason: String?)
 }

@@ -71,7 +71,9 @@ final class GameStore: ObservableObject {
             backendState = .ready(persona: event["persona"] as? String ?? "")
             Task { await refreshAll() }
         case "login-required":
-            backendState = .connecting
+            backendState = .loginRequired(error: nil)
+        case "login-failed":
+            backendState = .loginRequired(error: event["error"] as? String)
         case "presence":
             guard let id = event["id"] as? String else { return }
             presences[id] = Presence(
@@ -110,6 +112,11 @@ final class GameStore: ObservableObject {
     }
 
     // Data ----------------------------------------------------------------
+
+    /// The server runs the EA login and opens the browser.
+    func login() {
+        Task { _ = try? await backend.request(["cmd": "login"]) }
+    }
 
     func refreshAll() async {
         loading = true

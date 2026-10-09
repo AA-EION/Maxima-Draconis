@@ -68,7 +68,7 @@ impl BridgeThread {
                 .await?;
 
         // The server's `ready` carries the signed-in persona.
-        match client.await_ready().await {
+        match client.login_and_await_ready().await {
             Ok(persona) if !persona.is_empty() => {
                 tx.send(MaximaLibResponse::LoginResponse(InteractThreadLoginResponse {
                     success: true,

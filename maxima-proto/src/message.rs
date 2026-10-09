@@ -42,6 +42,9 @@ pub enum Request {
     Friends,
     Status,
     Shutdown,
+    /// Start the EA login on the server (it opens the browser). No-op when
+    /// already logged in or a login is in progress.
+    Login,
     /// The signed-in user (persona + id + avatar url).
     WhoAmI,
     GameDetails {
@@ -155,6 +158,17 @@ pub enum Request {
     },
     /// Register Maxima's URL protocol handlers with the host OS.
     RegisterProtocols,
+    /// Snapshot of the download queue. The queue commands below answer with
+    /// the same snapshot after acting.
+    DownloadQueue,
+    CancelInstall {
+        slug: String,
+    },
+    PauseInstall,
+    ResumeInstall,
+    MoveInstallToTop {
+        slug: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -223,6 +237,10 @@ pub enum Notification {
     },
     /// Sent after `hello` while the server waits for the EA login.
     LoginRequired,
+    /// The login the server started failed; it is waiting for `login` again.
+    LoginFailed {
+        error: String,
+    },
     Presence {
         id: String,
         basic: String,
@@ -252,6 +270,8 @@ pub enum Notification {
         current: Option<String>,
         #[serde(default)]
         queued: Vec<String>,
+        #[serde(default)]
+        paused: bool,
     },
     VerifyProgress {
         slug: String,

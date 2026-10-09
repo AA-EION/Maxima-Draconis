@@ -20,6 +20,16 @@ struct LibraryView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 140)
+            case .loginRequired(let error):
+                VStack(spacing: 14) {
+                    Text("Log in to your EA account").font(.title3)
+                    if let error { Text(error).font(.caption).foregroundStyle(.secondary) }
+                    Button("Log in") { store.login() }
+                        .buttonStyle(.glassProminent)
+                        .tint(maximaOrange)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 140)
             case .stopped(let reason):
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")

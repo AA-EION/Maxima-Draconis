@@ -94,6 +94,8 @@ struct MaximaApp: App {
                 Text(persona.isEmpty ? "Connected" : "Signed in as \(persona)")
             case .connecting:
                 Text("Connecting…")
+            case .loginRequired:
+                Button("Log in to EA…") { store.login() }
             case .stopped:
                 Text("Server stopped")
             }
@@ -202,6 +204,9 @@ struct ContentView: View {
             case .connecting:
                 ProgressView().controlSize(.mini)
                 Text("Connecting…").font(.caption)
+            case .loginRequired:
+                Circle().fill(.orange).frame(width: 7, height: 7)
+                Text("Not logged in").font(.caption)
             case .ready(let persona):
                 Circle().fill(.green).frame(width: 7, height: 7)
                 Text(persona.isEmpty ? "Connected" : persona)

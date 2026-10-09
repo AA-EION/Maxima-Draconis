@@ -39,7 +39,7 @@ actor Backend {
     }
 
     /// Control-protocol version this client speaks (`maxima_proto::PROTO_VERSION`).
-    static let protoVersion = 2
+    static let protoVersion = 3
 
     /// Where the running server listens and the token it expects.
     struct Instance {

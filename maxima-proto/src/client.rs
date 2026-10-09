@@ -21,7 +21,7 @@ use crate::message::{
     ServerMessage,
 };
 use crate::types::{
-    BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, StatusDto, UserDto,
+    BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, QueueDto, StatusDto, UserDto,
 };
 
 /// Cap for ordinary requests. Long-running ones (verify, file downloads,
@@ -220,6 +220,19 @@ impl MaximaClient {
         }
     }
 
+    /// Ask the server to log in (it opens the browser on its host).
+    pub async fn login(&self) -> Result<(), ClientError> {
+        self.request_raw(Request::Login).await.map(|_| ())
+    }
+
+    /// Start the login if the session isn't ready yet, then wait for it.
+    pub async fn login_and_await_ready(&self) -> Result<String, ClientError> {
+        if self.persona().is_empty() {
+            self.login().await?;
+        }
+        self.await_ready().await
+    }
+
     pub fn is_connected(&self) -> bool {
         *self.connected.borrow()
     }
@@ -391,15 +404,17 @@ impl MaximaClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Install with every option, including the Wine prefix and the file
-    /// exclusion patterns.
+    /// exclusion patterns. Returns the server's canonical slug for the game,
+    /// which keys its install notifications.
     pub async fn install_with(
         &self,
         slug: &str,
         options: InstallOptions,
-    ) -> Result<(), ClientError> {
+    ) -> Result<String, ClientError> {
         let timeout = (!options.only_listed_files).then_some(REQUEST_TIMEOUT);
         self.request_with(
             Request::Install {
@@ -414,7 +429,7 @@ impl MaximaClient {
             timeout,
         )
         .await
-        .map(|_| ())
+        .map(|r| r.field("slug").unwrap_or_else(|| slug.to_owned()))
     }
 
     pub async fn verify(
@@ -522,6 +537,12 @@ impl MaximaClient {
         self.request_with(Request::CloudSync { slug: slug.to_owned(), write, wine_prefix }, None)
             .await
             .map(|_| ())
+    }
+
+    /// Run a queue command (`DownloadQueue`, `CancelInstall`, …) and return
+    /// the queue as it stands afterwards.
+    pub async fn queue(&self, request: Request) -> Result<QueueDto, ClientError> {
+        self.request(request).await?.field("queue").ok_or(ClientError::Malformed("queue"))
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {

@@ -78,16 +78,18 @@ async fn run() -> Result<()> {
     server::run_server(maxima_arc, guard).await
 }
 
-/// Log in — OAuth on first run (opens the browser via qrc://), cached refresh
-/// token afterwards. The server owns login; frontends only wait for `ready`.
-/// Runs while the control port is already serving, so it must not hold the
-/// `Maxima` lock for the minutes a user can spend in the browser.
-pub(crate) async fn log_in(maxima_arc: &LockedMaxima) -> Result<()> {
+/// Whether the saved login (re-read from disk: another process of this
+/// install may have written it) is still valid.
+pub(crate) async fn saved_login(maxima_arc: &LockedMaxima) -> Result<bool> {
     let auth_storage = maxima_arc.lock().await.auth_storage().clone();
     let mut auth_storage = auth_storage.lock().await;
-    if auth_storage.logged_in().await? {
-        return Ok(());
-    }
+    auth_storage.reload()?;
+    Ok(auth_storage.logged_in().await?)
+}
+
+/// Interactive EA login: opens the browser and waits for the qrc:// redirect.
+/// Holds no lock while the user is in the browser.
+pub(crate) async fn oauth_login(maxima_arc: &LockedMaxima) -> Result<()> {
     info!("Logging in...");
     let mut ctx = AuthContext::new()?;
     begin_oauth_login_flow(&mut ctx).await?;
@@ -95,6 +97,7 @@ pub(crate) async fn log_in(maxima_arc: &LockedMaxima) -> Result<()> {
         bail!("Login failed!");
     }
     let token = nucleus_token_exchange(&ctx).await?;
-    auth_storage.add_account(&token).await?;
+    let auth_storage = maxima_arc.lock().await.auth_storage().clone();
+    auth_storage.lock().await.add_account(&token).await?;
     Ok(())
 }

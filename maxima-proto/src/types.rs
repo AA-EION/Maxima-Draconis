@@ -142,3 +142,23 @@ pub struct StatusDto {
     #[serde(default)]
     pub logged_in: bool,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QueueEntryDto {
+    pub slug: String,
+    pub offer_id: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct QueueDto {
+    #[serde(default)]
+    pub current: Option<QueueEntryDto>,
+    /// Percent done of `current`, when it is downloading.
+    #[serde(default)]
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub queued: Vec<QueueEntryDto>,
+    #[serde(default)]
+    pub paused: bool,
+}

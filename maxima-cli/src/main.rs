@@ -363,6 +363,13 @@ enum Mode {
     /// The server itself is the separate `maxima-server` binary — the CLI
     /// only talks to it.
     ServerStop,
+    /// Show the server's download queue, or act on it.
+    Downloads {
+        #[command(subcommand)]
+        action: Option<DownloadsAction>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Report whether a Maxima server is running, and its session state.
     ServerStatus {
         /// Emit a single JSON object instead of human-readable lines.
@@ -565,6 +572,15 @@ fn install_panic_hook() {
 /// Returns true if the parsed mode requests JSON output. Used to enable
 /// stdout suppression on the global logger before anything has a chance to
 /// log — keeps `--json` subcommand output cleanly parseable.
+#[derive(Subcommand, Debug)]
+enum DownloadsAction {
+    Cancel { slug: String },
+    Pause,
+    Resume,
+    /// Start a queued download now, requeueing the current one.
+    Top { slug: String },
+}
+
 fn json_mode(args: &Args) -> bool {
     matches!(
         args.mode,
@@ -574,6 +590,7 @@ fn json_mode(args: &Args) -> bool {
             | Some(Mode::Launch { json: true, .. })
             | Some(Mode::BottleInfo { json: true, .. })
             | Some(Mode::ServerStatus { json: true })
+            | Some(Mode::Downloads { json: true, .. })
     )
 }
 
@@ -716,6 +733,16 @@ async fn startup(args: Args) -> Result<()> {
     match &args.mode {
         Some(Mode::ServerStop) => return server::send_shutdown().await,
         Some(Mode::ServerStatus { json }) => return server::print_status(*json).await,
+        Some(Mode::Downloads { action, json }) => {
+            let request = match action {
+                None => maxima_proto::Request::DownloadQueue,
+                Some(DownloadsAction::Cancel { slug }) => maxima_proto::Request::CancelInstall { slug: slug.clone() },
+                Some(DownloadsAction::Pause) => maxima_proto::Request::PauseInstall,
+                Some(DownloadsAction::Resume) => maxima_proto::Request::ResumeInstall,
+                Some(DownloadsAction::Top { slug }) => maxima_proto::Request::MoveInstallToTop { slug: slug.clone() },
+            };
+            return server::run_downloads(request, *json).await;
+        }
         Some(Mode::Service { action }) => return run_service(action),
         _ => {}
     }

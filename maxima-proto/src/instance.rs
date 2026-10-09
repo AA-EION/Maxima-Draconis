@@ -24,7 +24,7 @@ pub const LOCK_FILE: &str = "instance.lock";
 const REALM_FILE: &str = "realm.json";
 
 /// Version of the control protocol spoken after `hello`.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
