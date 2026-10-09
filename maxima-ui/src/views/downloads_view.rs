@@ -17,9 +17,6 @@ pub struct QueuedDownload {
 }
 
 fn render_queued(app: &mut MaximaEguiApp, ui: &mut Ui, game: &QueuedDownload, is_current: bool) {
-    if is_current {
-        ui.ctx().request_repaint();
-    }
     ui.spacing_mut().item_spacing.y = APP_MARGIN.y;
     let container_size = vec2(ui.available_width(), 160.0);
     ui.allocate_ui(container_size, |ui| {

@@ -265,6 +265,10 @@ struct DownloadContext {
 
 type BytesDownloadedCallback = Box<dyn Fn(usize) + Send + Sync>;
 
+/// Download progress in compressed bytes, reported as they arrive. Signed so a
+/// failed attempt can take back what it reported.
+pub type ProgressCallback = Box<dyn Fn(isize) + Send + Sync>;
+
 struct EntryDownloadRequest<'a> {
     context: &'a DownloadContext,
     url: &'a str,
@@ -390,7 +394,7 @@ impl<'a> EntryDownloadRequest<'a> {
         let stream = data.bytes_stream();
         let counting_stream = ByteCountingStream::new(stream, self.callback.as_ref());
         let stream = counting_stream.into_async_read();
-        let mut stream_reader = BufReader::new(stream.compat());
+        let mut stream_reader = BufReader::with_capacity(READ_BUFFER, stream.compat());
 
         // State deserialization is disabled for now.
         // let out_pos = self.decoder.write_out_pos();
@@ -403,7 +407,7 @@ impl<'a> EntryDownloadRequest<'a> {
         )
         .await?;
 
-        let result = tokio::io::copy(&mut stream_reader, &mut wrapper).await;
+        let result = tokio::io::copy_buf(&mut stream_reader, &mut wrapper).await;
         if let Err(err) = result {
             return Err(DownloaderError::Download(DownloadError::ChunkCopy {
                 entry: self.entry.name().clone(),
@@ -543,8 +547,9 @@ impl ZipDownloader {
     pub async fn download_single_file(
         &self,
         entry: &ZipFileEntry,
-        callback: Option<BytesDownloadedCallback>,
+        callback: Option<ProgressCallback>,
     ) -> Result<usize, DownloaderError> {
+        let callback = callback.map(Arc::new);
         let file_path = self.path.join(entry.name());
 
         // Directory entry / parent-not-yet-created handling.
@@ -585,8 +590,8 @@ impl ZipDownloader {
             if let Ok(EntryDownloadState::Complete) =
                 EntryDownloadRequest::state(&context, entry).await
             {
-                if let Some(cb) = callback {
-                    cb(*entry.compressed_size() as usize);
+                if let Some(cb) = &callback {
+                    cb(*entry.compressed_size() as isize);
                 }
                 return Ok(0);
             }
@@ -611,15 +616,9 @@ impl ZipDownloader {
         //      attempt N+1's writer stops. Even when the decode
         //      succeeded, the file would carry trailing garbage.
         //
-        //   3. **Bytes over-counting** — the `BytesDownloadedCallback`
-        //      fires on every chunk via `ByteCountingStream`, regardless
-        //      of whether the attempt eventually succeeds. With the
-        //      caller's counter being incremented from every retry's
-        //      partial bytes, a single 6-retry file pushed `completed_bytes`
-        //      well past `total_bytes`. Combined with `is_done() == `
-        //      (also fixed in this PR), this kept installs hung forever.
-        //      Fix: per-attempt local counter, committed to the caller's
-        //      callback only when the attempt succeeds.
+        //   3. **Bytes over-counting** — progress is reported live, so a
+        //      failed attempt takes back the bytes it reported; otherwise
+        //      retries push `completed_bytes` past `total_bytes`.
         const MAX_RETRIES: u32 = 5;
         let end = *entry.compressed_size();
         let mut last_err: Option<DownloaderError> = None;
@@ -633,7 +632,7 @@ impl ZipDownloader {
                 .truncate(true)
                 .open(&file_path)
                 .await?;
-            let writer = tokio::io::BufWriter::new(file);
+            let writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, file);
 
             // Fresh decoder — never reuse one that already consumed
             // partial bytes from a failed attempt.
@@ -647,8 +646,12 @@ impl ZipDownloader {
             // bytes don't pollute `completed_bytes`.
             let attempt_committed = Arc::new(AtomicUsize::new(0));
             let attempt_committed_cb = attempt_committed.clone();
+            let live = callback.clone();
             let attempt_callback: Option<BytesDownloadedCallback> = Some(Box::new(move |bytes| {
                 attempt_committed_cb.fetch_add(bytes, Ordering::SeqCst);
+                if let Some(cb) = &live {
+                    cb(bytes as isize);
+                }
             }));
 
             let mut request = EntryDownloadRequest::new(
@@ -670,15 +673,11 @@ impl ZipDownloader {
             );
 
             match request.download_range(0, end).await {
-                Ok(()) => {
-                    // Successful attempt — commit bytes once to the
-                    // caller's counter.
-                    if let Some(cb) = callback.as_ref() {
-                        cb(attempt_committed.load(Ordering::SeqCst));
-                    }
-                    return Ok(0);
-                }
+                Ok(()) => return Ok(0),
                 Err(err) => {
+                    if let Some(cb) = &callback {
+                        cb(-(attempt_committed.load(Ordering::SeqCst) as isize));
+                    }
                     if attempt < MAX_RETRIES {
                         // Exponential backoff with jitter (500ms / 1s /
                         // 2s / 4s / 8s base, +0-250ms jitter).
@@ -715,6 +714,11 @@ impl ZipDownloader {
         Err(last_err.expect("last_err always set on failure path"))
     }
 }
+
+/// Large I/O buffers: every write to a tokio `File` is a hop to the blocking
+/// pool, which is costly per call (more so under Wine).
+const READ_BUFFER: usize = 256 * 1024;
+const WRITE_BUFFER: usize = 1024 * 1024;
 
 /// How long a download may go without receiving a single byte before we
 /// treat the connection as dead. reqwest 0.11 has no read/stall timeout of

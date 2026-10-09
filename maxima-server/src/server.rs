@@ -199,6 +199,9 @@ async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> R
                 Err(err) => warn!("Friends fetch failed: {}", err),
             }
         }
+        if let Err(err) = maxima.content_manager().start_queue().await {
+            warn!("Couldn't resume the download queue: {}", err);
+        }
         let user = maxima.local_user().await?;
         let persona = user
             .player()
