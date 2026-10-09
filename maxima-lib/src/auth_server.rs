@@ -57,7 +57,7 @@
 //! the standard active-launch branch (not the catornot external-LSX
 //! branch).
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use log::{debug, error, info, warn};
 use serde::Serialize;
@@ -89,7 +89,9 @@ use crate::core::{
     Maxima,
 };
 use crate::steam::{
-    lookup_steam_game, lookup_steam_game_by_offer, resolve_steam_install_path, STEAM_APP_ID_PATTERN,
+    installed_steam_app, installed_steam_apps, load_game_overrides, match_offer_by_name,
+    normalize_name, override_for_offer, override_for_steam_app, override_install_dir,
+    InstalledSteamApp, STEAM_APP_ID_PATTERN,
 };
 
 /// Header carrying the session token from `instance.json`.
@@ -256,6 +258,11 @@ enum AuthorizeError {
     NotLoggedIn,
     #[error("no owned offer '{0}' in EA library — link your Steam account at https://www.ea.com")]
     OfferNotFound(String),
+    #[error(
+        "Steam app '{0}' could not be matched to a game in your EA library: no entry in \
+         game-overrides.json and no installed Steam app with a matching name"
+    )]
+    SteamAppUnresolved(String),
     #[error(transparent)]
     Token(#[from] TokenError),
     #[error(transparent)]
@@ -269,7 +276,9 @@ impl AuthorizeError {
         match self {
             AuthorizeError::MissingOfferId => (400, "Bad Request"),
             AuthorizeError::NotLoggedIn | AuthorizeError::Token(_) => (401, "Unauthorized"),
-            AuthorizeError::OfferNotFound(_) => (404, "Not Found"),
+            AuthorizeError::OfferNotFound(_) | AuthorizeError::SteamAppUnresolved(_) => {
+                (404, "Not Found")
+            }
             // `LaunchError::NotInstalled` / `NoOfferFound` are also "not found"
             // shaped; map them precisely so curl users see a useful status.
             AuthorizeError::Launch(LaunchError::NotInstalled(_))
@@ -296,44 +305,12 @@ async fn handle_authorize(
     let raw_offer_id = raw_offer_id.ok_or(AuthorizeError::MissingOfferId)?;
     info!("Authorize request for slug '{}'", raw_offer_id);
 
-    // Steam emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
-    // (e.g. `1237970` for TF2). EA Desktop's library is keyed by Origin
-    // offer IDs like `Origin.OFR.50.0001456`, so we translate via the
-    // STEAM_GAMES table before doing the library lookup. The original
-    // slug is kept as `steam_app_id` to thread through to `launch.rs`
-    // for SteamAppId/SteamGameId env-var setup on the spawned game.
-    let (offer_id, steam_app_id): (String, Option<String>) =
-        if STEAM_APP_ID_PATTERN.is_match(raw_offer_id) {
-            match lookup_steam_game(raw_offer_id) {
-                Some(entry) => {
-                    info!(
-                        "Steam App ID '{}' resolved to Origin offer ID '{}'",
-                        raw_offer_id, entry.origin_offer_id
-                    );
-                    (
-                        entry.origin_offer_id.to_owned(),
-                        Some(raw_offer_id.to_owned()),
-                    )
-                }
-                None => {
-                    warn!(
-                        "Steam App ID '{}' is not in the STEAM_GAMES table; \
-                         passing through directly (will likely 404 in library lookup)",
-                        raw_offer_id
-                    );
-                    (raw_offer_id.to_owned(), Some(raw_offer_id.to_owned()))
-                }
-            }
-        } else {
-            // Looks like an Origin offer ID already (TF2 itself emits
-            // these mid-run; older EA-Desktop-style launches go this
-            // path too).
-            (raw_offer_id.to_owned(), None)
-        };
+    let overrides = load_game_overrides();
+    let is_steam_id = STEAM_APP_ID_PATTERN.is_match(raw_offer_id);
 
-    // Phase 1: cheap pre-checks. Drop the lock before
+    // Phase 1: pre-checks and resolution. Drop the lock before
     // `launch::start_game` re-acquires it, so we don't deadlock.
-    {
+    let (offer_id, steam_app_id, install_dir) = {
         let mut maxima = maxima_arc.lock().await;
 
         // `logged_in()` re-validates the cached token so an expired
@@ -346,29 +323,99 @@ async fn handle_authorize(
             return Err(AuthorizeError::NotLoggedIn);
         }
 
-        // Confirm the (translated) offer is in the user's EA library
-        // here so we can give a clean 404 ("link your accounts at
-        // ea.com") instead of bubbling a less-helpful
-        // `LaunchError::NoOfferFound` later.
-        if maxima
+        let titles: Vec<LibraryEntry> = maxima
+            .mut_library()
+            .games()
+            .await?
+            .iter()
+            .map(|title| {
+                let base = title.base_offer();
+                LibraryEntry {
+                    offer_id: base.offer_id().clone(),
+                    slug: base.slug().clone(),
+                    names: vec![title.name(), base.offer().display_name().to_owned()],
+                }
+            })
+            .collect();
+        let slugs: Vec<&str> = titles.iter().map(|t| t.slug.as_str()).collect();
+        let prefixes = steam_prefix_candidates(&slugs);
+
+        // Steam emits `link2ea://launchgame/<numeric_steam_app_id>?platform=steam`
+        // while EA's library is keyed by Origin offer IDs. Map the App ID to
+        // an offer through the overrides file, else through the installed
+        // Steam app's name. The App ID itself is threaded on to `launch.rs`
+        // for the SteamAppId/SteamGameId env vars on the spawned game.
+        let (offer_id, steam_app_id, installed, by_override) = if is_steam_id {
+            let by_override = override_for_steam_app(&overrides, raw_offer_id);
+            let installed = find_installed_app(raw_offer_id, &prefixes);
+            let offer_id = match by_override {
+                Some(entry) => entry.offer_id.clone(),
+                None => installed
+                    .as_ref()
+                    .and_then(|(app, _)| {
+                        let candidates: Vec<(String, Vec<String>)> = titles
+                            .iter()
+                            .map(|t| (t.offer_id.clone(), t.names.clone()))
+                            .collect();
+                        match_offer_by_name(&app.manifest.name, &candidates)
+                    })
+                    .ok_or_else(|| AuthorizeError::SteamAppUnresolved(raw_offer_id.to_owned()))?,
+            };
+            info!(
+                "Steam App ID '{}' resolved to offer '{}'",
+                raw_offer_id, offer_id
+            );
+            (offer_id, Some(raw_offer_id.to_owned()), installed, by_override)
+        } else {
+            // Already an offer ID (games emit these mid-run too).
+            (
+                raw_offer_id.to_owned(),
+                None,
+                None,
+                override_for_offer(&overrides, raw_offer_id),
+            )
+        };
+
+        // Confirm the offer is in the user's EA library here so we can give
+        // a clean 404 ("link your accounts at ea.com") instead of bubbling a
+        // less-helpful `LaunchError::NoOfferFound` later.
+        let offer = maxima
             .mut_library()
             .game_by_base_offer(&offer_id)
             .await?
-            .is_none()
-        {
-            return Err(AuthorizeError::OfferNotFound(offer_id.clone()));
-        }
-    }
+            .cloned()
+            .ok_or_else(|| AuthorizeError::OfferNotFound(offer_id.clone()))?;
 
-    // Phase 2: build LaunchOptions. The Steam-install path fallback is
-    // crucial for Titanfall 2 from Steam — EA Desktop has no record of
-    // the install, so `launch::start_game` would bail with
-    // `LaunchError::NotInstalled` without an explicit override.
-    let path_override = lookup_steam_game_by_offer(&offer_id)
-        .and_then(resolve_steam_install_path)
-        .and_then(|p| p.to_str().map(str::to_owned));
+        // Where a copy EA Desktop has no record of lives (e.g. in a Steam
+        // library): the overrides file, else the Steam app that was
+        // resolved, else - for a game EA doesn't see installed - an
+        // installed Steam app of the same name. `launch::start_game` turns
+        // the directory into the executable.
+        let prefix_hint = installed
+            .as_ref()
+            .and_then(|(_, prefix)| prefix.as_deref())
+            .or_else(|| prefixes.iter().find_map(|p| p.as_deref()));
+        let install_dir = by_override
+            .and_then(|entry| entry.install_dir.as_deref())
+            .and_then(|dir| override_install_dir(dir, prefix_hint))
+            .or_else(|| installed.as_ref().map(|(app, _)| app.install_dir()));
+        let install_dir = match install_dir {
+            Some(dir) => Some(dir),
+            None if !offer.is_installed().await => {
+                find_installed_by_name(&offer_names(&titles, &offer_id), &prefixes)
+                    .map(|app| app.install_dir())
+            }
+            None => None,
+        };
+
+        (offer_id, steam_app_id, install_dir)
+    };
+
+    let path_override = install_dir
+        .filter(|dir| dir.exists())
+        .and_then(|dir| dir.to_str().map(str::to_owned));
     if let Some(ref p) = path_override {
-        info!("Resolved Steam install path for {}: {}", offer_id, p);
+        info!("Resolved install directory for {}: {}", offer_id, p);
     }
 
     let arguments = cmd_params
@@ -389,12 +436,10 @@ async fn handle_authorize(
         arguments,
         cloud_saves: true,
         // Threading the original Steam App ID (if any) through to
-        // `launch.rs` makes it set SteamAppId/SteamGameId env vars on
-        // the spawned game — without these the game exits with code
-        // 100010 "Steam not detected". Per-game launch args (e.g.
-        // -noOriginStartup, -multiple) must come from the caller via
-        // `cmd_params` or `MAXIMA_LAUNCH_ARGS`; we no longer inject
-        // any TF2-specific defaults.
+        // `launch.rs` makes it set SteamAppId/SteamGameId env vars on the
+        // spawned game; Steam-aware games exit without them. Per-game launch
+        // args must come from the caller via `cmd_params` or
+        // `MAXIMA_LAUNCH_ARGS`.
         steam_app_id,
         entitlement_source: None,
         // The game's own prefix (recorded at install, else its per-game
@@ -417,6 +462,71 @@ async fn handle_authorize(
 
     info!("Game launched for offer '{}'", offer_id);
     Ok(())
+}
+
+struct LibraryEntry {
+    offer_id: String,
+    slug: String,
+    names: Vec<String>,
+}
+
+fn offer_names(titles: &[LibraryEntry], offer_id: &str) -> Vec<String> {
+    titles
+        .iter()
+        .find(|t| t.offer_id == offer_id)
+        .map(|t| t.names.clone())
+        .unwrap_or_default()
+}
+
+/// Wine prefixes that may hold a Steam install, most specific first: the
+/// user override, each library game's own prefix, the ambient one. A single
+/// "no prefix" entry on Windows hosts, where Steam is found natively.
+fn steam_prefix_candidates(slugs: &[&str]) -> Vec<Option<PathBuf>> {
+    #[cfg(unix)]
+    {
+        use crate::unix::prefix;
+
+        let mut found: Vec<Option<PathBuf>> = Vec::new();
+        let mut add = |path: Option<PathBuf>| {
+            if let Some(path) = path.filter(|p| p.exists()) {
+                if !found.contains(&Some(path.clone())) {
+                    found.push(Some(path));
+                }
+            }
+        };
+        add(prefix::explicit_override());
+        for slug in slugs {
+            add(prefix::prefix_for_game(slug, None).ok());
+        }
+        add(prefix::ambient().ok());
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = slugs;
+        vec![None]
+    }
+}
+
+fn find_installed_app(
+    steam_app_id: &str,
+    prefixes: &[Option<PathBuf>],
+) -> Option<(InstalledSteamApp, Option<PathBuf>)> {
+    prefixes.iter().find_map(|prefix| {
+        installed_steam_app(steam_app_id, prefix.as_deref()).map(|app| (app, prefix.clone()))
+    })
+}
+
+fn find_installed_by_name(
+    names: &[String],
+    prefixes: &[Option<PathBuf>],
+) -> Option<InstalledSteamApp> {
+    let wanted: Vec<String> = names.iter().map(|n| normalize_name(n)).collect();
+    prefixes.iter().find_map(|prefix| {
+        installed_steam_apps(prefix.as_deref())
+            .into_iter()
+            .find(|app| wanted.contains(&normalize_name(&app.manifest.name)))
+    })
 }
 
 fn extract_query_param(path_and_query: &str, key: &str) -> Option<String> {

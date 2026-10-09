@@ -23,7 +23,7 @@ use crate::{
         Maxima,
     },
     ooa::{needs_license_update, request_and_save_license, LicenseAuth, LicenseError},
-    steam::{lookup_steam_game_by_offer, STEAM_APP_ID_PATTERN},
+    steam::{load_game_overrides, override_for_offer, STEAM_APP_ID_PATTERN},
     util::{
         native::{is_wine_environment, NativeError, SafeParent, SafeStr},
         registry::bootstrap_path,
@@ -386,45 +386,26 @@ pub async fn start_game(
     let path = if let Some(game_path_override) = options.path_override {
         let p = PathBuf::from(&game_path_override);
         if p.is_dir() {
-            // User passed an install directory, not the executable. Resolve
-            // the exe filename via the STEAM_GAMES table — it's the only
-            // place Maxima carries reliable per-title exe-name mappings for
-            // non-Origin installs (Steam install dirs don't have an Origin
-            // manifest we could otherwise read).
-            match offer
-                .as_ref()
-                .and_then(|o| lookup_steam_game_by_offer(o.offer_id().as_str()))
-            {
-                Some(entry) => {
-                    let exe = p.join(entry.exe_name);
+            // An install directory instead of the executable: find the exe
+            // from the offer's own data or the installer manifest.
+            match exe_in_install_dir(&p, offer.as_ref()).await {
+                Some(exe) => {
                     info!(
-                        "game_path '{}' is a directory; resolved exe to '{}' via STEAM_GAMES",
+                        "game_path '{}' is a directory; resolved exe to '{}'",
                         p.display(),
                         exe.display()
                     );
                     exe
                 }
-                None => match exe_from_install_manifest(&p).await {
-                    Some(exe) => {
-                        info!(
-                            "game_path '{}' is a directory; resolved exe to '{}' via its \
-                             installer manifest",
-                            p.display(),
-                            exe.display()
-                        );
-                        exe
-                    }
-                    None => {
-                        error!(
-                            "game_path '{}' is a directory but offer '{}' is not in the \
-                             STEAM_GAMES table and has no readable installer manifest — \
-                             pass the full path to the .exe instead.",
-                            p.display(),
-                            offer.as_ref().map(|o| o.offer_id().as_str()).unwrap_or("?")
-                        );
-                        return Err(LaunchError::GamePath);
-                    }
-                },
+                None => {
+                    error!(
+                        "game_path '{}' is a directory and the executable could not be \
+                         determined for offer '{}' — pass the full path to the .exe instead.",
+                        p.display(),
+                        offer.as_ref().map(|o| o.offer_id().as_str()).unwrap_or("?")
+                    );
+                    return Err(LaunchError::GamePath);
+                }
             }
         } else {
             p
@@ -832,6 +813,42 @@ pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeE
 
 /// The game's executable according to the installer manifest inside
 /// `install_dir`, resolved against that directory (no registry involved).
+/// The executable inside `install_dir`, trying in order the per-game
+/// overrides file, the offer's execute path and the installer manifest. The
+/// first candidate that exists wins; if none does the first one is returned
+/// so the launch fails on a path the user can recognise.
+async fn exe_in_install_dir(
+    install_dir: &std::path::Path,
+    offer: Option<&OwnedOffer>,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(offer) = offer {
+        let overrides = load_game_overrides();
+        if let Some(exe) = override_for_offer(&overrides, offer.offer_id()).and_then(|o| o.exe.as_ref())
+        {
+            candidates.push(path_in_install_root(install_dir, exe));
+        }
+        if let Some(name) = offer.exe_file_name().await {
+            candidates.push(install_dir.join(name));
+        }
+    }
+    if let Some(exe) = exe_from_install_manifest(install_dir).await {
+        candidates.push(exe);
+    }
+
+    #[cfg(unix)]
+    let exists = |p: &PathBuf| case_insensitive_path(p.clone()).exists();
+    #[cfg(not(unix))]
+    let exists = |p: &PathBuf| p.exists();
+
+    candidates
+        .iter()
+        .find(|p| exists(p))
+        .or(candidates.first())
+        .cloned()
+}
+
 async fn exe_from_install_manifest(install_dir: &std::path::Path) -> Option<PathBuf> {
     let manifest_path = install_dir.join(MANIFEST_RELATIVE_PATH);
     #[cfg(unix)]
