@@ -106,75 +106,91 @@ pub fn check_registry_validity() -> Result<(), RegistryError> {
 
 #[cfg(windows)]
 async fn read_reg_key(path: &str) -> Result<Option<String>, RegistryError> {
-    if let (Some(hkey_segment), Some(value_segment)) = (path.find('\\'), path.rfind('\\')) {
-        let sub_key = &path[(hkey_segment + 1)..value_segment];
-        let value_name = &path[(value_segment + 1)..];
+    let (Some(hkey_segment), Some(value_segment)) = (path.find('\\'), path.rfind('\\')) else {
+        return Ok(None);
+    };
+    let sub_key = &path[(hkey_segment + 1)..value_segment];
+    let value_name = &path[(value_segment + 1)..];
 
-        let hkey = HKEY_LOCAL_MACHINE as HKEY;
-        let mut handle = ptr::null_mut();
-
-        unsafe {
-            if RegOpenKeyExW(
-                hkey,
-                U16CString::from_str(sub_key)?.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut handle,
-            ) != 0
-            {
-                return Err(RegistryError::Key(sub_key.to_string()));
-            }
-
-            let dw_type = ptr::null_mut();
-            let mut dw_size = 0;
-
-            if RegQueryValueExW(
-                handle,
-                U16CString::from_str(value_name)?.as_ptr(),
-                ptr::null_mut(),
-                dw_type,
-                ptr::null_mut(),
-                &mut dw_size,
-            ) != 0
-            {
-                RegCloseKey(handle);
-                return Err(RegistryError::Value {
-                    value: value_name.to_string(),
-                    key: sub_key.to_string(),
-                });
-            }
-
-            if dw_size <= 0 {
-                RegCloseKey(handle);
-                return Err(RegistryError::Value {
-                    value: value_name.to_string(),
-                    key: sub_key.to_string(),
-                });
-            }
-
-            let mut buf: Vec<u16> = vec![0; dw_size as usize / 2];
-            if RegQueryValueExW(
-                handle,
-                U16CString::from_str(value_name)?.as_ptr(),
-                ptr::null_mut(),
-                dw_type,
-                buf.as_mut_ptr() as *mut u8,
-                &mut dw_size,
-            ) != 0
-            {
-                RegCloseKey(handle);
-                return Err(RegistryError::Value {
-                    value: value_name.to_string(),
-                    key: sub_key.to_string(),
-                });
-            }
-
-            RegCloseKey(handle);
-            return Ok(Some(String::from_utf16_lossy(&buf[..buf.len() - 1])));
-        }
+    match read_hklm_value(sub_key, value_name) {
+        Ok(value) => Ok(Some(value)),
+        // 32-bit installers (Origin, most EA titles) write under the
+        // WOW6432Node view, which a 64-bit process doesn't see by default.
+        Err(err) => match wow6432_variant(sub_key) {
+            Some(alt) => read_hklm_value(&alt, value_name).map(Some).map_err(|_| err),
+            None => Err(err),
+        },
     }
+}
 
-    Ok(None)
+/// `SOFTWARE\X` → `SOFTWARE\WOW6432Node\X`; `None` when the key isn't under
+/// `SOFTWARE` or already names the 32-bit view.
+#[cfg(any(windows, test))]
+fn wow6432_variant(sub_key: &str) -> Option<String> {
+    let (root, rest) = sub_key.split_once('\\')?;
+    if !root.eq_ignore_ascii_case("software")
+        || rest.get(..11).is_some_and(|p| p.eq_ignore_ascii_case("wow6432node"))
+    {
+        return None;
+    }
+    Some(format!("{root}\\WOW6432Node\\{rest}"))
+}
+
+#[cfg(windows)]
+fn read_hklm_value(sub_key: &str, value_name: &str) -> Result<String, RegistryError> {
+    let value_err = || RegistryError::Value {
+        value: value_name.to_string(),
+        key: sub_key.to_string(),
+    };
+    let wide_key = U16CString::from_str(sub_key)?;
+    let wide_value = U16CString::from_str(value_name)?;
+    let mut handle = ptr::null_mut();
+
+    // SAFETY: the wide strings outlive the calls, the buffer is sized by the
+    // first query, and the handle is closed on every path after a successful open.
+    unsafe {
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE as HKEY,
+            wide_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut handle,
+        ) != 0
+        {
+            return Err(RegistryError::Key(sub_key.to_string()));
+        }
+
+        let mut dw_size = 0;
+        let sized = RegQueryValueExW(
+            handle,
+            wide_value.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dw_size,
+        );
+        if sized != 0 || dw_size < 2 {
+            RegCloseKey(handle);
+            return Err(value_err());
+        }
+
+        let mut buf: Vec<u16> = vec![0; dw_size as usize / 2];
+        let read = RegQueryValueExW(
+            handle,
+            wide_value.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            buf.as_mut_ptr() as *mut u8,
+            &mut dw_size,
+        );
+        RegCloseKey(handle);
+        if read != 0 {
+            return Err(value_err());
+        }
+
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Ok(String::from_utf16_lossy(&buf[..len]))
+    }
 }
 
 #[cfg(unix)]
@@ -276,11 +292,14 @@ pub fn launch_bootstrap() -> Result<(), NativeError> {
     };
 
     unsafe {
-        ShellExecuteExW(&mut shell_execute_info);
-
-        let err = GetLastError();
-        if err == ERROR_CANCELLED {
-            return Err(NativeError::Elevation(file1));
+        if ShellExecuteExW(&mut shell_execute_info) == 0 {
+            if GetLastError() == ERROR_CANCELLED {
+                return Err(NativeError::Elevation(file1));
+            }
+            return Err(NativeError::Io(std::io::Error::last_os_error()));
+        }
+        if !shell_execute_info.hProcess.is_null() {
+            winapi::um::handleapi::CloseHandle(shell_execute_info.hProcess);
         }
     }
 
@@ -624,4 +643,24 @@ pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
 #[cfg(unix)]
 pub fn launch_bootstrap() -> Result<(), RegistryError> {
     todo!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wow6432_variant;
+
+    #[test]
+    fn wow6432_variant_only_rewrites_software_keys() {
+        assert_eq!(
+            wow6432_variant(r"SOFTWARE\Origin").as_deref(),
+            Some(r"SOFTWARE\WOW6432Node\Origin")
+        );
+        assert_eq!(
+            wow6432_variant(r"Software\Respawn\Titanfall2").as_deref(),
+            Some(r"Software\WOW6432Node\Respawn\Titanfall2")
+        );
+        assert_eq!(wow6432_variant(r"SOFTWARE\Wow6432Node\Origin"), None);
+        assert_eq!(wow6432_variant(r"SYSTEM\CurrentControlSet"), None);
+        assert_eq!(wow6432_variant("SOFTWARE"), None);
+    }
 }

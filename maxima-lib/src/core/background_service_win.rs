@@ -10,6 +10,12 @@ use is_elevated::is_elevated;
 
 pub const BACKGROUND_SERVICE_PORT: u16 = 13021;
 
+/// Header every Maxima client sends to the background service. The service
+/// rejects requests without it (and any request carrying an `Origin` header):
+/// a web page can make the browser hit `127.0.0.1`, but it cannot attach a
+/// custom header without a CORS preflight, which the service never answers.
+pub const BACKGROUND_SERVICE_CLIENT_HEADER: (&str, &str) = ("x-maxima-client", "1");
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct ServiceLibraryInjectionRequest {
     pub pid: u32,
@@ -39,6 +45,7 @@ pub async fn request_library_injection(
             "http://127.0.0.1:{}/inject_library",
             BACKGROUND_SERVICE_PORT
         ))
+        .header(BACKGROUND_SERVICE_CLIENT_HEADER.0, BACKGROUND_SERVICE_CLIENT_HEADER.1)
         .body(serde_json::to_string(request)?)
         .send()
         .await?;
@@ -55,10 +62,13 @@ pub async fn request_registry_setup() -> Result<(), BackgroundServiceClientError
         return Ok(());
     }
 
-    reqwest::get(format!(
-        "http://127.0.0.1:{}/set_up_registry",
-        BACKGROUND_SERVICE_PORT
-    ))
-    .await?;
+    reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/set_up_registry",
+            BACKGROUND_SERVICE_PORT
+        ))
+        .header(BACKGROUND_SERVICE_CLIENT_HEADER.0, BACKGROUND_SERVICE_CLIENT_HEADER.1)
+        .send()
+        .await?;
     Ok(())
 }
