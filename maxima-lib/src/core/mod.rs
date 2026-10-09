@@ -69,7 +69,7 @@ use crate::{
     auth_server,
     content::manager::{ContentManager, ContentManagerError},
     lsx::{self, service::LSXServerError, types::LSXRequestType},
-    rtm::client::{BasicPresence, RtmClient},
+    presence::{BasicPresence, PresenceClient},
     util::native::{maxima_cache_dir, NativeError},
 };
 
@@ -112,7 +112,7 @@ pub struct Maxima {
     content_manager: ContentManager,
 
     #[getter(skip)]
-    rtm: RtmClient,
+    rtm: PresenceClient,
 
     #[getter(skip)]
     request_cache: DynamicCache<String>,
@@ -238,7 +238,7 @@ impl Maxima {
             lsx_connections: Arc::new(AtomicU16::new(0)),
             cloud_sync: CloudSyncClient::new(auth_storage.clone()),
             content_manager: ContentManager::new(auth_storage.clone(), false).await?,
-            rtm: RtmClient::new(auth_storage),
+            rtm: PresenceClient::new(auth_storage),
             request_cache,
             dummy_local_user,
             pending_events: Vec::new(),
@@ -497,7 +497,7 @@ impl Maxima {
         &mut self.content_manager
     }
 
-    pub fn rtm(&mut self) -> &mut RtmClient {
+    pub fn rtm(&mut self) -> &mut PresenceClient {
         &mut self.rtm
     }
 
