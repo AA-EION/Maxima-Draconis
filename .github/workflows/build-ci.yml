@@ -227,6 +227,72 @@ jobs:
         ./target/release/maxima-cli --help >/dev/null
         test "$(uname -m)" = aarch64
 
+  # ── Linux packages (AppImage + Flatpak/metainfo checks) ──────────────────
+  # Builds the static musl binaries (incl. maxima-tui, which compiles fine on
+  # Linux - only maxima-ui does not), wraps them in an AppImage and runs it, and
+  # syntax-checks the Flatpak manifest, metainfo and .desktop file. A full
+  # flatpak-builder run is not done here: it needs the vendored cargo-sources.json
+  # and a runtime download, which is far too slow for a push CI.
+  linux-packages:
+    name: Linux packages
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config desktop-file-utils appstream python3-yaml
+        rustup target add x86_64-unknown-linux-musl
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: Linux-packages-rust-deps
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/master' }}
+
+    - name: Validate packaging files
+      run: REQUIRE_TOOLS=1 packaging/linux/validate.sh
+
+    - name: Build static binaries
+      run: |
+        cargo build --release --target x86_64-unknown-linux-musl \
+          -p maxima-cli -p maxima-server -p maxima-bootstrap -p maxima-tui
+      env:
+        RUSTFLAGS: "-C target-feature=+crt-static"
+
+    - name: Build AppImage
+      run: packaging/linux/appimage/build.sh
+
+    - name: Smoke-test the AppImage
+      env:
+        APPIMAGE_EXTRACT_AND_RUN: "1"
+      run: |
+        set -e
+        img="$(ls dist/Maxima-*-x86_64.AppImage)"
+        "$img" --help >/dev/null
+        "$img" cli --help >/dev/null
+        out="$("$img" server-status --json)"
+        echo "$out"
+        echo "$out" | grep -q '"running":false'
+        "$img" --appimage-extract >/dev/null
+        for b in maxima-cli maxima-server maxima-bootstrap maxima-tui; do
+          test -x "squashfs-root/usr/bin/$b"
+        done
+        grep -q 'x-scheme-handler/link2ea' squashfs-root/com.ArmchairDevelopers.Maxima.desktop
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: maxima-appimage-x86_64
+        path: dist/Maxima-*-x86_64.AppImage
+
   # ── macOS native (Apple Silicon) ─────────────────────────────────────────
   # The native-mode binaries (maxima-cli / maxima-server / maxima-bootstrap /
   # maxima-tui), MaximaBootstrap.app and the SwiftUI Maxima.app. The matrix

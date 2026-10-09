@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>com.ArmchairDevelopers.Maxima</id>
+  <launchable type="desktop-id">com.ArmchairDevelopers.Maxima.desktop</launchable>
+
+  <name>Maxima</name>
+  <summary>Free and open-source replacement for the EA Desktop launcher</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <developer id="com.armchairdevelopers">
+    <name>Armchair Developers</name>
+  </developer>
+
+  <description>
+    <p>
+      Maxima signs in to your EA account, keeps your game library, downloads
+      and updates games and starts them with the licence and EA environment
+      they expect, without the EA Desktop client.
+    </p>
+    <p>
+      It ships a command line client, a background server that holds the
+      logged-in session, and a protocol handler that answers link2ea://,
+      origin2:// and qrc:// links opened by games and by the EA login page.
+    </p>
+    <p>
+      Games run through Wine or Proton; make sure a compatible runtime is
+      available on your system.
+    </p>
+  </description>
+
+  <categories>
+    <category>Game</category>
+  </categories>
+
+  <keywords>
+    <keyword>EA</keyword>
+    <keyword>Origin</keyword>
+    <keyword>launcher</keyword>
+  </keywords>
+
+  <provides>
+    <binary>maxima</binary>
+    <binary>maxima-cli</binary>
+    <binary>maxima-server</binary>
+    <binary>maxima-bootstrap</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/AA-EION/Maxima-Draconis</url>
+  <url type="bugtracker">https://github.com/AA-EION/Maxima-Draconis/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.14.0" date="2026-10-09" />
+  </releases>
+</component>

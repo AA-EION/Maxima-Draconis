@@ -1,0 +1,104 @@
+# Flatpak manifest for Maxima (CLI, server and protocol handler).
+#
+# Build (see ../README.md):
+#   ./generate-sources.sh          # writes cargo-sources.json (offline crates)
+#   flatpak-builder --user --install --force-clean build-dir com.ArmchairDevelopers.Maxima.yml
+#
+# Toolchain: org.freedesktop.Sdk.Extension.rust-nightly. The workspace needs
+# nightly (#![feature(...)] in maxima-lib), so rust-stable is not an option.
+# maxima-ui is not built: it pulls rustix 0.37 through accesskit_unix -> zbus,
+# which does not compile on current nightly (same reason CI skips it).
+app-id: com.ArmchairDevelopers.Maxima
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-nightly
+command: maxima
+
+finish-args:
+  # EA login, manifests and the game CDN.
+  - --share=network
+  # Everything the launcher stores lives under the app's own data/cache dirs
+  # (ProjectDirs("com", "ArmchairDevelopers", "Maxima") -> ~/.var/app/<id>/...),
+  # which are always writable; no --persist is needed for them.
+  #
+  # Games are downloaded to a user-chosen directory; ~/Games is the default
+  # people expect for a launcher. Widen or narrow to taste (--filesystem=home
+  # for arbitrary install paths). Note that Wine/Proton is NOT inside this
+  # sandbox: the Flatpak is aimed at install/update/auth and the protocol
+  # handler, and running a game through Proton from inside a sandbox needs
+  # extra escapes that are deliberately not granted here.
+  - --filesystem=~/Games:create
+  # The server, CLI and protocol handler talk over loopback only (LSX 3216,
+  # /authorize 13219, server 13220, OAuth callback 31033), which --share=network
+  # already covers.
+  #
+  # Opening the EA login page uses xdg-open, which the runtime routes through
+  # the OpenURI portal; no extra permission is required. link2ea://, origin2://
+  # and qrc:// links reach the app through the exported .desktop file (its
+  # MimeType= lines), which Flatpak installs into the host's application list.
+  #
+  # Skip the binaries' own maxima-<scheme>.desktop registration (it would write
+  # to the sandbox, not the host) and the host-handler check that goes with it.
+  - --env=MAXIMA_PACKAGED=1
+  - --env=MAXIMA_DISABLE_QRC=1
+
+build-options:
+  append-path: /usr/lib/sdk/rust-nightly/bin
+  env:
+    CARGO_HOME: /run/build/maxima/cargo
+    RUSTFLAGS: -C strip=symbols
+
+modules:
+  # prost-build needs protoc and the SDK does not ship one. Prebuilt, pinned.
+  - name: protoc
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/protoc /app/protoc/bin/protoc
+      - cp -r include /app/protoc/include
+    cleanup:
+      - /protoc
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip
+        sha256: 0ad949f04a6a174da83cdcbdb36dee0a4925272a5b6d83f79a6bf9852076d53f
+        strip-components: 0
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-aarch_64.zip
+        sha256: 1de522032a8b194002fe35cab86d747848238b5e4de4f99648372079f5b46f9a
+        strip-components: 0
+
+  - name: maxima
+    buildsystem: simple
+    build-options:
+      env:
+        PROTOC: /app/protoc/bin/protoc
+        PROTOC_INCLUDE: /app/protoc/include
+    build-commands:
+      - cargo --offline build --release -p maxima-cli -p maxima-server -p maxima-bootstrap
+      - install -Dm755 target/release/maxima-cli /app/bin/maxima-cli
+      - install -Dm755 target/release/maxima-server /app/bin/maxima-server
+      - install -Dm755 target/release/maxima-bootstrap /app/bin/maxima-bootstrap
+      - install -Dm755 packaging/linux/maxima-launcher.sh /app/bin/maxima
+      - install -Dm644 packaging/linux/com.ArmchairDevelopers.Maxima.desktop
+        /app/share/applications/com.ArmchairDevelopers.Maxima.desktop
+      - install -Dm644 packaging/linux/com.ArmchairDevelopers.Maxima.metainfo.xml
+        /app/share/metainfo/com.ArmchairDevelopers.Maxima.metainfo.xml
+      - install -Dm644 maxima-resources/assets/logo.png
+        /app/share/icons/hicolor/32x32/apps/com.ArmchairDevelopers.Maxima.png
+    sources:
+      # Local checkout, two levels up from this file. Replace with a
+      # `type: git` source (url + tag) when publishing.
+      - type: dir
+        path: ../../..
+        skip:
+          - .git
+          - .claude
+          - target
+          - dist
+      # Written by ./generate-sources.sh from Cargo.lock: every crate and git
+      # dependency, plus the .cargo/config that points cargo at them.
+      - cargo-sources.json
