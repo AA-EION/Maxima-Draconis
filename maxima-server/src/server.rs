@@ -152,16 +152,25 @@ async fn tick_loop(state: Arc<ServerState>) {
         tick.tick().await;
         let mut maxima = state.maxima.lock().await;
 
-        for event in maxima.consume_pending_events() {
-            if let MaximaEvent::InstallFinished(_offer_id) = event {
-                let slug = state.installing.lock().await.take();
-                state.notify(Notification::InstallDone { slug });
-                state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
-                last_percent = -1.0;
-            }
-        }
-
         maxima.update().await;
+
+        // After update(), so an install that ended this tick is reported by its
+        // event, never mistaken for success by the "download vanished" check below.
+        for event in maxima.consume_pending_events() {
+            let notification = match event {
+                MaximaEvent::InstallFinished(_) => {
+                    Notification::InstallDone { slug: state.installing.lock().await.take() }
+                }
+                MaximaEvent::InstallFailed { message, .. } => Notification::InstallError {
+                    slug: state.installing.lock().await.take(),
+                    message,
+                },
+                MaximaEvent::ReceivedLSXRequest(..) => continue,
+            };
+            state.notify(notification);
+            state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
+            last_percent = -1.0;
+        }
 
         let playing_now = maxima.playing().is_some();
         if was_playing && !playing_now {
@@ -184,7 +193,10 @@ async fn tick_loop(state: Arc<ServerState>) {
                 }
                 None => {
                     *state.installing.lock().await = None;
-                    state.notify(Notification::InstallDone { slug: Some(slug) });
+                    state.notify(Notification::InstallError {
+                        slug: Some(slug),
+                        message: "the download stopped before it finished".into(),
+                    });
                     state.notify(Notification::DownloadQueue { current: None, queued: vec![] });
                     last_percent = -1.0;
                 }

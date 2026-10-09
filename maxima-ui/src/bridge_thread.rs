@@ -128,6 +128,8 @@ pub struct BridgeThread {
 
 #[derive(thiserror::Error, Debug)]
 pub enum BackendError {
+    #[error("install of {offer_id} failed: {message}")]
+    InstallFailed { offer_id: String, message: String },
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error(transparent)]
@@ -426,6 +428,12 @@ impl BridgeThread {
                         maxima::core::MaximaEvent::InstallFinished(offer_id) => {
                             backend_responder
                                 .send(MaximaLibResponse::DownloadFinished(offer_id))?;
+                            Self::update_queue(maxima.content_manager(), backend_responder.clone());
+                        }
+                        maxima::core::MaximaEvent::InstallFailed { offer_id, message } => {
+                            backend_responder.send(MaximaLibResponse::NonFatalError(Box::new(
+                                BackendError::InstallFailed { offer_id, message },
+                            )))?;
                             Self::update_queue(maxima.content_manager(), backend_responder.clone());
                         }
                     }

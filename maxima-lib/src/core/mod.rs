@@ -79,6 +79,8 @@ pub enum MaximaEvent {
     ReceivedLSXRequest(u32, LSXRequestType),
     /// Offer ID. Use `maxima.mut_library().title_by_base_offer(id)` for details
     InstallFinished(String),
+    /// The install of this offer stopped with an error; nothing was marked installed.
+    InstallFailed { offer_id: String, message: String },
 }
 
 pub type MaximaLSXEventCallback = extern "C" fn(*const c_char);

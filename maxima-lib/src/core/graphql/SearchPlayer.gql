@@ -1,5 +1,5 @@
 query SearchPlayer($searchText: String!, $pageNumber: Int!, $pageSize: Int!, $isMutualFriendsEnabled: Boolean = false) {
-  players(searchText: $searchText, paging: {pageNumber: $pageNumber, pageSize: $pageSize}) {
+  players(searchText: $searchText, paging: {pageNumber: $pageNumber, pageSize: $pageSize}) @connection(key: "playersBySearchText", filter: ["searchText"]) {
     items {
       ...PlayerWithMutualFriendsCount
       __typename

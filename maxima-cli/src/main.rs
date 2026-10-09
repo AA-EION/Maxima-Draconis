@@ -934,14 +934,13 @@ async fn interactive_install_game(maxima_arc: LockedMaxima) -> Result<()> {
     loop {
         let mut maxima = maxima_arc.lock().await;
 
+        maxima.update().await;
+
         for event in maxima.consume_pending_events() {
-            match event {
-                MaximaEvent::ReceivedLSXRequest(_pid, _request) => (),
-                _ => {}
+            if let MaximaEvent::InstallFailed { message, .. } = event {
+                bail!("install failed: {message}");
             }
         }
-
-        maxima.update().await;
 
         if let Some(downloader) = maxima.content_manager().current() {
             info!("Downloading: {}%/100%", downloader.percentage_done());
