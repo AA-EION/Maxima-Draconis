@@ -3,6 +3,7 @@ use gethostname::gethostname;
 use hex::ToHex;
 use regex::Regex;
 use ring::digest::SHA1_FOR_LEGACY_USE_ONLY;
+use std::path::Path;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::CpuidResult;
 use thiserror::Error;
@@ -65,8 +66,10 @@ pub enum HardwareHashError {
 }
 
 impl HardwareInfo {
+    /// `wine_prefix` is the Wine prefix the hash is for (unix: its creation
+    /// time is part of the identity); ignored on Windows.
     #[cfg(windows)]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, _wine_prefix: Option<&Path>) -> Self {
         use std::collections::HashMap;
 
         use log::warn;
@@ -162,7 +165,7 @@ impl HardwareInfo {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, wine_prefix: Option<&Path>) -> Self {
         use std::{fs, path::Path, process::Command};
 
         let board_manufacturer = match fs::read_to_string("/sys/class/dmi/id/board_vendor") {
@@ -180,7 +183,7 @@ impl HardwareInfo {
         };
 
         let bios_sn = String::from("Serial number");
-        let os_install_date = get_root_creation_str();
+        let os_install_date = get_root_creation_str(wine_prefix);
         let os_sn = String::from("00330-50000-00000-AAOEM");
 
         let mut gpu_pnp_id: Option<String> = None;
@@ -259,7 +262,7 @@ impl HardwareInfo {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn new(version: u32) -> Self {
+    pub fn new(version: u32, wine_prefix: Option<&Path>) -> Self {
         use std::process::Command;
 
         use smbioslib::{
@@ -293,7 +296,7 @@ impl HardwareInfo {
             bios_sn = bios.serial_number().to_string();
         }
 
-        let os_install_date = get_root_creation_str();
+        let os_install_date = get_root_creation_str(wine_prefix);
         let mut os_sn = String::from("None");
         if let Some(uuid) = bios_data.and_then(|bios| bios.uuid()) {
             os_sn = uuid.to_string();
@@ -463,18 +466,23 @@ impl HardwareInfo {
     }
 }
 
+/// Creation time of the Wine prefix's `drive_c`, standing in for "OS install
+/// date". Without a prefix the user explicitly chose (an auth-time hash has
+/// no game), the epoch default keeps the identity stable instead of
+/// depending on whichever game was set up last.
 #[cfg(unix)]
-fn get_root_creation_str() -> String {
-    use crate::unix::wine::wine_prefix_dir;
+fn get_root_creation_str(wine_prefix: Option<&Path>) -> String {
     use chrono::{TimeZone, Utc};
     use std::{fs, os::unix::fs::MetadataExt};
 
     let date_str = String::from("1970010100:00:00.000000000+0000");
-    let wine_prefix = wine_prefix_dir();
-    if wine_prefix.is_err() {
-        return date_str;
-    }
-    let wine_prefix = wine_prefix.unwrap();
+    let wine_prefix = match wine_prefix
+        .map(Path::to_path_buf)
+        .or_else(crate::unix::prefix::explicit_override)
+    {
+        Some(prefix) => prefix,
+        None => return date_str,
+    };
     let date_str = match fs::metadata(wine_prefix.join("drive_c")) {
         Ok(metadata) => {
             let nsec = (metadata.mtime_nsec() / 1_000_000) * 1_000_000;
@@ -887,7 +895,7 @@ mod tests {
     #[test]
     fn hardware_info_builds_without_panicking() {
         for version in [1, 2] {
-            let info = HardwareInfo::new(version);
+            let info = HardwareInfo::new(version, None);
             assert!(!info.generate_hardware_hash().is_empty());
             assert!(!info.generate_mid().unwrap().is_empty());
         }

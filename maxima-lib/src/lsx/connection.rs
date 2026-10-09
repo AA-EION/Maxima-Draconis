@@ -300,22 +300,34 @@ pub fn get_os_pid(context: &ActiveGameContext) -> Result<u32, NativeError> {
 }
 
 #[cfg(target_os = "windows")]
-pub async fn get_wine_pid(_launch_id: &str, _name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    _launch_id: &str,
+    _name: &str,
+    _wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     Ok(0)
 }
 
 #[cfg(target_os = "linux")]
-pub async fn get_wine_pid(launch_id: &str, name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    launch_id: &str,
+    name: &str,
+    wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     use crate::core::background_service::wine_get_pid;
 
-    wine_get_pid(launch_id, name).await
+    wine_get_pid(launch_id, name, wine_prefix).await
 }
 
 // macOS: no wine-helper.exe / background service; PID lookup is only used for
 // Kyber DLL injection, which Wine on macOS can't do anyway. 0 = "not found",
 // same contract as the windows stub above.
 #[cfg(target_os = "macos")]
-pub async fn get_wine_pid(_launch_id: &str, _name: &str) -> Result<u32, NativeError> {
+pub async fn get_wine_pid(
+    _launch_id: &str,
+    _name: &str,
+    _wine_prefix: Option<&std::path::Path>,
+) -> Result<u32, NativeError> {
     Ok(0)
 }
 
@@ -374,7 +386,12 @@ impl Connection {
                             .ok_or(NativeError::Stringify)?
                             .to_owned();
 
-                            pid = get_wine_pid(&context.launch_id(), &filename).await;
+                            pid = get_wine_pid(
+                                &context.launch_id(),
+                                &filename,
+                                context.wine_prefix().as_deref(),
+                            )
+                            .await;
                         } else {
                             warn!(
                                 "Failed to find game process while looking for PID {}",

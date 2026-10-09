@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::core::manifest::{
     bytes_to_string, collect_touchup_args,
@@ -230,7 +230,11 @@ impl DiPManifest {
     }
 
     #[cfg(unix)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
         use crate::{
             core::launch::mx_linux_setup,
             unix::{
@@ -243,7 +247,11 @@ impl DiPManifest {
             return Ok(());
         }
 
-        mx_linux_setup().await?;
+        let prefix = match wine_prefix {
+            Some(prefix) => prefix.to_path_buf(),
+            None => crate::unix::prefix::ambient()?,
+        };
+        mx_linux_setup(&prefix).await?;
 
         let install_path = PathBuf::from(remove_trailing_slash(
             install_path.to_str().ok_or(ManifestError::Decode)?,
@@ -251,14 +259,18 @@ impl DiPManifest {
         let args = collect_touchup_args(&self.touchup.parameters, &install_path)?;
         let path = install_path.join(self.touchup.path());
         let path = case_insensitive_path(path);
-        run_wine_command(path, Some(args), None, true, CommandType::Run).await?;
+        run_wine_command(path, Some(args), None, true, CommandType::Run, &prefix).await?;
 
-        invalidate_mx_wine_registry().await;
+        invalidate_mx_wine_registry(&prefix).await;
         Ok(())
     }
 
     #[cfg(windows)]
-    pub async fn run_touchup(&self, install_path: &PathBuf) -> Result<(), ManifestError> {
+    pub async fn run_touchup(
+        &self,
+        install_path: &PathBuf,
+        _wine_prefix: Option<&Path>,
+    ) -> Result<(), ManifestError> {
         use crate::util::{elevation, native::NativeError};
 
         if self.touchup.is_empty() {

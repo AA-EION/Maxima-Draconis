@@ -17,7 +17,8 @@ use crate::{
         },
         clients::JUNO_PC_CLIENT_ID,
         cloudsync::{CloudSyncError, CloudSyncLockMode},
-        library::{LibraryError, OwnedOffer},
+        library::{path_in_install_root, LibraryError, OwnedOffer},
+        manifest::{self, MANIFEST_RELATIVE_PATH},
         service_layer::ServiceLayerError,
         Maxima,
     },
@@ -112,6 +113,11 @@ pub struct LaunchOptions {
     /// who need them pass them via `arguments`, `MAXIMA_LAUNCH_ARGS`, or
     /// `cmd_params` on the `link2ea://` URL.
     pub steam_app_id: Option<String>,
+    /// Wine prefix (unix) to run this one game in, overriding both the
+    /// `MAXIMA_WINE_PREFIX` setting and the prefix recorded at install time
+    /// (see `unix::prefix` for the precedence). `None` lets the platform
+    /// pick per game. Ignored on Windows.
+    pub wine_prefix: Option<PathBuf>,
 }
 
 pub enum LaunchMode {
@@ -155,6 +161,13 @@ pub struct ActiveGameContext {
     /// `link2ea://launchgame/Origin.OFR.…` mid-run, or maxima-cli launch
     /// with an Origin offer ID slug).
     steam_app_id: Option<String>,
+    /// The game's slug, when the launch is tied to a library offer.
+    slug: Option<String>,
+    /// The Wine prefix this game was launched into (unix). Everything that
+    /// later acts on behalf of this game (cloud-save upload, PID lookup,
+    /// license requests over LSX) uses it instead of any process-wide
+    /// selection.
+    wine_prefix: Option<PathBuf>,
     process: Child,
     started: bool,
 }
@@ -168,6 +181,8 @@ impl ActiveGameContext {
         offer: Option<OwnedOffer>,
         mode: LaunchMode,
         steam_app_id: Option<String>,
+        slug: Option<String>,
+        wine_prefix: Option<PathBuf>,
         process: Child,
     ) -> Self {
         Self {
@@ -179,6 +194,8 @@ impl ActiveGameContext {
             injections: Vec::new(),
             cloud_saves,
             steam_app_id,
+            slug,
+            wine_prefix,
             process,
             started: false,
         }
@@ -197,6 +214,11 @@ impl ActiveGameContext {
 pub struct BootstrapLaunchArgs {
     pub path: String,
     pub args: Vec<String>,
+    /// Wine prefix the bootstrap must run the game in (unix). Absent in
+    /// payloads from older launchers, in which case the bootstrap falls back
+    /// to its ambient prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_prefix: Option<String>,
 }
 
 impl Display for LaunchMode {
@@ -293,15 +315,27 @@ pub async fn start_game(
                     );
                     exe
                 }
-                None => {
-                    error!(
-                        "game_path '{}' is a directory but offer '{}' is not in the \
-                         STEAM_GAMES table — pass the full path to the .exe instead.",
-                        p.display(),
-                        offer.as_ref().map(|o| o.offer_id().as_str()).unwrap_or("?")
-                    );
-                    return Err(LaunchError::GamePath);
-                }
+                None => match exe_from_install_manifest(&p).await {
+                    Some(exe) => {
+                        info!(
+                            "game_path '{}' is a directory; resolved exe to '{}' via its \
+                             installer manifest",
+                            p.display(),
+                            exe.display()
+                        );
+                        exe
+                    }
+                    None => {
+                        error!(
+                            "game_path '{}' is a directory but offer '{}' is not in the \
+                             STEAM_GAMES table and has no readable installer manifest — \
+                             pass the full path to the .exe instead.",
+                            p.display(),
+                            offer.as_ref().map(|o| o.offer_id().as_str()).unwrap_or("?")
+                        );
+                        return Err(LaunchError::GamePath);
+                    }
+                },
             }
         } else {
             p
@@ -344,8 +378,28 @@ pub async fn start_game(
         );
     }
 
+    // Which Wine prefix THIS game runs in. Resolved per launch and carried
+    // explicitly from here on; never exported through the environment, so a
+    // server launching two games in two prefixes keeps them apart.
     #[cfg(unix)]
-    mx_linux_setup().await?;
+    let wine_prefix: Option<PathBuf> = {
+        let slug = offer.as_ref().map(|o| o.slug().clone());
+        Some(match (slug, options.wine_prefix.as_deref()) {
+            (Some(slug), explicit) => {
+                crate::unix::prefix::resolve_for_game(&slug, explicit).await?
+            }
+            (None, Some(explicit)) => explicit.to_path_buf(),
+            (None, None) => crate::unix::prefix::ambient()?,
+        })
+    };
+    #[cfg(not(unix))]
+    let wine_prefix: Option<PathBuf> = None;
+    let wine_prefix_ref = wine_prefix.as_deref();
+
+    #[cfg(unix)]
+    if let Some(prefix) = wine_prefix_ref {
+        mx_linux_setup(prefix).await?;
+    }
 
     match mode {
         LaunchMode::Offline(_) => {}
@@ -369,13 +423,19 @@ pub async fn start_game(
                      fetch + .dlf write entirely. Game will only have whatever \
                      .dlf was already on disk (or none)."
                 );
-            } else if needs_license_update(&content_id).await? {
+            } else if needs_license_update(&content_id, wine_prefix_ref).await? {
                 info!(
                     "Requesting new game license for {}...",
                     offer.offer().display_name()
                 );
 
-                request_and_save_license(&auth, &content_id, path.to_owned().into()).await?;
+                request_and_save_license(
+                    &auth,
+                    &content_id,
+                    path.to_owned().into(),
+                    wine_prefix_ref,
+                )
+                .await?;
             } else {
                 info!("Existing game license is still valid, not updating");
             }
@@ -385,7 +445,7 @@ pub async fn start_game(
 
                 let result = maxima
                     .cloud_sync()
-                    .obtain_lock(offer, CloudSyncLockMode::Read)
+                    .obtain_lock(offer, CloudSyncLockMode::Read, wine_prefix_ref)
                     .await;
                 if let Err(err) = result {
                     error!("Failed to obtain CloudSync read lock: {}", err);
@@ -406,8 +466,14 @@ pub async fn start_game(
         LaunchMode::OnlineOffline(_, ref persona, ref password) => {
             let auth = LicenseAuth::Direct(persona.to_owned(), password.to_owned());
 
-            if needs_license_update(&content_id).await? {
-                request_and_save_license(&auth, &content_id, path.to_owned().into()).await?;
+            if needs_license_update(&content_id, wine_prefix_ref).await? {
+                request_and_save_license(
+                    &auth,
+                    &content_id,
+                    path.to_owned().into(),
+                    wine_prefix_ref,
+                )
+                .await?;
             } else {
                 info!("Existing game license is still valid, not updating");
             }
@@ -426,6 +492,8 @@ pub async fn start_game(
     if !bootstrap_path()?.exists() {
         return Err(LaunchError::BootstrapMissing);
     }
+
+    let slug = offer.as_ref().map(|o| o.slug().clone());
 
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
@@ -446,9 +514,20 @@ pub async fn start_game(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    // Belt and braces for a bootstrap that predates the `wine_prefix` field
+    // in its launch payload: it reads the prefix from its own environment.
+    // Set on this child only, never on our own process.
+    #[cfg(unix)]
+    if let Some(prefix) = wine_prefix_ref {
+        child.env(crate::unix::prefix::WINE_PREFIX_ENV, prefix);
+    }
+
     let bootstrap_args = BootstrapLaunchArgs {
         path: path.to_string(),
         args: game_args,
+        wine_prefix: wine_prefix
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&bootstrap_args)?);
@@ -582,6 +661,8 @@ pub async fn start_game(
         offer,
         mode,
         options.steam_app_id.clone(),
+        slug,
+        wine_prefix,
         child,
     ));
 
@@ -608,8 +689,9 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
     nucleus_auth_exchange(&context, JUNO_PC_CLIENT_ID, "token").await
 }
 
+/// Make sure the wine runtime and the given prefix are ready to run a game.
 #[cfg(target_os = "linux")]
-pub async fn mx_linux_setup() -> Result<(), NativeError> {
+pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
         install_wine, setup_wine_registry,
@@ -631,33 +713,47 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
         }
     }
 
-    setup_wine_registry().await?;
+    std::fs::create_dir_all(wine_prefix)?;
+    setup_wine_registry(wine_prefix).await?;
 
     Ok(())
 }
 
 /// macOS variant: games run through a CrossOver bottle — no wine/umu
-/// auto-install here. The bottle is normally selected (and created on
-/// demand) by `crossover::ensure_game_bottle`, which exports
-/// MAXIMA_WINE_PREFIX for this process and its children; we require it here
-/// so an unwired call path fails with a clear message instead of wine
-/// silently creating a fresh prefix at ~/.local/share/maxima/wine/prefix.
+/// auto-install here. The bottle is chosen (and created on demand) per game
+/// by `unix::prefix::resolve_for_game`; this only checks it is really there,
+/// so a wrong `--wine-prefix` fails with a clear message instead of wine
+/// silently creating a fresh prefix somewhere.
 #[cfg(target_os = "macos")]
-pub async fn mx_linux_setup() -> Result<(), NativeError> {
+pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeError> {
     use crate::unix::wine::setup_wine_registry;
 
-    if std::env::var("MAXIMA_WINE_PREFIX").is_err() {
-        return Err(NativeError::MissingEnvironmentVariable(
-            "MAXIMA_WINE_PREFIX (no bottle selected — `maxima-cli install`/`launch` \
-             auto-create a per-game CrossOver bottle; set this manually for `serve` \
-             or a custom prefix)"
-                .to_string(),
-        ));
+    if !wine_prefix.join("system.reg").exists() {
+        return Err(NativeError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "wine prefix `{}` is not an existing CrossOver bottle — `maxima-cli \
+                 install`/`launch` create a per-game bottle automatically; for a custom \
+                 prefix, create the bottle in CrossOver first",
+                wine_prefix.display()
+            ),
+        )));
     }
 
-    setup_wine_registry().await?;
+    setup_wine_registry(wine_prefix).await?;
 
     Ok(())
+}
+
+/// The game's executable according to the installer manifest inside
+/// `install_dir`, resolved against that directory (no registry involved).
+async fn exe_from_install_manifest(install_dir: &std::path::Path) -> Option<PathBuf> {
+    let manifest_path = install_dir.join(MANIFEST_RELATIVE_PATH);
+    #[cfg(unix)]
+    let manifest_path = case_insensitive_path(manifest_path);
+    let manifest = manifest::read(manifest_path).await.ok()?;
+    let relative = manifest.execute_path(false)?;
+    Some(path_in_install_root(install_dir, &relative))
 }
 
 pub fn parse_arguments(input: &str) -> Vec<String> {

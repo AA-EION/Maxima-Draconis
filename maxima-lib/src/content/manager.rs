@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     content::{
         downloader::{DownloadError, ZipDownloader},
+        exclusion::get_exclusion_list,
         zip::{self, CompressionType, ZipError, ZipFileEntry},
         ContentService,
     },
@@ -29,6 +30,7 @@ use crate::{
         service_layer::ServiceLayerError,
         MaximaEvent,
     },
+    gameinfo::GameInstallInfo,
     util::native::{maxima_dir, NativeError},
 };
 
@@ -82,6 +84,28 @@ pub struct QueuedGame {
     offer_id: String,
     build_id: String,
     path: PathBuf,
+    /// Library slug: keys the install record and the per-game exclusion
+    /// file. Empty for entries queued by older versions, which then get
+    /// neither.
+    #[builder(default)]
+    #[serde(default)]
+    slug: String,
+    /// Wine prefix (unix) the game is installed into / will run in. Carried
+    /// with the queue entry so the touchup and the install record use the
+    /// prefix chosen when the install was requested, however long the
+    /// download is queued.
+    #[builder(default)]
+    #[serde(default)]
+    wine_prefix: Option<PathBuf>,
+    /// Extra glob patterns (on top of the game's exclusion file) for files
+    /// that must not be downloaded.
+    #[builder(default)]
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// Locale to record in the install record (e.g. `en_US`).
+    #[builder(default)]
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[derive(Default, Getters, Serialize, Deserialize)]
@@ -183,6 +207,9 @@ impl DownloadQueue {
 
 pub struct GameDownloader {
     offer_id: String,
+    install_info: GameInstallInfo,
+    slug: String,
+    wine_prefix: Option<PathBuf>,
 
     downloader: Arc<ZipDownloader>,
     entries: Vec<ZipFileEntry>,
@@ -207,10 +234,32 @@ impl GameDownloader {
 
         let downloader = ZipDownloader::new(&game.offer_id, &url.url(), &game.path).await?;
 
+        let exclusion = get_exclusion_list(&game.slug, &game.exclude);
         let mut entries = Vec::new();
+        let mut excluded = 0usize;
         for ele in downloader.manifest().entries() {
-            // TODO: Filtering
+            if exclusion.is_match(ele.name()) {
+                excluded += 1;
+                continue;
+            }
             entries.push(ele.clone());
+        }
+        if excluded > 0 {
+            info!(
+                "Excluding {} file(s) from the download ({} pattern(s))",
+                excluded,
+                exclusion.patterns().len()
+            );
+        }
+
+        let mut install_info = GameInstallInfo::new(game.path.clone(), game.wine_prefix.clone())
+            .with_offer(&game.offer_id, Some(&game.build_id))
+            .with_exclude(game.exclude.clone());
+        if let Some(locale) = &game.locale {
+            install_info = install_info.with_locale(locale);
+        }
+        if !game.slug.is_empty() {
+            install_info = install_info.with_slug(&game.slug);
         }
 
         let total_bytes = entries
@@ -221,6 +270,9 @@ impl GameDownloader {
 
         Ok(GameDownloader {
             offer_id: game.offer_id.to_owned(),
+            install_info,
+            slug: game.slug.clone(),
+            wine_prefix: game.wine_prefix.clone(),
 
             downloader: Arc::new(downloader),
             entries,
@@ -240,11 +292,21 @@ impl GameDownloader {
         let failure = self.failure.clone();
         let notify = self.notify.clone();
         let offer_id = self.offer_id.clone();
+        let install_info = self.install_info.clone();
+        let slug = self.slug.clone();
+        let wine_prefix = self.wine_prefix.clone();
 
         tokio::spawn(async move {
-            let result =
-                GameDownloader::start_downloads(downloader, entries, cancel_token, completed_bytes)
-                    .await;
+            let result = GameDownloader::start_downloads(
+                downloader,
+                entries,
+                cancel_token,
+                completed_bytes,
+                install_info,
+                slug,
+                wine_prefix,
+            )
+            .await;
             if let Err(err) = result {
                 error!("Install of {offer_id} failed: {err}");
                 *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
@@ -258,6 +320,9 @@ impl GameDownloader {
         entries: Vec<ZipFileEntry>,
         cancel_token: CancellationToken,
         completed_bytes: Arc<AtomicUsize>,
+        mut install_info: GameInstallInfo,
+        slug: String,
+        wine_prefix: Option<PathBuf>,
     ) -> Result<(), DownloaderError> {
         let total = entries.len();
         let failed = Arc::new(AtomicUsize::new(0));
@@ -299,9 +364,25 @@ impl GameDownloader {
         }
 
         let path = downloader.path();
-        info!("Files downloaded, running touchup...");
+        info!("Files downloaded");
+
+        // From here on the game is "installed": the record, not any
+        // registry, is what says so (and which prefix it lives in).
+        if !slug.is_empty() {
+            install_info.save_to_json(&slug);
+        }
+
+        info!("Running touchup...");
         let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-        manifest.run_touchup(path).await?;
+
+        if !slug.is_empty() {
+            if let Some(version) = manifest.version() {
+                install_info.version = Some(version);
+                install_info.save_to_json(&slug);
+            }
+        }
+
+        manifest.run_touchup(path, wine_prefix.as_deref()).await?;
         info!("Installation finished!");
 
         completed_bytes.fetch_add(1, Ordering::SeqCst);

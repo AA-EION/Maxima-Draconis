@@ -8,7 +8,7 @@ use std::string::FromUtf8Error;
 use std::{
     fs::create_dir_all,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::fs::{self, File};
 
@@ -17,7 +17,7 @@ use base64::{engine::general_purpose, DecodeError, Engine};
 use crate::core::{auth::hardware::HardwareInfo, endpoints::API_PROXY_NOVAFUSION_LICENSES};
 #[cfg(unix)]
 use crate::unix::fs::case_insensitive_path;
-use crate::util::native::{NativeError, SafeParent, SafeStr};
+use crate::util::native::{NativeError, SafeParent};
 use lazy_static::lazy_static;
 use quick_xml::DeError;
 use regex::Regex;
@@ -173,8 +173,13 @@ pub enum LicenseAuth {
     Direct(String, String),
 }
 
-pub async fn needs_license_update(content_id: &str) -> Result<bool, LicenseError> {
-    let path = get_license_dir()?.join(format!("{}.dlf", content_id));
+/// `wine_prefix` selects the Wine prefix whose license directory is checked
+/// (unix); it is ignored on Windows. `None` means the ambient prefix.
+pub async fn needs_license_update(
+    content_id: &str,
+    wine_prefix: Option<&Path>,
+) -> Result<bool, LicenseError> {
+    let path = get_license_dir(wine_prefix)?.join(format!("{}.dlf", content_id));
     if !path.exists() {
         return Ok(true);
     }
@@ -201,6 +206,7 @@ pub async fn request_and_save_license(
     auth: &LicenseAuth,
     content_id: &str,
     mut game_path: PathBuf,
+    wine_prefix: Option<&Path>,
 ) -> Result<(), LicenseError> {
     if game_path.is_file() {
         game_path = game_path.safe_parent()?.to_path_buf();
@@ -214,7 +220,7 @@ pub async fn request_and_save_license(
     let version = detect_ooa_version(game_path).await.unwrap_or(1);
     debug!("OOA version is {version}");
 
-    let hw_info = HardwareInfo::new(version);
+    let hw_info = HardwareInfo::new(version, wine_prefix);
     let license = request_license(
         content_id,
         &hw_info.generate_hardware_hash(),
@@ -223,7 +229,7 @@ pub async fn request_and_save_license(
         None,
     )
     .await?;
-    save_licenses(&license, state).await?;
+    save_licenses(&license, state, wine_prefix).await?;
 
     Ok(())
 }
@@ -338,8 +344,12 @@ pub async fn save_license(
     Ok(())
 }
 
-pub async fn save_licenses(license: &License, state: OOAState) -> Result<(), LicenseError> {
-    let path = get_license_dir()?;
+pub async fn save_licenses(
+    license: &License,
+    state: OOAState,
+    wine_prefix: Option<&Path>,
+) -> Result<(), LicenseError> {
+    let path = get_license_dir(wine_prefix)?;
 
     debug!("Saving the license {license:#?}");
     save_license(
@@ -360,22 +370,23 @@ pub async fn save_licenses(license: &License, state: OOAState) -> Result<(), Lic
 }
 
 #[cfg(windows)]
-pub fn get_license_dir() -> Result<PathBuf, NativeError> {
+pub fn get_license_dir(_wine_prefix: Option<&Path>) -> Result<PathBuf, NativeError> {
     let path = format!("C:/{}", LICENSE_PATH.to_string());
     create_dir_all(&path)?;
     Ok(PathBuf::from(path))
 }
 
+/// The license directory inside a Wine prefix: the one given, or the
+/// ambient prefix when `None`.
 #[cfg(unix)]
-pub fn get_license_dir() -> Result<PathBuf, NativeError> {
-    use crate::unix::wine::wine_prefix_dir;
+pub fn get_license_dir(wine_prefix: Option<&Path>) -> Result<PathBuf, NativeError> {
+    let prefix = match wine_prefix {
+        Some(prefix) => prefix.to_path_buf(),
+        None => crate::unix::prefix::ambient()?,
+    };
 
-    let path = format!(
-        "{}/drive_c/{}",
-        wine_prefix_dir()?.safe_str()?,
-        LICENSE_PATH.to_string()
-    );
+    let path = prefix.join("drive_c").join(LICENSE_PATH);
     create_dir_all(&path)?;
 
-    Ok(PathBuf::from(path))
+    Ok(path)
 }
