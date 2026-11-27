@@ -216,9 +216,10 @@ pub async fn run_locate_game(
     path: &str,
     slug: Option<String>,
     wine_prefix: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<()> {
     let client = connect_ready().await?;
-    client.locate_game_for(path, slug, wine_prefix).await?;
+    client.locate_game_with(path, slug, wine_prefix, touchup).await?;
     info!("Installed!");
     Ok(())
 }

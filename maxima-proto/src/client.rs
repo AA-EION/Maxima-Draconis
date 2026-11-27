@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex};
 use crate::instance::{InstanceInfo, PROTO_VERSION};
 use crate::message::{
     EntitlementSource, ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
-    ServerMessage,
+    ServerMessage, TouchupPolicy,
 };
 use crate::types::{
     BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, QueueDto, StatusDto, UserDto,
@@ -102,6 +102,8 @@ pub struct InstallOptions {
     pub exclude: Vec<String>,
     /// Game locale (`xx_XX`); `None` = recorded, else the server default.
     pub locale: Option<String>,
+    /// `None` = the server's `MAXIMA_TOUCHUP`, else `auto`.
+    pub touchup: Option<TouchupPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -432,6 +434,7 @@ impl MaximaClient {
                 wine_prefix: options.wine_prefix,
                 exclude: options.exclude,
                 locale: options.locale,
+                touchup: options.touchup,
             },
             timeout,
         )
@@ -526,7 +529,18 @@ impl MaximaClient {
         slug: Option<String>,
         wine_prefix: Option<String>,
     ) -> Result<(), ClientError> {
-        self.request(Request::LocateGame { path: path.to_owned(), slug, wine_prefix })
+        self.locate_game_with(path, slug, wine_prefix, None).await
+    }
+
+    /// [`locate_game_for`](Self::locate_game_for) with a touchup policy.
+    pub async fn locate_game_with(
+        &self,
+        path: &str,
+        slug: Option<String>,
+        wine_prefix: Option<String>,
+        touchup: Option<TouchupPolicy>,
+    ) -> Result<(), ClientError> {
+        self.request(Request::LocateGame { path: path.to_owned(), slug, wine_prefix, touchup })
             .await
             .map(|_| ())
     }

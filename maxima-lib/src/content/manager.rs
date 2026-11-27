@@ -26,7 +26,7 @@ use crate::{
     },
     core::{
         auth::storage::LockedAuthStorage,
-        manifest::{self, ManifestError, MANIFEST_RELATIVE_PATH},
+        manifest::{self, ManifestError, TouchupPolicy, MANIFEST_RELATIVE_PATH},
         service_layer::ServiceLayerError,
         MaximaEvent,
     },
@@ -106,6 +106,11 @@ pub struct QueuedGame {
     #[builder(default)]
     #[serde(default)]
     locale: Option<String>,
+    /// Whether the installer touchup runs once the files are down
+    /// (`Never` skips it; `Auto` and `Always` run it).
+    #[builder(default)]
+    #[serde(default)]
+    touchup: TouchupPolicy,
 }
 
 #[derive(Default, Getters, Serialize, Deserialize)]
@@ -210,6 +215,7 @@ pub struct GameDownloader {
     install_info: GameInstallInfo,
     slug: String,
     wine_prefix: Option<PathBuf>,
+    touchup: TouchupPolicy,
 
     downloader: Arc<ZipDownloader>,
     entries: Vec<ZipFileEntry>,
@@ -276,6 +282,7 @@ impl GameDownloader {
             install_info,
             slug: game.slug.clone(),
             wine_prefix: game.wine_prefix.clone(),
+            touchup: game.touchup,
 
             downloader: Arc::new(downloader),
             entries,
@@ -298,6 +305,7 @@ impl GameDownloader {
         let install_info = self.install_info.clone();
         let slug = self.slug.clone();
         let wine_prefix = self.wine_prefix.clone();
+        let touchup = self.touchup;
 
         tokio::spawn(async move {
             let result = GameDownloader::start_downloads(
@@ -308,6 +316,7 @@ impl GameDownloader {
                 install_info,
                 slug,
                 wine_prefix,
+                touchup,
             )
             .await;
             if let Err(err) = result {
@@ -326,6 +335,7 @@ impl GameDownloader {
         mut install_info: GameInstallInfo,
         slug: String,
         wine_prefix: Option<PathBuf>,
+        touchup: TouchupPolicy,
     ) -> Result<(), DownloaderError> {
         let total = entries.len();
         let failed = Arc::new(AtomicUsize::new(0));
@@ -379,7 +389,6 @@ impl GameDownloader {
             install_info.save_to_json(&slug);
         }
 
-        info!("Running touchup...");
         let manifest = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
 
         if !slug.is_empty() {
@@ -389,13 +398,18 @@ impl GameDownloader {
             }
         }
 
-        let locale = install_info
-            .locale
-            .clone()
-            .unwrap_or_else(|| crate::core::locale::DEFAULT_LOCALE.to_owned());
-        manifest
-            .run_touchup(path, wine_prefix.as_deref(), &locale)
-            .await?;
+        if touchup.runs_on_install() {
+            info!("Running touchup...");
+            let locale = install_info
+                .locale
+                .clone()
+                .unwrap_or_else(|| crate::core::locale::DEFAULT_LOCALE.to_owned());
+            manifest
+                .run_touchup(path, wine_prefix.as_deref(), &locale)
+                .await?;
+        } else {
+            info!("Skipping touchup (touchup policy: never)");
+        }
         info!("Installation finished!");
 
         completed_bytes.fetch_add(1, Ordering::SeqCst);

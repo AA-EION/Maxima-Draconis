@@ -63,6 +63,36 @@ impl From<EntitlementArg> for launch::EntitlementSource {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TouchupArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<TouchupArg> for maxima_proto::TouchupPolicy {
+    fn from(arg: TouchupArg) -> Self {
+        match arg {
+            TouchupArg::Auto => Self::Auto,
+            TouchupArg::Always => Self::Always,
+            TouchupArg::Never => Self::Never,
+        }
+    }
+}
+
+/// `--touchup`, else this process's `MAXIMA_TOUCHUP`; `None` leaves the
+/// choice to the server.
+fn touchup_choice(arg: Option<TouchupArg>) -> Option<maxima_proto::TouchupPolicy> {
+    use maxima::core::manifest::TouchupPolicy;
+    arg.map(Into::into).or_else(|| {
+        TouchupPolicy::from_env().map(|p| match p {
+            TouchupPolicy::Auto => maxima_proto::TouchupPolicy::Auto,
+            TouchupPolicy::Always => maxima_proto::TouchupPolicy::Always,
+            TouchupPolicy::Never => maxima_proto::TouchupPolicy::Never,
+        })
+    })
+}
+
 fn parse_locale_arg(value: &str) -> Result<String, String> {
     maxima::core::locale::Locale::parse(value)
         .map(|l| l.full_str().to_owned())
@@ -178,6 +208,13 @@ enum Mode {
         /// MAXIMA_WINE_PREFIX, but for this command only.
         #[arg(long)]
         wine_prefix: Option<String>,
+
+        /// When the installer touchup runs. `auto` (default): always on
+        /// install; on locate only when the game's manifest asks for it
+        /// (`forceTouchupInstallerAfterUpdate`), and a failure there is a
+        /// warning. `always` / `never` force it. Env: `MAXIMA_TOUCHUP`.
+        #[arg(long, value_enum)]
+        touchup: Option<TouchupArg>,
     },
     /// Install a game from the user's EA library to a local path,
     /// non-interactively. Equivalent to the interactive "Install Game"
@@ -243,6 +280,13 @@ enum Mode {
         /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
         #[arg(long, value_parser = parse_locale_arg)]
         locale: Option<String>,
+
+        /// When the installer touchup runs. `auto` (default): always on
+        /// install; on locate only when the game's manifest asks for it
+        /// (`forceTouchupInstallerAfterUpdate`), and a failure there is a
+        /// warning. `always` / `never` force it. Env: `MAXIMA_TOUCHUP`.
+        #[arg(long, value_enum)]
+        touchup: Option<TouchupArg>,
 
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
@@ -766,8 +810,14 @@ async fn startup(args: Args) -> Result<()> {
     // also stays in-process.
     match &args.mode {
         Some(Mode::ListGames { json }) => return server::run_list_games(*json).await,
-        Some(Mode::LocateGame { path, slug, wine_prefix }) => {
-            return server::run_locate_game(path, slug.clone(), wine_prefix.clone()).await
+        Some(Mode::LocateGame { path, slug, wine_prefix, touchup }) => {
+            return server::run_locate_game(
+                path,
+                slug.clone(),
+                wine_prefix.clone(),
+                touchup_choice(*touchup),
+            )
+            .await
         }
         Some(Mode::BottleInfo { slug, json, wine_prefix }) => {
             return server::run_bottle_info(slug, *json, wine_prefix.clone()).await
@@ -806,6 +856,7 @@ async fn startup(args: Args) -> Result<()> {
             wine_prefix,
             exclude,
             locale,
+            touchup,
         }) => {
             return server::run_install(
                 slug,
@@ -817,6 +868,7 @@ async fn startup(args: Args) -> Result<()> {
                     wine_prefix: wine_prefix.clone(),
                     exclude: exclude.clone(),
                     locale: locale.clone(),
+                    touchup: touchup_choice(*touchup),
                 },
                 *json,
             )

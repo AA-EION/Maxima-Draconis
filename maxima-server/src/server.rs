@@ -25,7 +25,8 @@ use maxima::core::{
     cloudsync::CloudSyncLockMode,
     launch::{self, EntitlementSource, LaunchMode, LaunchOptions},
     locale::Locale,
-    manifest, LockedMaxima, Maxima, MaximaEvent,
+    manifest::{self, TouchupPolicy},
+    LockedMaxima, Maxima, MaximaEvent,
 };
 use maxima::rtm::client::RichPresence;
 use maxima_proto::instance::{token_matches, InstanceGuard, InstanceState, PROTO_VERSION};
@@ -546,6 +547,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_prefix,
             exclude,
             locale,
+            touchup,
         } => cmd_install(
             state,
             slug,
@@ -556,11 +558,12 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_prefix,
             exclude,
             locale,
+            touchup,
         )
         .await
         .map(|slug| json!({ "slug": slug })),
-        Request::LocateGame { path, slug, wine_prefix } => {
-            cmd_locate(state, &path, slug, wine_prefix).await.map(|_| json!({}))
+        Request::LocateGame { path, slug, wine_prefix, touchup } => {
+            cmd_locate(state, &path, slug, wine_prefix, touchup).await.map(|_| json!({}))
         }
         Request::CloudSync { slug, write, wine_prefix } => {
             cmd_cloud_sync(state, &slug, write, wine_prefix).await.map(|_| json!({}))
@@ -938,6 +941,7 @@ async fn cmd_install(
     wine_prefix: Option<String>,
     exclude: Vec<String>,
     locale: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<String> {
     use maxima::content::manager::QueuedGameBuilder;
 
@@ -1042,6 +1046,7 @@ async fn cmd_install(
         .wine_prefix(prefix)
         .exclude(exclude)
         .locale(Some(locale.full_str().to_owned()))
+        .touchup(TouchupPolicy::resolve(touchup.map(touchup_policy)))
         .build()?;
     maxima.content_manager().add_install(game).await?;
     Ok(slug)
@@ -1197,6 +1202,7 @@ async fn cmd_verify(
             wine_prefix,
             Vec::new(),
             None,
+            None,
         ))
         .await?;
         state.notify(Notification::VerifyDone {
@@ -1337,14 +1343,23 @@ async fn cmd_register_protocols() -> Result<()> {
     Ok(())
 }
 
-/// Register an existing install: run its touchup in the right prefix and
-/// write the install record, so every later command finds it without a
-/// registry.
+fn touchup_policy(policy: maxima_proto::TouchupPolicy) -> TouchupPolicy {
+    match policy {
+        maxima_proto::TouchupPolicy::Auto => TouchupPolicy::Auto,
+        maxima_proto::TouchupPolicy::Always => TouchupPolicy::Always,
+        maxima_proto::TouchupPolicy::Never => TouchupPolicy::Never,
+    }
+}
+
+/// Register an existing install: run its touchup in the right prefix when
+/// the touchup policy asks for it (see `TouchupPolicy`) and write the
+/// install record, so every later command finds it without a registry.
 async fn cmd_locate(
     state: &Arc<ServerState>,
     path: &str,
     slug: Option<String>,
     wine_prefix: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<()> {
     use maxima::core::manifest::MANIFEST_RELATIVE_PATH;
     use maxima::gameinfo::GameInstallInfo;
@@ -1394,7 +1409,22 @@ async fn cmd_locate(
     };
 
     let man = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-    man.run_touchup(&path, prefix.as_deref(), locale.full_str()).await?;
+    let policy = TouchupPolicy::resolve(touchup.map(touchup_policy));
+    if policy.runs_on_locate(man.as_ref()) {
+        info!("Running touchup for {} (policy {:?})", path.display(), policy);
+        if let Err(err) = man.run_touchup(&path, prefix.as_deref(), locale.full_str()).await {
+            if policy.locate_failure_is_fatal() {
+                return Err(err.into());
+            }
+            warn!(
+                "Touchup for {} failed ({}); registering the install anyway",
+                path.display(),
+                err
+            );
+        }
+    } else {
+        info!("Not running touchup for {} (policy {:?})", path.display(), policy);
+    }
 
     if let Some((slug, offer_id)) = game {
         let mut info = GameInstallInfo::new(path.clone(), prefix)

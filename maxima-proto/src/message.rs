@@ -26,6 +26,17 @@ pub enum EntitlementSource {
     Steam,
 }
 
+/// When the installer touchup runs (`auto` when omitted): an install always
+/// runs it under `auto`; a locate only when the game's manifest asks for it,
+/// and a failure there is a warning. `always` / `never` force it on / off.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchupPolicy {
+    Auto,
+    Always,
+    Never,
+}
+
 /// A client → server request. `cmd` is the tag; per-command fields sit
 /// alongside it. Wrapped in [`RequestEnvelope`] to carry the correlation id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -108,6 +119,9 @@ pub enum Request {
         /// recorded one, else the server default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         locale: Option<String>,
+        /// Omitted = the server's `MAXIMA_TOUCHUP`, else `auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        touchup: Option<TouchupPolicy>,
     },
     LocateGame {
         path: String,
@@ -119,6 +133,9 @@ pub enum Request {
         /// game's own. Omitted = the server picks per game.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wine_prefix: Option<String>,
+        /// Omitted = the server's `MAXIMA_TOUCHUP`, else `auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        touchup: Option<TouchupPolicy>,
     },
     CloudSync {
         slug: String,
@@ -400,21 +417,24 @@ mod tests {
                 wine_prefix: None,
                 exclude: vec![],
                 locale: None,
+                touchup: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains("wine_prefix"));
         assert!(!s.contains("exclude"));
         assert!(!s.contains("locale"));
+        assert!(!s.contains("touchup"));
 
         // A request from a client that predates the fields still parses.
         let old = r#"{"id":2,"cmd":"install","slug":"g","path":"/p"}"#;
         let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
         match parsed.request {
-            Request::Install { wine_prefix, exclude, locale, .. } => {
+            Request::Install { wine_prefix, exclude, locale, touchup, .. } => {
                 assert_eq!(wine_prefix, None);
                 assert!(exclude.is_empty());
                 assert_eq!(locale, None);
+                assert_eq!(touchup, None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -436,7 +456,14 @@ mod tests {
         let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
         assert!(matches!(
             parsed.request,
-            Request::LocateGame { slug: None, wine_prefix: None, .. }
+            Request::LocateGame { slug: None, wine_prefix: None, touchup: None, .. }
+        ));
+
+        let new = r#"{"id":5,"cmd":"locate-game","path":"/g","touchup":"never"}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(new).unwrap();
+        assert!(matches!(
+            parsed.request,
+            Request::LocateGame { touchup: Some(TouchupPolicy::Never), .. }
         ));
     }
 
