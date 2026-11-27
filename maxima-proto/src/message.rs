@@ -91,6 +91,10 @@ pub enum Request {
         /// the server default (`MAXIMA_LOCALE`, else `en_US`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         locale: Option<String>,
+        /// umu `GAMEID` (Linux hosts). Omitted = the server's
+        /// `MAXIMA_UMU_GAMEID`, else `umu-0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        umu_gameid: Option<String>,
     },
     Install {
         slug: String,
@@ -346,6 +350,7 @@ mod tests {
                 steam_app_id: Some("12345".into()),
                 entitlement_source: Some(EntitlementSource::Steam),
                 locale: Some("de_DE".into()),
+                umu_gameid: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
@@ -357,6 +362,7 @@ mod tests {
         assert!(s.contains("\"steam_app_id\":\"12345\""));
         assert!(s.contains("\"entitlement_source\":\"steam\""));
         assert!(s.contains("\"locale\":\"de_DE\""));
+        assert!(!s.contains("umu_gameid"));
     }
 
     #[test]

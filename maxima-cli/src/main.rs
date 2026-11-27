@@ -93,6 +93,14 @@ fn touchup_choice(arg: Option<TouchupArg>) -> Option<maxima_proto::TouchupPolicy
     })
 }
 
+fn parse_umu_gameid_arg(value: &str) -> Result<String, String> {
+    if launch::valid_umu_gameid(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("`{value}` is not a umu GAMEID (letters, digits, '-', '_', '.')"))
+    }
+}
+
 fn parse_locale_arg(value: &str) -> Result<String, String> {
     maxima::core::locale::Locale::parse(value)
         .map(|l| l.full_str().to_owned())
@@ -180,6 +188,11 @@ enum Mode {
         /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
         #[arg(long, value_parser = parse_locale_arg)]
         locale: Option<String>,
+
+        /// umu `GAMEID` for this launch (Linux; ignored elsewhere), e.g.
+        /// `umu-1234`. Defaults to `MAXIMA_UMU_GAMEID`, else `umu-0`.
+        #[arg(long, value_parser = parse_umu_gameid_arg)]
+        umu_gameid: Option<String>,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -886,6 +899,7 @@ async fn startup(args: Args) -> Result<()> {
             json,
             wine_prefix,
             locale,
+            umu_gameid,
         }) => {
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
@@ -902,6 +916,7 @@ async fn startup(args: Args) -> Result<()> {
                     .or_else(launch::EntitlementSource::from_env)
                     .map(proto_entitlement),
                 locale: locale.clone(),
+                umu_gameid: umu_gameid.clone(),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -978,6 +993,7 @@ async fn startup(args: Args) -> Result<()> {
             json,
             wine_prefix,
             locale,
+            umu_gameid,
         } => {
             let mut game_args = game_args;
             game_args.extend(trailing_args);
@@ -992,6 +1008,7 @@ async fn startup(args: Args) -> Result<()> {
                 wine_prefix.map(PathBuf::from),
                 wine_dll_override,
                 locale,
+                umu_gameid,
                 maxima_arc.clone(),
                 json,
             )
@@ -1139,6 +1156,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         None,
         None,
         Vec::new(),
+        None,
         None,
         maxima_arc.clone(),
         false,
@@ -1516,6 +1534,7 @@ async fn start_game(
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
     locale: Option<String>,
+    umu_gameid: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1532,6 +1551,7 @@ async fn start_game(
         wine_prefix,
         wine_dll_overrides,
         locale,
+        umu_gameid,
         maxima_arc,
         json,
     )
@@ -1571,6 +1591,7 @@ async fn start_game_inner(
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
     locale: Option<String>,
+    umu_gameid: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1611,6 +1632,7 @@ async fn start_game_inner(
             .as_deref()
             .map(maxima::core::locale::Locale::parse)
             .transpose()?,
+        umu_gameid,
     };
 
     if login.is_none() {

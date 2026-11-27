@@ -466,7 +466,7 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
 async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
     use maxima::unix::{
         prefix,
-        wine::{run_wine_command_with_overrides, CommandType},
+        wine::{run_wine_command_with_options, CommandType, WineRunOptions},
     };
 
     // The launcher names the prefix in the payload; a payload from an older
@@ -476,14 +476,17 @@ async fn platform_launch(args: BootstrapLaunchArgs) -> Result<(), NativeError> {
         None => prefix::ambient()?,
     };
 
-    run_wine_command_with_overrides(
+    run_wine_command_with_options(
         args.path,
         Some(args.args),
         None,
         false,
         CommandType::WaitForExitAndRun,
         &wine_prefix,
-        &args.wine_dll_overrides,
+        WineRunOptions {
+            dll_overrides: &args.wine_dll_overrides,
+            umu_gameid: args.umu_gameid.as_deref(),
+        },
     )
     .await?;
 

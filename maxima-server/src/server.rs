@@ -524,6 +524,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             steam_app_id,
             entitlement_source,
             locale,
+            umu_gameid,
         } => cmd_launch(
             state,
             slug,
@@ -535,6 +536,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             steam_app_id,
             entitlement_source,
             locale,
+            umu_gameid,
         )
         .await
         .map(|_| json!({})),
@@ -868,8 +870,14 @@ async fn cmd_launch(
     steam_app_id: Option<String>,
     entitlement_source: Option<maxima_proto::EntitlementSource>,
     locale: Option<String>,
+    umu_gameid: Option<String>,
 ) -> Result<()> {
     let locale = locale.as_deref().map(Locale::parse).transpose()?;
+    if let Some(id) = umu_gameid.as_deref() {
+        if !launch::valid_umu_gameid(id) {
+            anyhow::bail!("`{}` is not a umu GAMEID", id);
+        }
+    }
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
     let prefix = prepare_prefix(&slug, &wine_prefix).await?;
     let path_override = exe_override
@@ -891,6 +899,7 @@ async fn cmd_launch(
             wine_prefix: prefix,
             wine_dll_overrides,
             locale,
+            umu_gameid,
         },
     )
     .await?;

@@ -42,6 +42,8 @@ pub struct LaunchParams {
     pub entitlement_source: Option<EntitlementSource>,
     /// Game locale (`xx_XX`); `None` = recorded, else the server default.
     pub locale: Option<String>,
+    /// umu `GAMEID` (Linux hosts); `None` = the server's default.
+    pub umu_gameid: Option<String>,
 }
 
 impl Default for LaunchParams {
@@ -55,6 +57,7 @@ impl Default for LaunchParams {
             steam_app_id: None,
             entitlement_source: None,
             locale: None,
+            umu_gameid: None,
         }
     }
 }
@@ -381,6 +384,7 @@ impl MaximaClient {
             steam_app_id: params.steam_app_id,
             entitlement_source: params.entitlement_source,
             locale: params.locale,
+            umu_gameid: params.umu_gameid,
         })
         .await
         .map(|_| ())

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{create_dir_all, remove_dir_all, remove_file, File},
     io::Read,
     path::{Path, PathBuf},
@@ -294,8 +294,102 @@ pub fn eac_dir() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/eac_runtime"))
 }
 
-pub fn umu_bin() -> Result<PathBuf, NativeError> {
+/// Explicit `umu-run` to use instead of the managed copy (Linux).
+pub const UMU_LOCATION_ENV: &str = "MAXIMA_UMU_LOCATION";
+/// Passed through to umu as `PROTONPATH` instead of the managed Proton
+/// (Linux): a Proton directory, or a name umu resolves itself (`GE-Proton`).
+pub const UMU_PROTONPATH_ENV: &str = "MAXIMA_UMU_PROTONPATH";
+/// umu `GAMEID` (Linux) when the launch doesn't name one.
+pub const UMU_GAMEID_ENV: &str = "MAXIMA_UMU_GAMEID";
+pub const DEFAULT_UMU_GAMEID: &str = "umu-0";
+
+/// The copy of umu Maxima downloads and keeps up to date.
+pub fn managed_umu_bin() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/umu/umu-run"))
+}
+
+/// The `umu-run` to run Wine through. On Linux: `MAXIMA_UMU_LOCATION`, else
+/// `umu-run` on `PATH`, else the managed copy. Elsewhere the managed copy.
+pub fn umu_bin() -> Result<PathBuf, NativeError> {
+    #[cfg(target_os = "linux")]
+    if let Some(external) = external_umu_bin() {
+        return Ok(external);
+    }
+    managed_umu_bin()
+}
+
+/// A `umu-run` Maxima doesn't manage: `MAXIMA_UMU_LOCATION`, else the first
+/// executable `umu-run` on `PATH`.
+#[cfg(target_os = "linux")]
+pub fn external_umu_bin() -> Option<PathBuf> {
+    if let Some(path) = env::var_os(UMU_LOCATION_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    find_executable("umu-run", &env::var_os("PATH")?)
+}
+
+#[cfg(target_os = "linux")]
+fn find_executable(name: &str, search_path: &OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    env::split_paths(search_path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// `MAXIMA_UMU_PROTONPATH`, when set (Linux).
+#[cfg(target_os = "linux")]
+pub fn external_protonpath() -> Option<OsString> {
+    env::var_os(UMU_PROTONPATH_ENV).filter(|p| !p.is_empty())
+}
+
+/// What umu gets as `PROTONPATH`: `MAXIMA_UMU_PROTONPATH` verbatim on Linux,
+/// else the managed Proton.
+fn protonpath() -> Result<OsString, NativeError> {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = external_protonpath() {
+        return Ok(path);
+    }
+    Ok(proton_dir()?.into_os_string())
+}
+
+pub use crate::core::launch::valid_umu_gameid;
+
+/// The launch's own `GAMEID`, else `MAXIMA_UMU_GAMEID`, else `umu-0`.
+/// Invalid values are skipped.
+#[cfg(target_os = "linux")]
+fn pick_umu_gameid(explicit: Option<&str>, from_env: Option<&str>) -> String {
+    if let Some(id) = explicit.filter(|id| !id.is_empty()) {
+        if valid_umu_gameid(id) {
+            return id.to_owned();
+        }
+        warn!("Ignoring invalid umu GAMEID '{}'", id);
+    }
+    if let Some(id) = from_env.filter(|id| !id.is_empty()) {
+        if valid_umu_gameid(id) {
+            return id.to_owned();
+        }
+        warn!("Ignoring {}='{}' (not a umu GAMEID)", UMU_GAMEID_ENV, id);
+    }
+    DEFAULT_UMU_GAMEID.to_owned()
+}
+
+fn umu_gameid(explicit: Option<&str>) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        pick_umu_gameid(explicit, env::var(UMU_GAMEID_ENV).ok().as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = explicit;
+        DEFAULT_UMU_GAMEID.to_owned()
+    }
 }
 
 fn versions() -> Result<Versions, NativeError> {
@@ -466,7 +560,40 @@ pub async fn run_wine_command_with_overrides<I: IntoIterator<Item = T>, T: AsRef
     prefix: &Path,
     dll_overrides: &[String],
 ) -> Result<String, NativeError> {
-    let proton_path = proton_dir()?;
+    run_wine_command_with_options(
+        arg,
+        args,
+        cwd,
+        want_output,
+        command_type,
+        prefix,
+        WineRunOptions { dll_overrides, umu_gameid: None },
+    )
+    .await
+}
+
+/// Per-command Wine options.
+#[derive(Default, Clone, Copy)]
+pub struct WineRunOptions<'a> {
+    /// Extra `dll[,dll]=mode` overrides.
+    pub dll_overrides: &'a [String],
+    /// umu `GAMEID` for this command (Linux); `None` = `MAXIMA_UMU_GAMEID`,
+    /// else `umu-0`.
+    pub umu_gameid: Option<&'a str>,
+}
+
+/// [`run_wine_command`] with every per-command option.
+pub async fn run_wine_command_with_options<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
+    arg: T,
+    args: Option<I>,
+    cwd: Option<PathBuf>,
+    want_output: bool,
+    command_type: CommandType,
+    prefix: &Path,
+    options: WineRunOptions<'_>,
+) -> Result<String, NativeError> {
+    let dll_overrides = options.dll_overrides;
+    let proton_path = protonpath()?;
     let proton_prefix_path = prefix.to_path_buf();
     let eac_path = eac_dir()?;
     let umu_bin = umu_bin()?;
@@ -511,7 +638,7 @@ pub async fn run_wine_command_with_overrides<I: IntoIterator<Item = T>, T: AsRef
     let mut binding = Command::new(wine_path.clone());
     let mut child = binding
         .env("WINEPREFIX", &proton_prefix_path)
-        .env("GAMEID", "umu-0")
+        .env("GAMEID", umu_gameid(options.umu_gameid))
         .env("PROTON_VERB", &command_type.to_string())
         .env("PROTONPATH", proton_path)
         .env("STORE", "ea")
@@ -524,7 +651,8 @@ pub async fn run_wine_command_with_overrides<I: IntoIterator<Item = T>, T: AsRef
         .env("LD_PRELOAD", "") // Fixes some log errors for some games
         .arg(arg);
 
-    if !wine_path.ends_with("umu-run") {
+    let runs_umu = wine_path.ends_with("umu-run") || Path::new(&wine_path) == umu_bin.as_path();
+    if !runs_umu {
         child = child.env("WINEDLLOVERRIDES", resolve_wine_dll_overrides(dll_overrides));
     } else {
         let requested = requested_wine_dll_overrides(dll_overrides);
@@ -1062,6 +1190,43 @@ pub async fn parse_partial_registry_path_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn umu_gameid_validation() {
+        assert!(valid_umu_gameid("umu-0"));
+        assert!(valid_umu_gameid("umu-1237970"));
+        assert!(!valid_umu_gameid(""));
+        assert!(!valid_umu_gameid("umu 0"));
+        assert!(!valid_umu_gameid("a;b"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn umu_gameid_prefers_the_launch_then_the_env() {
+        assert_eq!(pick_umu_gameid(None, None), DEFAULT_UMU_GAMEID);
+        assert_eq!(pick_umu_gameid(None, Some("umu-7")), "umu-7");
+        assert_eq!(pick_umu_gameid(Some("umu-9"), Some("umu-7")), "umu-9");
+        assert_eq!(pick_umu_gameid(Some("bad id"), Some("umu-7")), "umu-7");
+        assert_eq!(pick_umu_gameid(None, Some("bad id")), DEFAULT_UMU_GAMEID);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn umu_run_is_found_on_the_search_path_only_when_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plain = tempfile::tempdir().unwrap();
+        let exec = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("umu-run"), "").unwrap();
+        let script = exec.path().join("umu-run");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = env::join_paths([plain.path(), exec.path()]).unwrap();
+        assert_eq!(find_executable("umu-run", &path), Some(script));
+        let only_plain = env::join_paths([plain.path()]).unwrap();
+        assert_eq!(find_executable("umu-run", &only_plain), None);
+    }
 
     // Real system.reg escaping: doubled backslashes in key names and values.
     const SYSTEM_REG: &str = r#"WINE REGISTRY Version 2

@@ -147,6 +147,16 @@ impl EntitlementSource {
     }
 }
 
+/// A umu `GAMEID` is a short token such as `umu-0` or `umu-1234`. Only used
+/// on Linux, but checked on every host so a request is judged the same way.
+pub fn valid_umu_gameid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// `MAXIMA_STEAM_APP_ID`, if set to a plausible Steam App ID.
 pub fn steam_app_id_from_env() -> Option<String> {
     let value = env::var("MAXIMA_STEAM_APP_ID").ok()?;
@@ -206,6 +216,9 @@ pub struct LaunchOptions {
     /// record, else the process default (`MAXIMA_LOCALE`, else `en_US`). An
     /// explicit value is also remembered in the install record.
     pub locale: Option<Locale>,
+    /// umu `GAMEID` for this launch (Linux; ignored elsewhere). `None` =
+    /// `MAXIMA_UMU_GAMEID`, else `umu-0`.
+    pub umu_gameid: Option<String>,
 }
 
 pub enum LaunchMode {
@@ -319,6 +332,10 @@ pub struct BootstrapLaunchArgs {
     pub wine_prefix: Option<String>,
     #[serde(default)]
     pub wine_dll_overrides: Vec<String>,
+    /// umu `GAMEID` (Linux). Absent = the bootstrap's `MAXIMA_UMU_GAMEID`,
+    /// else `umu-0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umu_gameid: Option<String>,
 }
 
 impl Display for LaunchMode {
@@ -626,6 +643,7 @@ pub async fn start_game(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         wine_dll_overrides: options.wine_dll_overrides.clone(),
+        umu_gameid: options.umu_gameid.clone(),
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&bootstrap_args)?);
@@ -797,15 +815,21 @@ pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeE
 
     let skip = std::env::var("MAXIMA_DISABLE_WINE_VERIFICATION").is_ok();
     if !skip {
-        if !check_wine_validity().await? {
+        // A Proton / umu the user points us at is theirs to keep current.
+        if crate::unix::wine::external_protonpath().is_none() && !check_wine_validity().await? {
             install_wine().await?;
         }
         let runtimes = get_lutris_runtimes().await?;
         if !check_runtime_validity("eac_runtime", &runtimes).await? {
             install_runtime("eac_runtime", &runtimes).await?;
         }
-        if !check_runtime_validity("umu", &runtimes).await? {
-            install_runtime("umu", &runtimes).await?;
+        match crate::unix::wine::external_umu_bin() {
+            Some(umu) => info!("Using umu-run at {}", umu.display()),
+            None => {
+                if !check_runtime_validity("umu", &runtimes).await? {
+                    install_runtime("umu", &runtimes).await?;
+                }
+            }
         }
     }
 
@@ -936,13 +960,17 @@ mod wine_prefix_tests {
             args: vec![],
             wine_prefix: Some("/prefixes/a".into()),
             wine_dll_overrides: vec![],
+            umu_gameid: Some("umu-1234".into()),
         };
         let json = serde_json::to_string(&with).unwrap();
         let back: BootstrapLaunchArgs = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wine_prefix.as_deref(), Some("/prefixes/a"));
+        assert_eq!(back.umu_gameid.as_deref(), Some("umu-1234"));
 
         let without = BootstrapLaunchArgs::default();
-        assert!(!serde_json::to_string(&without).unwrap().contains("wine_prefix"));
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("wine_prefix"));
+        assert!(!json.contains("umu_gameid"));
     }
 
     #[test]
