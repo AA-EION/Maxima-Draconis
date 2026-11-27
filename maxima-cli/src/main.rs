@@ -24,7 +24,7 @@ use maxima::{
     core::{
         auth::{
             context::AuthContext,
-            login::{begin_oauth_login_flow, manual_login},
+            login::begin_oauth_login_flow,
             nucleus_auth_exchange, nucleus_token_exchange, TokenResponse,
         },
         clients::JUNO_PC_CLIENT_ID,
@@ -685,21 +685,16 @@ pub async fn login_flow(login_override: Option<String>) -> Result<TokenResponse>
     let mut auth_context = AuthContext::new()?;
 
     if let Some(access_token) = &login_override {
-        let access_token = if let Some(captures) = MANUAL_LOGIN_PATTERN.captures(&access_token) {
-            let persona = &captures[1];
-            let password = &captures[2];
+        // EA patched the OOA username/password exchange; only an access
+        // token (or the browser login) can start a session now.
+        if MANUAL_LOGIN_PATTERN.is_match(access_token) {
+            bail!(
+                "username:password login is no longer supported by EA; \
+                 pass an access token with --login, or omit it to log in in the browser"
+            );
+        }
 
-            let login_result = manual_login(persona, password).await;
-            if login_result.is_err() {
-                bail!("Login failed: {}", login_result.err().unwrap().to_string());
-            }
-
-            login_result.unwrap()
-        } else {
-            access_token.to_owned()
-        };
-
-        auth_context.set_access_token(&access_token);
+        auth_context.set_access_token(access_token);
         let code = nucleus_auth_exchange(&auth_context, JUNO_PC_CLIENT_ID, "code").await?;
         auth_context.set_code(&code);
     } else {
