@@ -56,6 +56,9 @@ struct ServerState {
     clients: AtomicUsize,
     /// Last presence per friend, replayed to clients as they connect.
     presence: Mutex<HashMap<String, Notification>>,
+    /// The URL of the login in progress, replayed to clients that connect
+    /// while it runs.
+    login_url: std::sync::Mutex<Option<String>>,
 }
 
 impl ServerState {
@@ -104,6 +107,7 @@ pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> R
         persona: Mutex::new(String::new()),
         clients: AtomicUsize::new(0),
         presence: Mutex::new(HashMap::new()),
+        login_url: std::sync::Mutex::new(None),
     });
 
     // Serve before logging in: a first-run login waits on the user in the
@@ -163,7 +167,13 @@ async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> R
             break;
         }
         state.logging_in.store(true, Ordering::Release);
-        let result = crate::oauth_login(maxima_arc).await;
+        let url_state = state.clone();
+        let result = crate::oauth_login(maxima_arc, move |url: &str| {
+            *url_state.login_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.to_owned());
+            url_state.notify(Notification::LoginUrl { url: url.to_owned() });
+        })
+        .await;
+        *state.login_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
         state.logging_in.store(false, Ordering::Release);
         match result {
             Ok(()) => break,
@@ -356,6 +366,10 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     } else {
         send(&out_tx, &Notification::LoginRequired);
+        let url = state.login_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(url) = url {
+            send(&out_tx, &Notification::LoginUrl { url });
+        }
     }
 
     let ev_tx = out_tx.clone();

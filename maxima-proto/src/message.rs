@@ -270,6 +270,13 @@ pub enum Notification {
     LoginFailed {
         error: String,
     },
+    /// The EA login page for the login in progress. The server also tries to
+    /// open it in a browser on its own host; a client can show or open it
+    /// when that host has no usable browser. Replayed to clients that
+    /// connect while the login runs.
+    LoginUrl {
+        url: String,
+    },
     Presence {
         id: String,
         basic: String,
@@ -470,6 +477,17 @@ mod tests {
         assert!(matches!(
             parsed.request,
             Request::LocateGame { touchup: Some(TouchupPolicy::Never), .. }
+        ));
+    }
+
+    #[test]
+    fn login_url_wire_shape() {
+        let n = Notification::LoginUrl { url: "https://example.invalid/login".into() };
+        let s = serde_json::to_string(&n).unwrap();
+        assert_eq!(s, r#"{"event":"login-url","url":"https://example.invalid/login"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&s).unwrap(),
+            ServerMessage::Notification(Notification::LoginUrl { .. })
         ));
     }
 

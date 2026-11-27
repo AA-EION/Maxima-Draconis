@@ -16,7 +16,7 @@ mod linux_tray;
 use anyhow::{bail, Result};
 use log::{error, info, warn};
 use maxima::core::{
-    auth::{context::AuthContext, login::begin_oauth_login_flow, nucleus_token_exchange},
+    auth::{context::AuthContext, login::begin_oauth_login_flow_with, nucleus_token_exchange},
     LockedMaxima, Maxima, MaximaOptionsBuilder,
 };
 use maxima::util::{log::init_logger_named, native::maxima_dir};
@@ -88,11 +88,15 @@ pub(crate) async fn saved_login(maxima_arc: &LockedMaxima) -> Result<bool> {
 }
 
 /// Interactive EA login: opens the browser and waits for the qrc:// redirect.
-/// Holds no lock while the user is in the browser.
-pub(crate) async fn oauth_login(maxima_arc: &LockedMaxima) -> Result<()> {
+/// `on_url` gets the login URL first, for clients to show or open. Holds no
+/// lock while the user is in the browser.
+pub(crate) async fn oauth_login(
+    maxima_arc: &LockedMaxima,
+    on_url: impl FnOnce(&str) + Send,
+) -> Result<()> {
     info!("Logging in...");
     let mut ctx = AuthContext::new()?;
-    begin_oauth_login_flow(&mut ctx).await?;
+    begin_oauth_login_flow_with(&mut ctx, on_url).await?;
     if ctx.code().is_none() {
         bail!("Login failed!");
     }
