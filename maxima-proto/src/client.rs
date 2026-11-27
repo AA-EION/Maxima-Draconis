@@ -40,6 +40,8 @@ pub struct LaunchParams {
     pub wine_dll_overrides: Vec<String>,
     pub steam_app_id: Option<String>,
     pub entitlement_source: Option<EntitlementSource>,
+    /// Game locale (`xx_XX`); `None` = recorded, else the server default.
+    pub locale: Option<String>,
 }
 
 impl Default for LaunchParams {
@@ -52,6 +54,7 @@ impl Default for LaunchParams {
             wine_dll_overrides: Vec::new(),
             steam_app_id: None,
             entitlement_source: None,
+            locale: None,
         }
     }
 }
@@ -97,6 +100,8 @@ pub struct InstallOptions {
     pub wine_prefix: Option<String>,
     /// Glob patterns of files to leave out of the download.
     pub exclude: Vec<String>,
+    /// Game locale (`xx_XX`); `None` = recorded, else the server default.
+    pub locale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,6 +378,7 @@ impl MaximaClient {
             wine_dll_overrides: params.wine_dll_overrides,
             steam_app_id: params.steam_app_id,
             entitlement_source: params.entitlement_source,
+            locale: params.locale,
         })
         .await
         .map(|_| ())
@@ -425,6 +431,7 @@ impl MaximaClient {
                 only_listed_files: options.only_listed_files,
                 wine_prefix: options.wine_prefix,
                 exclude: options.exclude,
+                locale: options.locale,
             },
             timeout,
         )

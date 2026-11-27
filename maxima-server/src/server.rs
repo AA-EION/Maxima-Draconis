@@ -24,6 +24,7 @@ use log::{error, info, warn};
 use maxima::core::{
     cloudsync::CloudSyncLockMode,
     launch::{self, EntitlementSource, LaunchMode, LaunchOptions},
+    locale::Locale,
     manifest, LockedMaxima, Maxima, MaximaEvent,
 };
 use maxima::rtm::client::RichPresence;
@@ -521,6 +522,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_dll_overrides,
             steam_app_id,
             entitlement_source,
+            locale,
         } => cmd_launch(
             state,
             slug,
@@ -531,6 +533,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_dll_overrides,
             steam_app_id,
             entitlement_source,
+            locale,
         )
         .await
         .map(|_| json!({})),
@@ -542,6 +545,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             only_listed_files,
             wine_prefix,
             exclude,
+            locale,
         } => cmd_install(
             state,
             slug,
@@ -551,6 +555,7 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             only_listed_files,
             wine_prefix,
             exclude,
+            locale,
         )
         .await
         .map(|slug| json!({ "slug": slug })),
@@ -859,7 +864,9 @@ async fn cmd_launch(
     wine_dll_overrides: Vec<String>,
     steam_app_id: Option<String>,
     entitlement_source: Option<maxima_proto::EntitlementSource>,
+    locale: Option<String>,
 ) -> Result<()> {
+    let locale = locale.as_deref().map(Locale::parse).transpose()?;
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
     let prefix = prepare_prefix(&slug, &wine_prefix).await?;
     let path_override = exe_override
@@ -880,6 +887,7 @@ async fn cmd_launch(
             }),
             wine_prefix: prefix,
             wine_dll_overrides,
+            locale,
         },
     )
     .await?;
@@ -929,8 +937,13 @@ async fn cmd_install(
     only_listed_files: bool,
     wine_prefix: Option<String>,
     exclude: Vec<String>,
+    locale: Option<String>,
 ) -> Result<String> {
     use maxima::content::manager::QueuedGameBuilder;
+
+    if let Some(locale) = &locale {
+        Locale::parse(locale)?;
+    }
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
@@ -1019,7 +1032,8 @@ async fn cmd_install(
     if queue.current.iter().chain(&queue.queued).any(|q| q.offer_id == offer_id) {
         return Ok(slug);
     }
-    let locale = maxima.locale().full_str().to_owned();
+    let recorded = maxima::gameinfo::load_game_info(&slug).and_then(|r| r.locale);
+    let locale = Locale::resolve(locale.as_deref(), recorded.as_deref(), maxima.locale())?;
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build_id)
@@ -1027,7 +1041,7 @@ async fn cmd_install(
         .slug(slug.clone())
         .wine_prefix(prefix)
         .exclude(exclude)
-        .locale(Some(locale))
+        .locale(Some(locale.full_str().to_owned()))
         .build()?;
     maxima.content_manager().add_install(game).await?;
     Ok(slug)
@@ -1182,6 +1196,7 @@ async fn cmd_verify(
             true,
             wine_prefix,
             Vec::new(),
+            None,
         ))
         .await?;
         state.notify(Notification::VerifyDone {
@@ -1369,15 +1384,23 @@ async fn cmd_locate(
         }
     };
 
+    let recorded = game
+        .as_ref()
+        .and_then(|(slug, _)| maxima::gameinfo::load_game_info(slug))
+        .and_then(|r| r.locale);
+    let locale = {
+        let maxima = state.maxima.lock().await;
+        Locale::resolve(None, recorded.as_deref(), maxima.locale())?
+    };
+
     let man = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-    man.run_touchup(&path, prefix.as_deref()).await?;
+    man.run_touchup(&path, prefix.as_deref(), locale.full_str()).await?;
 
     if let Some((slug, offer_id)) = game {
-        let locale = state.maxima.lock().await.locale().full_str().to_owned();
         let mut info = GameInstallInfo::new(path.clone(), prefix)
             .with_slug(&slug)
             .with_offer(&offer_id, None)
-            .with_locale(&locale);
+            .with_locale(locale.full_str());
         info.version = man.version();
         info.save(&slug)?;
     }

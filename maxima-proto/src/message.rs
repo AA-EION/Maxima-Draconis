@@ -76,6 +76,10 @@ pub enum Request {
         /// `steam_app_id` (Steam when set, EA when not).
         #[serde(default)]
         entitlement_source: Option<EntitlementSource>,
+        /// Game locale (`xx_XX`). Omitted = the game's recorded locale, else
+        /// the server default (`MAXIMA_LOCALE`, else `en_US`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locale: Option<String>,
     },
     Install {
         slug: String,
@@ -100,6 +104,10 @@ pub enum Request {
         /// the game's exclusion file. Remembered in the install record.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// Game locale (`xx_XX`) to install with and record. Omitted = the
+        /// recorded one, else the server default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locale: Option<String>,
     },
     LocateGame {
         path: String,
@@ -320,6 +328,7 @@ mod tests {
                 wine_dll_overrides: vec!["wsock32=n,b".into()],
                 steam_app_id: Some("12345".into()),
                 entitlement_source: Some(EntitlementSource::Steam),
+                locale: Some("de_DE".into()),
             },
         };
         let s = serde_json::to_string(&env).unwrap();
@@ -330,6 +339,7 @@ mod tests {
         assert!(s.contains("\"wine_dll_overrides\":[\"wsock32=n,b\"]"));
         assert!(s.contains("\"steam_app_id\":\"12345\""));
         assert!(s.contains("\"entitlement_source\":\"steam\""));
+        assert!(s.contains("\"locale\":\"de_DE\""));
     }
 
     #[test]
@@ -344,8 +354,10 @@ mod tests {
                 wine_dll_overrides,
                 steam_app_id,
                 entitlement_source,
+                locale,
                 ..
             } => {
+                assert!(locale.is_none());
                 assert!(args.is_empty());
                 assert!(exe_override.is_none());
                 assert!(cloud_saves);
@@ -387,19 +399,22 @@ mod tests {
                 only_listed_files: false,
                 wine_prefix: None,
                 exclude: vec![],
+                locale: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains("wine_prefix"));
         assert!(!s.contains("exclude"));
+        assert!(!s.contains("locale"));
 
         // A request from a client that predates the fields still parses.
         let old = r#"{"id":2,"cmd":"install","slug":"g","path":"/p"}"#;
         let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
         match parsed.request {
-            Request::Install { wine_prefix, exclude, .. } => {
+            Request::Install { wine_prefix, exclude, locale, .. } => {
                 assert_eq!(wine_prefix, None);
                 assert!(exclude.is_empty());
+                assert_eq!(locale, None);
             }
             other => panic!("unexpected {other:?}"),
         }

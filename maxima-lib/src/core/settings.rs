@@ -7,4 +7,6 @@ pub enum MaximaSetting {
     IsIgoEnabled,
     IsIgoAvailable,
     Environment,
+    /// The game's language, as an `xx_XX` locale.
+    Language,
 }

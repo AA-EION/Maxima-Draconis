@@ -87,6 +87,8 @@ pub type MaximaLSXEventCallback = extern "C" fn(*const c_char);
 
 #[derive(Getters)]
 pub struct Maxima {
+    /// Default game locale: `MAXIMA_LOCALE`, else `en_US`. A launch or an
+    /// install can pick its own (see `core::locale`).
     locale: Locale,
 
     auth_storage: LockedAuthStorage,
@@ -226,7 +228,7 @@ impl Maxima {
         };
 
         Ok(Arc::new(Mutex::new(Self {
-            locale: Locale::EnUs,
+            locale: Locale::process_default(),
             auth_storage: auth_storage.clone(),
             service_layer: ServiceLayerClient::new(auth_storage.clone()),
             library: GameLibrary::new(auth_storage.clone()).await,

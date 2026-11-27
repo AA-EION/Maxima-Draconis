@@ -45,6 +45,7 @@ pub trait GameManifest: Send + std::fmt::Debug {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError>;
     fn execute_path(&self, trial: bool) -> Option<String>;
     fn version(&self) -> Option<String>;
@@ -55,8 +56,9 @@ impl GameManifest for DiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
-        self.run_touchup(install_path, wine_prefix).await
+        self.run_touchup(install_path, wine_prefix, locale).await
     }
 
     fn execute_path(&self, trial: bool) -> Option<String> {
@@ -74,8 +76,9 @@ impl GameManifest for PreDiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
-        self.run_touchup(install_path, wine_prefix).await
+        self.run_touchup(install_path, wine_prefix, locale).await
     }
 
     fn execute_path(&self, _: bool) -> Option<String> {
@@ -175,6 +178,7 @@ pub(crate) fn expand_args(parameters: &str, locale: &str, install_location: &str
 pub(crate) fn collect_touchup_args(
     parameters: &str,
     install_path: &Path,
+    locale: &str,
 ) -> Result<Vec<PathBuf>, ManifestError> {
     let install = install_path
         .to_str()
@@ -185,7 +189,7 @@ pub(crate) fn collect_touchup_args(
 
     Ok(expand_args(
         parameters,
-        "en_US",
+        locale,
         install.to_str().ok_or(ManifestError::Decode)?,
     ))
 }

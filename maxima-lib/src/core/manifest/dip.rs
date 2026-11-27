@@ -234,6 +234,7 @@ impl DiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
         use crate::{
             core::launch::mx_linux_setup,
@@ -256,7 +257,7 @@ impl DiPManifest {
         let install_path = PathBuf::from(remove_trailing_slash(
             install_path.to_str().ok_or(ManifestError::Decode)?,
         ));
-        let args = collect_touchup_args(&self.touchup.parameters, &install_path)?;
+        let args = collect_touchup_args(&self.touchup.parameters, &install_path, locale)?;
         let path = install_path.join(self.touchup.path());
         let path = case_insensitive_path(path);
         run_wine_command(path, Some(args), None, true, CommandType::Run, &prefix).await?;
@@ -270,6 +271,7 @@ impl DiPManifest {
         &self,
         install_path: &PathBuf,
         _wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
         use crate::util::{elevation, native::NativeError};
 
@@ -277,7 +279,7 @@ impl DiPManifest {
             return Ok(());
         }
 
-        let args = collect_touchup_args(&self.touchup.parameters, install_path)?;
+        let args = collect_touchup_args(&self.touchup.parameters, install_path, locale)?;
         let path = install_path.join(self.touchup.path());
 
         let code = elevation::run_and_wait(&path, &args).await?;

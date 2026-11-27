@@ -389,7 +389,13 @@ impl GameDownloader {
             }
         }
 
-        manifest.run_touchup(path, wine_prefix.as_deref()).await?;
+        let locale = install_info
+            .locale
+            .clone()
+            .unwrap_or_else(|| crate::core::locale::DEFAULT_LOCALE.to_owned());
+        manifest
+            .run_touchup(path, wine_prefix.as_deref(), &locale)
+            .await?;
         info!("Installation finished!");
 
         completed_bytes.fetch_add(1, Ordering::SeqCst);

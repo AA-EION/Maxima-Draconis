@@ -18,6 +18,7 @@ use crate::{
         clients::JUNO_PC_CLIENT_ID,
         cloudsync::{CloudSyncError, CloudSyncLockMode},
         library::{path_in_install_root, LibraryError, OwnedOffer},
+        locale::Locale,
         manifest::{self, MANIFEST_RELATIVE_PATH},
         service_layer::ServiceLayerError,
         Maxima,
@@ -157,6 +158,7 @@ pub fn steam_app_id_from_env() -> Option<String> {
     }
 }
 
+#[derive(Default)]
 pub struct LaunchOptions {
     pub path_override: Option<String>,
     pub arguments: Vec<String>,
@@ -200,6 +202,10 @@ pub struct LaunchOptions {
     /// (e.g. `wsock32=n,b`), layered on top of the built-in defaults and
     /// `MAXIMA_WINE_DLL_OVERRIDES`. Ignored by hosts that don't use Wine.
     pub wine_dll_overrides: Vec<String>,
+    /// Locale to run the game in. `None` = the one in the game's install
+    /// record, else the process default (`MAXIMA_LOCALE`, else `en_US`). An
+    /// explicit value is also remembered in the install record.
+    pub locale: Option<Locale>,
 }
 
 pub enum LaunchMode {
@@ -247,6 +253,9 @@ pub struct ActiveGameContext {
     /// selection.
     wine_prefix: Option<PathBuf>,
     entitlement_override: Option<EntitlementSource>,
+    /// The locale the game was launched in (`EAGameLocale`); LSX reports it
+    /// as the installed language.
+    locale: Locale,
     process: Child,
     started: bool,
 }
@@ -263,6 +272,7 @@ impl ActiveGameContext {
         slug: Option<String>,
         wine_prefix: Option<PathBuf>,
         entitlement_override: Option<EntitlementSource>,
+        locale: Locale,
         process: Child,
     ) -> Self {
         Self {
@@ -277,6 +287,7 @@ impl ActiveGameContext {
             slug,
             wine_prefix,
             entitlement_override,
+            locale,
             process,
             started: false,
         }
@@ -563,6 +574,25 @@ pub async fn start_game(
 
     let slug = offer.as_ref().map(|o| o.slug().clone());
 
+    let record = slug.as_deref().and_then(crate::gameinfo::load_game_info);
+    let locale = match options.locale.clone() {
+        Some(locale) => locale,
+        None => record
+            .as_ref()
+            .and_then(|r| r.locale.as_deref())
+            .and_then(|r| Locale::parse(r).ok())
+            .unwrap_or_else(|| maxima.locale.clone()),
+    };
+    if let (Some(explicit), Some(slug), Some(mut record)) =
+        (options.locale.as_ref(), slug.as_deref(), record)
+    {
+        if record.locale.as_deref() != Some(explicit.full_str()) {
+            record.locale = Some(explicit.full_str().to_owned());
+            record.save_to_json(slug);
+        }
+    }
+    info!("Game locale: {}", locale);
+
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
 
@@ -615,7 +645,7 @@ pub async fn start_game(
         .env("EAEntitlementSource", source_tag)
         .env("EAExternalSource", source_tag)
         .env("EAFreeTrialGame", "false")
-        .env("EAGameLocale", maxima.locale.full_str())
+        .env("EAGameLocale", locale.full_str())
         .env("EAGenericAuthToken", access_token.to_owned())
         .env("EALaunchCode", "unavailable")
         .env("EALaunchOwner", source_tag)
@@ -728,6 +758,7 @@ pub async fn start_game(
         slug,
         wine_prefix,
         entitlement_override,
+        locale,
         child,
     ));
 

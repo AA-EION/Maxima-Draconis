@@ -2,7 +2,7 @@ use crate::{
     core::settings::MaximaSetting,
     lsx::{
         connection::LockedConnectionState,
-        request::LSXRequestError,
+        request::{game::game_locale, LSXRequestError},
         types::{
             LSXGetInternetConnectedState, LSXGetSetting, LSXGetSettingResponse,
             LSXInternetConnectedState, LSXResponseType, LSXSetDownloaderUtilization,
@@ -12,13 +12,18 @@ use crate::{
 };
 
 pub async fn handle_settings_request(
-    _: LockedConnectionState,
+    state: LockedConnectionState,
     request: LSXGetSetting,
 ) -> Result<Option<LSXResponseType>, LSXRequestError> {
     let setting = match request.attr_SettingId {
         MaximaSetting::IsIgoEnabled => "false".to_string(),
         MaximaSetting::IsIgoAvailable => "false".to_string(),
         MaximaSetting::Environment => "production".to_string(),
+        MaximaSetting::Language => {
+            let arc = state.write().await.maxima_arc();
+            let maxima = arc.lock().await;
+            game_locale(&maxima).full_str().to_string()
+        }
     };
 
     make_lsx_handler_response!(Response, GetSettingResponse, { attr_Setting: setting })

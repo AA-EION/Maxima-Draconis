@@ -421,6 +421,7 @@ service_layer_enum!(Platform, { Pc, MacPc });
 
 service_layer_type!(GetPreloadedOwnedGamesRequest, {
     is_mac: bool,
+    #[serde(serialize_with = "Locale::serialize_service_layer")]
     locale: Locale,
     limit: u32,
     next: String,
@@ -767,6 +768,7 @@ service_layer_type!(PlayersPage, {
 
 service_layer_type!(GetLegacyCatalogDefsRequest, {
     offer_ids: Vec<String>,
+    #[serde(serialize_with = "Locale::serialize_service_layer")]
     locale: Locale,
 });
 

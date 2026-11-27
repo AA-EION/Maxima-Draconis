@@ -63,6 +63,12 @@ impl From<EntitlementArg> for launch::EntitlementSource {
     }
 }
 
+fn parse_locale_arg(value: &str) -> Result<String, String> {
+    maxima::core::locale::Locale::parse(value)
+        .map(|l| l.full_str().to_owned())
+        .map_err(|e| e.to_string())
+}
+
 fn proto_entitlement(source: launch::EntitlementSource) -> maxima_proto::EntitlementSource {
     match source {
         launch::EntitlementSource::Ea => maxima_proto::EntitlementSource::Ea,
@@ -139,6 +145,11 @@ enum Mode {
         /// MAXIMA_WINE_PREFIX, but for this command only.
         #[arg(long)]
         wine_prefix: Option<String>,
+
+        /// Game locale, `xx_XX` (e.g. `de_DE`). Defaults to the one in the
+        /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
+        #[arg(long, value_parser = parse_locale_arg)]
+        locale: Option<String>,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -227,6 +238,11 @@ enum Mode {
         /// folder: `--exclude "*.bik" --exclude "Movies/"`.
         #[arg(long)]
         exclude: Vec<String>,
+
+        /// Game locale, `xx_XX` (e.g. `de_DE`). Defaults to the one in the
+        /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
+        #[arg(long, value_parser = parse_locale_arg)]
+        locale: Option<String>,
 
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
@@ -789,6 +805,7 @@ async fn startup(args: Args) -> Result<()> {
             json,
             wine_prefix,
             exclude,
+            locale,
         }) => {
             return server::run_install(
                 slug,
@@ -799,6 +816,7 @@ async fn startup(args: Args) -> Result<()> {
                     only_listed_files: *only_listed_files,
                     wine_prefix: wine_prefix.clone(),
                     exclude: exclude.clone(),
+                    locale: locale.clone(),
                 },
                 *json,
             )
@@ -815,6 +833,7 @@ async fn startup(args: Args) -> Result<()> {
             entitlement_source,
             json,
             wine_prefix,
+            locale,
         }) => {
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
@@ -830,6 +849,7 @@ async fn startup(args: Args) -> Result<()> {
                     .map(launch::EntitlementSource::from)
                     .or_else(launch::EntitlementSource::from_env)
                     .map(proto_entitlement),
+                locale: locale.clone(),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -905,6 +925,7 @@ async fn startup(args: Args) -> Result<()> {
             entitlement_source,
             json,
             wine_prefix,
+            locale,
         } => {
             let mut game_args = game_args;
             game_args.extend(trailing_args);
@@ -918,6 +939,7 @@ async fn startup(args: Args) -> Result<()> {
                 entitlement_source.map(Into::into),
                 wine_prefix.map(PathBuf::from),
                 wine_dll_override,
+                locale,
                 maxima_arc.clone(),
                 json,
             )
@@ -1065,6 +1087,7 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         None,
         None,
         Vec::new(),
+        None,
         maxima_arc.clone(),
         false,
     )
@@ -1440,6 +1463,7 @@ async fn start_game(
     entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
+    locale: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1455,6 +1479,7 @@ async fn start_game(
         entitlement_source,
         wine_prefix,
         wine_dll_overrides,
+        locale,
         maxima_arc,
         json,
     )
@@ -1493,6 +1518,7 @@ async fn start_game_inner(
     entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
+    locale: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1529,6 +1555,10 @@ async fn start_game_inner(
         entitlement_source,
         wine_prefix,
         wine_dll_overrides,
+        locale: locale
+            .as_deref()
+            .map(maxima::core::locale::Locale::parse)
+            .transpose()?,
     };
 
     if login.is_none() {
