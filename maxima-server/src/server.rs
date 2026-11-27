@@ -24,7 +24,9 @@ use log::{error, info, warn};
 use maxima::core::{
     cloudsync::CloudSyncLockMode,
     launch::{self, EntitlementSource, LaunchMode, LaunchOptions},
-    manifest, LockedMaxima, Maxima, MaximaEvent,
+    locale::Locale,
+    manifest::{self, TouchupPolicy},
+    LockedMaxima, Maxima, MaximaEvent,
 };
 use maxima::rtm::client::RichPresence;
 use maxima_proto::instance::{token_matches, InstanceGuard, InstanceState, PROTO_VERSION};
@@ -54,6 +56,9 @@ struct ServerState {
     clients: AtomicUsize,
     /// Last presence per friend, replayed to clients as they connect.
     presence: Mutex<HashMap<String, Notification>>,
+    /// The URL of the login in progress, replayed to clients that connect
+    /// while it runs.
+    login_url: std::sync::Mutex<Option<String>>,
 }
 
 impl ServerState {
@@ -102,6 +107,7 @@ pub async fn run_server(maxima_arc: LockedMaxima, mut guard: InstanceGuard) -> R
         persona: Mutex::new(String::new()),
         clients: AtomicUsize::new(0),
         presence: Mutex::new(HashMap::new()),
+        login_url: std::sync::Mutex::new(None),
     });
 
     // Serve before logging in: a first-run login waits on the user in the
@@ -161,7 +167,13 @@ async fn start_session(state: &Arc<ServerState>, guard: &mut InstanceGuard) -> R
             break;
         }
         state.logging_in.store(true, Ordering::Release);
-        let result = crate::oauth_login(maxima_arc).await;
+        let url_state = state.clone();
+        let result = crate::oauth_login(maxima_arc, move |url: &str| {
+            *url_state.login_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.to_owned());
+            url_state.notify(Notification::LoginUrl { url: url.to_owned() });
+        })
+        .await;
+        *state.login_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
         state.logging_in.store(false, Ordering::Release);
         match result {
             Ok(()) => break,
@@ -354,6 +366,10 @@ async fn handle_client(state: Arc<ServerState>, stream: TcpStream) {
         }
     } else {
         send(&out_tx, &Notification::LoginRequired);
+        let url = state.login_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(url) = url {
+            send(&out_tx, &Notification::LoginUrl { url });
+        }
     }
 
     let ev_tx = out_tx.clone();
@@ -521,6 +537,8 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_dll_overrides,
             steam_app_id,
             entitlement_source,
+            locale,
+            umu_gameid,
         } => cmd_launch(
             state,
             slug,
@@ -531,6 +549,8 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             wine_dll_overrides,
             steam_app_id,
             entitlement_source,
+            locale,
+            umu_gameid,
         )
         .await
         .map(|_| json!({})),
@@ -542,6 +562,8 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             only_listed_files,
             wine_prefix,
             exclude,
+            locale,
+            touchup,
         } => cmd_install(
             state,
             slug,
@@ -551,11 +573,13 @@ async fn dispatch(state: &Arc<ServerState>, id: u64, request: Request) -> Respon
             only_listed_files,
             wine_prefix,
             exclude,
+            locale,
+            touchup,
         )
         .await
         .map(|slug| json!({ "slug": slug })),
-        Request::LocateGame { path, slug, wine_prefix } => {
-            cmd_locate(state, &path, slug, wine_prefix).await.map(|_| json!({}))
+        Request::LocateGame { path, slug, wine_prefix, touchup } => {
+            cmd_locate(state, &path, slug, wine_prefix, touchup).await.map(|_| json!({}))
         }
         Request::CloudSync { slug, write, wine_prefix } => {
             cmd_cloud_sync(state, &slug, write, wine_prefix).await.map(|_| json!({}))
@@ -859,7 +883,15 @@ async fn cmd_launch(
     wine_dll_overrides: Vec<String>,
     steam_app_id: Option<String>,
     entitlement_source: Option<maxima_proto::EntitlementSource>,
+    locale: Option<String>,
+    umu_gameid: Option<String>,
 ) -> Result<()> {
+    let locale = locale.as_deref().map(Locale::parse).transpose()?;
+    if let Some(id) = umu_gameid.as_deref() {
+        if !launch::valid_umu_gameid(id) {
+            anyhow::bail!("`{}` is not a umu GAMEID", id);
+        }
+    }
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
     let prefix = prepare_prefix(&slug, &wine_prefix).await?;
     let path_override = exe_override
@@ -880,6 +912,8 @@ async fn cmd_launch(
             }),
             wine_prefix: prefix,
             wine_dll_overrides,
+            locale,
+            umu_gameid,
         },
     )
     .await?;
@@ -929,8 +963,14 @@ async fn cmd_install(
     only_listed_files: bool,
     wine_prefix: Option<String>,
     exclude: Vec<String>,
+    locale: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<String> {
     use maxima::content::manager::QueuedGameBuilder;
+
+    if let Some(locale) = &locale {
+        Locale::parse(locale)?;
+    }
     use maxima::content::{downloader::ZipDownloader, ContentService};
 
     let (slug, offer_id) = resolve_game(&state.maxima, &typed).await?;
@@ -1019,7 +1059,8 @@ async fn cmd_install(
     if queue.current.iter().chain(&queue.queued).any(|q| q.offer_id == offer_id) {
         return Ok(slug);
     }
-    let locale = maxima.locale().full_str().to_owned();
+    let recorded = maxima::gameinfo::load_game_info(&slug).and_then(|r| r.locale);
+    let locale = Locale::resolve(locale.as_deref(), recorded.as_deref(), maxima.locale())?;
     let game = QueuedGameBuilder::default()
         .offer_id(offer_id)
         .build_id(build_id)
@@ -1027,7 +1068,8 @@ async fn cmd_install(
         .slug(slug.clone())
         .wine_prefix(prefix)
         .exclude(exclude)
-        .locale(Some(locale))
+        .locale(Some(locale.full_str().to_owned()))
+        .touchup(TouchupPolicy::resolve(touchup.map(touchup_policy)))
         .build()?;
     maxima.content_manager().add_install(game).await?;
     Ok(slug)
@@ -1182,6 +1224,8 @@ async fn cmd_verify(
             true,
             wine_prefix,
             Vec::new(),
+            None,
+            None,
         ))
         .await?;
         state.notify(Notification::VerifyDone {
@@ -1322,14 +1366,23 @@ async fn cmd_register_protocols() -> Result<()> {
     Ok(())
 }
 
-/// Register an existing install: run its touchup in the right prefix and
-/// write the install record, so every later command finds it without a
-/// registry.
+fn touchup_policy(policy: maxima_proto::TouchupPolicy) -> TouchupPolicy {
+    match policy {
+        maxima_proto::TouchupPolicy::Auto => TouchupPolicy::Auto,
+        maxima_proto::TouchupPolicy::Always => TouchupPolicy::Always,
+        maxima_proto::TouchupPolicy::Never => TouchupPolicy::Never,
+    }
+}
+
+/// Register an existing install: run its touchup in the right prefix when
+/// the touchup policy asks for it (see `TouchupPolicy`) and write the
+/// install record, so every later command finds it without a registry.
 async fn cmd_locate(
     state: &Arc<ServerState>,
     path: &str,
     slug: Option<String>,
     wine_prefix: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<()> {
     use maxima::core::manifest::MANIFEST_RELATIVE_PATH;
     use maxima::gameinfo::GameInstallInfo;
@@ -1369,15 +1422,38 @@ async fn cmd_locate(
         }
     };
 
+    let recorded = game
+        .as_ref()
+        .and_then(|(slug, _)| maxima::gameinfo::load_game_info(slug))
+        .and_then(|r| r.locale);
+    let locale = {
+        let maxima = state.maxima.lock().await;
+        Locale::resolve(None, recorded.as_deref(), maxima.locale())?
+    };
+
     let man = manifest::read(path.join(MANIFEST_RELATIVE_PATH)).await?;
-    man.run_touchup(&path, prefix.as_deref()).await?;
+    let policy = TouchupPolicy::resolve(touchup.map(touchup_policy));
+    if policy.runs_on_locate(man.as_ref()) {
+        info!("Running touchup for {} (policy {:?})", path.display(), policy);
+        if let Err(err) = man.run_touchup(&path, prefix.as_deref(), locale.full_str()).await {
+            if policy.locate_failure_is_fatal() {
+                return Err(err.into());
+            }
+            warn!(
+                "Touchup for {} failed ({}); registering the install anyway",
+                path.display(),
+                err
+            );
+        }
+    } else {
+        info!("Not running touchup for {} (policy {:?})", path.display(), policy);
+    }
 
     if let Some((slug, offer_id)) = game {
-        let locale = state.maxima.lock().await.locale().full_str().to_owned();
         let mut info = GameInstallInfo::new(path.clone(), prefix)
             .with_slug(&slug)
             .with_offer(&offer_id, None)
-            .with_locale(&locale);
+            .with_locale(locale.full_str());
         info.version = man.version();
         info.save(&slug)?;
     }

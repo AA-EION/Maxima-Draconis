@@ -24,7 +24,7 @@ use maxima::{
     core::{
         auth::{
             context::AuthContext,
-            login::{begin_oauth_login_flow, manual_login},
+            login::begin_oauth_login_flow,
             nucleus_auth_exchange, nucleus_token_exchange, TokenResponse,
         },
         clients::JUNO_PC_CLIENT_ID,
@@ -61,6 +61,50 @@ impl From<EntitlementArg> for launch::EntitlementSource {
             EntitlementArg::Steam => Self::Steam,
         }
     }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TouchupArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<TouchupArg> for maxima_proto::TouchupPolicy {
+    fn from(arg: TouchupArg) -> Self {
+        match arg {
+            TouchupArg::Auto => Self::Auto,
+            TouchupArg::Always => Self::Always,
+            TouchupArg::Never => Self::Never,
+        }
+    }
+}
+
+/// `--touchup`, else this process's `MAXIMA_TOUCHUP`; `None` leaves the
+/// choice to the server.
+fn touchup_choice(arg: Option<TouchupArg>) -> Option<maxima_proto::TouchupPolicy> {
+    use maxima::core::manifest::TouchupPolicy;
+    arg.map(Into::into).or_else(|| {
+        TouchupPolicy::from_env().map(|p| match p {
+            TouchupPolicy::Auto => maxima_proto::TouchupPolicy::Auto,
+            TouchupPolicy::Always => maxima_proto::TouchupPolicy::Always,
+            TouchupPolicy::Never => maxima_proto::TouchupPolicy::Never,
+        })
+    })
+}
+
+fn parse_umu_gameid_arg(value: &str) -> Result<String, String> {
+    if launch::valid_umu_gameid(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("`{value}` is not a umu GAMEID (letters, digits, '-', '_', '.')"))
+    }
+}
+
+fn parse_locale_arg(value: &str) -> Result<String, String> {
+    maxima::core::locale::Locale::parse(value)
+        .map(|l| l.full_str().to_owned())
+        .map_err(|e| e.to_string())
 }
 
 fn proto_entitlement(source: launch::EntitlementSource) -> maxima_proto::EntitlementSource {
@@ -139,6 +183,16 @@ enum Mode {
         /// MAXIMA_WINE_PREFIX, but for this command only.
         #[arg(long)]
         wine_prefix: Option<String>,
+
+        /// Game locale, `xx_XX` (e.g. `de_DE`). Defaults to the one in the
+        /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
+        #[arg(long, value_parser = parse_locale_arg)]
+        locale: Option<String>,
+
+        /// umu `GAMEID` for this launch (Linux; ignored elsewhere), e.g.
+        /// `umu-1234`. Defaults to `MAXIMA_UMU_GAMEID`, else `umu-0`.
+        #[arg(long, value_parser = parse_umu_gameid_arg)]
+        umu_gameid: Option<String>,
     },
     ListGames {
         /// Emit a JSON array on stdout (with log output suppressed) instead
@@ -167,6 +221,13 @@ enum Mode {
         /// MAXIMA_WINE_PREFIX, but for this command only.
         #[arg(long)]
         wine_prefix: Option<String>,
+
+        /// When the installer touchup runs. `auto` (default): always on
+        /// install; on locate only when the game's manifest asks for it
+        /// (`forceTouchupInstallerAfterUpdate`), and a failure there is a
+        /// warning. `always` / `never` force it. Env: `MAXIMA_TOUCHUP`.
+        #[arg(long, value_enum)]
+        touchup: Option<TouchupArg>,
     },
     /// Install a game from the user's EA library to a local path,
     /// non-interactively. Equivalent to the interactive "Install Game"
@@ -227,6 +288,18 @@ enum Mode {
         /// folder: `--exclude "*.bik" --exclude "Movies/"`.
         #[arg(long)]
         exclude: Vec<String>,
+
+        /// Game locale, `xx_XX` (e.g. `de_DE`). Defaults to the one in the
+        /// game's install record, else `MAXIMA_LOCALE`, else `en_US`.
+        #[arg(long, value_parser = parse_locale_arg)]
+        locale: Option<String>,
+
+        /// When the installer touchup runs. `auto` (default): always on
+        /// install; on locate only when the game's manifest asks for it
+        /// (`forceTouchupInstallerAfterUpdate`), and a failure there is a
+        /// warning. `always` / `never` force it. Env: `MAXIMA_TOUCHUP`.
+        #[arg(long, value_enum)]
+        touchup: Option<TouchupArg>,
 
         /// Emit JSONL progress on stdout (one JSON document per line)
         /// with logger stdout suppressed. Each progress tick is
@@ -685,21 +758,16 @@ pub async fn login_flow(login_override: Option<String>) -> Result<TokenResponse>
     let mut auth_context = AuthContext::new()?;
 
     if let Some(access_token) = &login_override {
-        let access_token = if let Some(captures) = MANUAL_LOGIN_PATTERN.captures(&access_token) {
-            let persona = &captures[1];
-            let password = &captures[2];
+        // EA patched the OOA username/password exchange; only an access
+        // token (or the browser login) can start a session now.
+        if MANUAL_LOGIN_PATTERN.is_match(access_token) {
+            bail!(
+                "username:password login is no longer supported by EA; \
+                 pass an access token with --login, or omit it to log in in the browser"
+            );
+        }
 
-            let login_result = manual_login(persona, password).await;
-            if login_result.is_err() {
-                bail!("Login failed: {}", login_result.err().unwrap().to_string());
-            }
-
-            login_result.unwrap()
-        } else {
-            access_token.to_owned()
-        };
-
-        auth_context.set_access_token(&access_token);
+        auth_context.set_access_token(access_token);
         let code = nucleus_auth_exchange(&auth_context, JUNO_PC_CLIENT_ID, "code").await?;
         auth_context.set_code(&code);
     } else {
@@ -755,8 +823,14 @@ async fn startup(args: Args) -> Result<()> {
     // also stays in-process.
     match &args.mode {
         Some(Mode::ListGames { json }) => return server::run_list_games(*json).await,
-        Some(Mode::LocateGame { path, slug, wine_prefix }) => {
-            return server::run_locate_game(path, slug.clone(), wine_prefix.clone()).await
+        Some(Mode::LocateGame { path, slug, wine_prefix, touchup }) => {
+            return server::run_locate_game(
+                path,
+                slug.clone(),
+                wine_prefix.clone(),
+                touchup_choice(*touchup),
+            )
+            .await
         }
         Some(Mode::BottleInfo { slug, json, wine_prefix }) => {
             return server::run_bottle_info(slug, *json, wine_prefix.clone()).await
@@ -794,6 +868,8 @@ async fn startup(args: Args) -> Result<()> {
             json,
             wine_prefix,
             exclude,
+            locale,
+            touchup,
         }) => {
             return server::run_install(
                 slug,
@@ -804,6 +880,8 @@ async fn startup(args: Args) -> Result<()> {
                     only_listed_files: *only_listed_files,
                     wine_prefix: wine_prefix.clone(),
                     exclude: exclude.clone(),
+                    locale: locale.clone(),
+                    touchup: touchup_choice(*touchup),
                 },
                 *json,
             )
@@ -820,6 +898,8 @@ async fn startup(args: Args) -> Result<()> {
             entitlement_source,
             json,
             wine_prefix,
+            locale,
+            umu_gameid,
         }) => {
             let mut a = game_args.clone();
             a.extend(trailing_args.clone());
@@ -835,6 +915,8 @@ async fn startup(args: Args) -> Result<()> {
                     .map(launch::EntitlementSource::from)
                     .or_else(launch::EntitlementSource::from_env)
                     .map(proto_entitlement),
+                locale: locale.clone(),
+                umu_gameid: umu_gameid.clone(),
             };
             info!("Forwarding launch of '{}' to the Maxima server", slug);
             return server::forward_streaming(req, &["game-stopped"], *json).await;
@@ -910,6 +992,8 @@ async fn startup(args: Args) -> Result<()> {
             entitlement_source,
             json,
             wine_prefix,
+            locale,
+            umu_gameid,
         } => {
             let mut game_args = game_args;
             game_args.extend(trailing_args);
@@ -923,6 +1007,8 @@ async fn startup(args: Args) -> Result<()> {
                 entitlement_source.map(Into::into),
                 wine_prefix.map(PathBuf::from),
                 wine_dll_override,
+                locale,
+                umu_gameid,
                 maxima_arc.clone(),
                 json,
             )
@@ -1070,6 +1156,8 @@ async fn interactive_start_game(maxima_arc: LockedMaxima) -> Result<()> {
         None,
         None,
         Vec::new(),
+        None,
+        None,
         maxima_arc.clone(),
         false,
     )
@@ -1445,6 +1533,8 @@ async fn start_game(
     entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
+    locale: Option<String>,
+    umu_gameid: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1460,6 +1550,8 @@ async fn start_game(
         entitlement_source,
         wine_prefix,
         wine_dll_overrides,
+        locale,
+        umu_gameid,
         maxima_arc,
         json,
     )
@@ -1498,6 +1590,8 @@ async fn start_game_inner(
     entitlement_source: Option<launch::EntitlementSource>,
     wine_prefix: Option<PathBuf>,
     wine_dll_overrides: Vec<String>,
+    locale: Option<String>,
+    umu_gameid: Option<String>,
     maxima_arc: LockedMaxima,
     json: bool,
 ) -> Result<()> {
@@ -1534,6 +1628,11 @@ async fn start_game_inner(
         entitlement_source,
         wine_prefix,
         wine_dll_overrides,
+        locale: locale
+            .as_deref()
+            .map(maxima::core::locale::Locale::parse)
+            .transpose()?,
+        umu_gameid,
     };
 
     if login.is_none() {

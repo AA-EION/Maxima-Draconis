@@ -20,6 +20,7 @@ pub use client::{ClientError, InstallOptions, LaunchParams, MaximaClient};
 pub use instance::{discover, Discovery, InstanceInfo, InstanceState, PROTO_VERSION};
 pub use message::{
     EntitlementSource, ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
+    TouchupPolicy,
     ServerMessage,
 };
 pub use types::{

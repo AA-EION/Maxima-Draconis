@@ -6,7 +6,9 @@ use crate::util::native::platform_path;
 use dip::DiPManifest;
 use lenient::split_args;
 use pre_dip::PreDiPManifest;
+use log::warn;
 use quick_xml::DeError;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -35,6 +37,68 @@ pub enum ManifestError {
 }
 
 pub const MANIFEST_RELATIVE_PATH: &str = "__Installer/installerdata.xml";
+pub const TOUCHUP_ENV: &str = "MAXIMA_TOUCHUP";
+
+/// When a game's installer touchup runs.
+///
+/// - `Auto` (default): an install always runs it; locating an existing
+///   install runs it only when the manifest sets
+///   `forceTouchupInstallerAfterUpdate`, and a failure there is only a
+///   warning (the install record is still written).
+/// - `Always`: run it on install and on locate; a failure fails the command.
+/// - `Never`: skip it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchupPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl TouchupPolicy {
+    /// `auto` / `always` / `never`, case-insensitive.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// `MAXIMA_TOUCHUP`, if set to a valid value.
+    pub fn from_env() -> Option<Self> {
+        let value = std::env::var(TOUCHUP_ENV).ok()?;
+        let parsed = Self::parse(&value);
+        if parsed.is_none() {
+            warn!("Ignoring {TOUCHUP_ENV}='{value}' (expected auto, always or never)");
+        }
+        parsed
+    }
+
+    /// The request's choice, else `MAXIMA_TOUCHUP`, else `Auto`.
+    pub fn resolve(explicit: Option<Self>) -> Self {
+        explicit.or_else(Self::from_env).unwrap_or_default()
+    }
+
+    pub fn runs_on_install(self) -> bool {
+        self != Self::Never
+    }
+
+    pub fn runs_on_locate(self, manifest: &dyn GameManifest) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => manifest.force_touchup_after_update(),
+        }
+    }
+
+    /// Whether a touchup failure on locate fails the locate.
+    pub fn locate_failure_is_fatal(self) -> bool {
+        self == Self::Always
+    }
+}
 
 #[async_trait::async_trait]
 pub trait GameManifest: Send + std::fmt::Debug {
@@ -45,9 +109,13 @@ pub trait GameManifest: Send + std::fmt::Debug {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError>;
     fn execute_path(&self, trial: bool) -> Option<String>;
     fn version(&self) -> Option<String>;
+    /// The manifest asks for the touchup to run again after an update
+    /// (`forceTouchupInstallerAfterUpdate`).
+    fn force_touchup_after_update(&self) -> bool;
 }
 #[async_trait::async_trait]
 impl GameManifest for DiPManifest {
@@ -55,8 +123,9 @@ impl GameManifest for DiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
-        self.run_touchup(install_path, wine_prefix).await
+        self.run_touchup(install_path, wine_prefix, locale).await
     }
 
     fn execute_path(&self, trial: bool) -> Option<String> {
@@ -66,6 +135,12 @@ impl GameManifest for DiPManifest {
     fn version(&self) -> Option<String> {
         self.version()
     }
+
+    fn force_touchup_after_update(&self) -> bool {
+        self.buildMetaData
+            .featureFlags
+            .attr_forceTouchupInstallerAfterUpdate
+    }
 }
 
 #[async_trait::async_trait]
@@ -74,8 +149,9 @@ impl GameManifest for PreDiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
-        self.run_touchup(install_path, wine_prefix).await
+        self.run_touchup(install_path, wine_prefix, locale).await
     }
 
     fn execute_path(&self, _: bool) -> Option<String> {
@@ -84,6 +160,10 @@ impl GameManifest for PreDiPManifest {
 
     fn version(&self) -> Option<String> {
         self.version()
+    }
+
+    fn force_touchup_after_update(&self) -> bool {
+        false // pre-DiP manifests have no such flag
     }
 }
 
@@ -175,6 +255,7 @@ pub(crate) fn expand_args(parameters: &str, locale: &str, install_location: &str
 pub(crate) fn collect_touchup_args(
     parameters: &str,
     install_path: &Path,
+    locale: &str,
 ) -> Result<Vec<PathBuf>, ManifestError> {
     let install = install_path
         .to_str()
@@ -185,7 +266,7 @@ pub(crate) fn collect_touchup_args(
 
     Ok(expand_args(
         parameters,
-        "en_US",
+        locale,
         install.to_str().ok_or(ManifestError::Decode)?,
     ))
 }

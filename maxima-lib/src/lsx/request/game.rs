@@ -4,7 +4,7 @@ const LANGUAGES: &str =
 //const LANGUAGES: &str = "en_US,es_ES,fr_FR,pt_BR";
 
 use crate::{
-    core::launch::EntitlementSource,
+    core::{launch::EntitlementSource, locale::Locale, Maxima},
     lsx::{
         connection::LockedConnectionState,
         request::LSXRequestError,
@@ -16,10 +16,29 @@ use crate::{
     make_lsx_handler_response,
 };
 
+/// The running game's locale (chosen at launch from the request or its
+/// install record), else the process default.
+pub(crate) fn game_locale(maxima: &Maxima) -> Locale {
+    maxima
+        .playing()
+        .as_ref()
+        .map(|p| p.locale().clone())
+        .unwrap_or_else(|| maxima.locale().clone())
+}
+
 async fn installed_language(state: &LockedConnectionState) -> String {
     let arc = state.write().await.maxima_arc();
     let maxima = arc.lock().await;
-    maxima.locale().full_str().to_string()
+    game_locale(&maxima).full_str().to_string()
+}
+
+/// The advertised language list, always including the one the game runs in.
+fn languages(installed: &str) -> String {
+    if LANGUAGES.split(',').any(|l| l == installed) {
+        LANGUAGES.to_string()
+    } else {
+        format!("{LANGUAGES},{installed}")
+    }
 }
 
 pub async fn handle_game_info_request(
@@ -28,7 +47,10 @@ pub async fn handle_game_info_request(
 ) -> Result<Option<LSXResponseType>, LSXRequestError> {
     let game_info = match request.attr_GameInfoId {
         LSXGameInfoId::FreeTrial => "false".to_string(),
-        LSXGameInfoId::Languages => LANGUAGES.to_string(),
+        // Matches `FullGamePurchased` in `GetAllGameInfo`: Maxima only
+        // launches games the account owns.
+        LSXGameInfoId::FullGamePurchased => "true".to_string(),
+        LSXGameInfoId::Languages => languages(&installed_language(&state).await),
         LSXGameInfoId::InstalledLanguage => installed_language(&state).await,
     };
 
@@ -78,7 +100,7 @@ pub async fn handle_all_game_info_request(
         (
             playing.and_then(|p| p.offer().clone()),
             playing.map_or(EntitlementSource::Ea, |p| p.entitlement_source()),
-            maxima.locale().full_str().to_string(),
+            game_locale(&maxima).full_str().to_string(),
         )
     };
 
@@ -114,7 +136,7 @@ pub async fn handle_all_game_info_request(
         attr_FullGameReleased: true,
         attr_InstalledVersion: installed_version,
         attr_MaxGroupSize: 16,
-        attr_Languages: LANGUAGES.to_string(),
+        attr_Languages: languages(&installed_language),
         attr_Expiration: NEUTRAL_DATE.to_string(),
         attr_UpToDate: true,
         attr_HasExpiration: false,
@@ -126,4 +148,28 @@ pub async fn handle_all_game_info_request(
         attr_FullGameReleaseDate: release_date.unwrap_or_else(|| NEUTRAL_DATE.to_string()),
         attr_SystemTime: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_ids_use_the_wire_names() {
+        use crate::core::settings::MaximaSetting;
+        assert_eq!(
+            serde_json::to_string(&LSXGameInfoId::FullGamePurchased).unwrap(),
+            "\"FULLGAME_PURCHASED\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MaximaSetting>("\"LANGUAGE\"").unwrap(),
+            MaximaSetting::Language
+        );
+    }
+
+    #[test]
+    fn languages_always_contain_the_installed_one() {
+        assert_eq!(languages("de_DE"), LANGUAGES);
+        assert_eq!(languages("nl_NL"), format!("{LANGUAGES},nl_NL"));
+    }
 }

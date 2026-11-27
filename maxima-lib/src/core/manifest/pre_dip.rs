@@ -135,6 +135,7 @@ impl PreDiPManifest {
         &self,
         install_path: &PathBuf,
         wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
         use log::warn;
 
@@ -168,7 +169,7 @@ impl PreDiPManifest {
         let install_path = PathBuf::from(remove_trailing_slash(
             install_path.to_str().ok_or(ManifestError::Decode)?,
         ));
-        let args = collect_touchup_args(&self.executable.parameters, &install_path)?;
+        let args = collect_touchup_args(&self.executable.parameters, &install_path, locale)?;
 
         let path = install_path.join(remove_leading_slash(&self.executable.file_path));
         let path = case_insensitive_path(path);
@@ -183,6 +184,7 @@ impl PreDiPManifest {
         &self,
         install_path: &PathBuf,
         _wine_prefix: Option<&Path>,
+        locale: &str,
     ) -> Result<(), ManifestError> {
         use crate::util::{
             elevation, native::NativeError, registry::cleanup_interrupted_burn_installs,
@@ -196,7 +198,7 @@ impl PreDiPManifest {
         // so they start fresh rather than trying to resume from a corrupt checkpoint.
         cleanup_interrupted_burn_installs();
 
-        let args = collect_touchup_args(&self.executable.parameters, install_path)?;
+        let args = collect_touchup_args(&self.executable.parameters, install_path, locale)?;
         let path = install_path.join(remove_leading_slash(&self.executable.file_path));
 
         let code = elevation::run_and_wait(&path, &args).await?;

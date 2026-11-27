@@ -72,10 +72,32 @@ pub async fn print_status(json_out: bool) -> Result<()> {
 /// running — and wait until its EA session is logged in.
 async fn connect_ready() -> Result<Arc<MaximaClient>> {
     let client = server_client::connect(CLIENT_NAME, true).await?;
-    if client.persona().is_empty() {
+    // The server may have no browser to open (detached, headless, remote
+    // session): print the login URL it announces. stderr keeps a `--json`
+    // stdout clean.
+    let url_printer = client.persona().is_empty().then(|| {
         info!("Waiting for the Maxima server to finish the EA login (check your browser)...");
+        let mut events = client.subscribe();
+        tokio::spawn(async move {
+            let mut last = None;
+            loop {
+                match events.recv().await {
+                    Ok(Notification::LoginUrl { url }) if last.as_ref() != Some(&url) => {
+                        eprintln!("Log in to EA at: {}", url);
+                        last = Some(url);
+                    }
+                    Ok(Notification::Ready { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    });
+    let result = tokio::time::timeout(LOGIN_TIMEOUT, client.login_and_await_ready()).await;
+    if let Some(printer) = url_printer {
+        printer.abort();
     }
-    match tokio::time::timeout(LOGIN_TIMEOUT, client.login_and_await_ready()).await {
+    match result {
         Ok(Ok(_)) => Ok(client),
         Ok(Err(_)) => anyhow::bail!(
             "maxima-server stopped before the login finished — login failed or was cancelled; \
@@ -216,9 +238,10 @@ pub async fn run_locate_game(
     path: &str,
     slug: Option<String>,
     wine_prefix: Option<String>,
+    touchup: Option<maxima_proto::TouchupPolicy>,
 ) -> Result<()> {
     let client = connect_ready().await?;
-    client.locate_game_for(path, slug, wine_prefix).await?;
+    client.locate_game_with(path, slug, wine_prefix, touchup).await?;
     info!("Installed!");
     Ok(())
 }
@@ -385,6 +408,7 @@ fn notification_event_name(note: &Notification) -> &'static str {
         Notification::Ready { .. } => "ready",
         Notification::LoginRequired => "login-required",
         Notification::LoginFailed { .. } => "login-failed",
+        Notification::LoginUrl { .. } => "login-url",
         Notification::Presence { .. } => "presence",
         Notification::InstallProgress { .. } => "install-progress",
         Notification::InstallDone { .. } => "install-done",

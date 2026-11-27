@@ -22,11 +22,13 @@ members = [
 # embed in `FInstall.txt`'s `maxima_lib_version` field, and
 # `maxima-resources` is a build-time helper crate).
 [workspace.package]
-version = "0.16.1"
+version = "0.17.0"
 
 [profile.release]
 strip = true
 
+# Pinned to exact commits (the default-branch heads these tracked when
+# pinned) so a push to either fork can't change a build. Bump deliberately.
 [patch.crates-io]
-flate2 = { git = 'https://github.com/ArmchairDevelopers/flate2-rs.git' }
-async-compression = { git = 'https://github.com/ArmchairDevelopers/async-compression.git' }
+flate2 = { git = 'https://github.com/ArmchairDevelopers/flate2-rs.git', rev = '42daaa1eb6aad89d9cf8c1fa51f2d6bcae3a3247' }
+async-compression = { git = 'https://github.com/ArmchairDevelopers/async-compression.git', rev = '4c9a88aa0ba50b32400e308b0c0dda9e5bf0e779' }

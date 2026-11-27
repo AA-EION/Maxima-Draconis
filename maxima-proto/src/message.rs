@@ -26,6 +26,17 @@ pub enum EntitlementSource {
     Steam,
 }
 
+/// When the installer touchup runs (`auto` when omitted): an install always
+/// runs it under `auto`; a locate only when the game's manifest asks for it,
+/// and a failure there is a warning. `always` / `never` force it on / off.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchupPolicy {
+    Auto,
+    Always,
+    Never,
+}
+
 /// A client → server request. `cmd` is the tag; per-command fields sit
 /// alongside it. Wrapped in [`RequestEnvelope`] to carry the correlation id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -76,6 +87,14 @@ pub enum Request {
         /// `steam_app_id` (Steam when set, EA when not).
         #[serde(default)]
         entitlement_source: Option<EntitlementSource>,
+        /// Game locale (`xx_XX`). Omitted = the game's recorded locale, else
+        /// the server default (`MAXIMA_LOCALE`, else `en_US`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locale: Option<String>,
+        /// umu `GAMEID` (Linux hosts). Omitted = the server's
+        /// `MAXIMA_UMU_GAMEID`, else `umu-0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        umu_gameid: Option<String>,
     },
     Install {
         slug: String,
@@ -100,6 +119,13 @@ pub enum Request {
         /// the game's exclusion file. Remembered in the install record.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// Game locale (`xx_XX`) to install with and record. Omitted = the
+        /// recorded one, else the server default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locale: Option<String>,
+        /// Omitted = the server's `MAXIMA_TOUCHUP`, else `auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        touchup: Option<TouchupPolicy>,
     },
     LocateGame {
         path: String,
@@ -111,6 +137,9 @@ pub enum Request {
         /// game's own. Omitted = the server picks per game.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wine_prefix: Option<String>,
+        /// Omitted = the server's `MAXIMA_TOUCHUP`, else `auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        touchup: Option<TouchupPolicy>,
     },
     CloudSync {
         slug: String,
@@ -241,6 +270,13 @@ pub enum Notification {
     LoginFailed {
         error: String,
     },
+    /// The EA login page for the login in progress. The server also tries to
+    /// open it in a browser on its own host; a client can show or open it
+    /// when that host has no usable browser. Replayed to clients that
+    /// connect while the login runs.
+    LoginUrl {
+        url: String,
+    },
     Presence {
         id: String,
         basic: String,
@@ -320,6 +356,8 @@ mod tests {
                 wine_dll_overrides: vec!["wsock32=n,b".into()],
                 steam_app_id: Some("12345".into()),
                 entitlement_source: Some(EntitlementSource::Steam),
+                locale: Some("de_DE".into()),
+                umu_gameid: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
@@ -330,6 +368,8 @@ mod tests {
         assert!(s.contains("\"wine_dll_overrides\":[\"wsock32=n,b\"]"));
         assert!(s.contains("\"steam_app_id\":\"12345\""));
         assert!(s.contains("\"entitlement_source\":\"steam\""));
+        assert!(s.contains("\"locale\":\"de_DE\""));
+        assert!(!s.contains("umu_gameid"));
     }
 
     #[test]
@@ -344,8 +384,10 @@ mod tests {
                 wine_dll_overrides,
                 steam_app_id,
                 entitlement_source,
+                locale,
                 ..
             } => {
+                assert!(locale.is_none());
                 assert!(args.is_empty());
                 assert!(exe_override.is_none());
                 assert!(cloud_saves);
@@ -387,19 +429,25 @@ mod tests {
                 only_listed_files: false,
                 wine_prefix: None,
                 exclude: vec![],
+                locale: None,
+                touchup: None,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains("wine_prefix"));
         assert!(!s.contains("exclude"));
+        assert!(!s.contains("locale"));
+        assert!(!s.contains("touchup"));
 
         // A request from a client that predates the fields still parses.
         let old = r#"{"id":2,"cmd":"install","slug":"g","path":"/p"}"#;
         let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
         match parsed.request {
-            Request::Install { wine_prefix, exclude, .. } => {
+            Request::Install { wine_prefix, exclude, locale, touchup, .. } => {
                 assert_eq!(wine_prefix, None);
                 assert!(exclude.is_empty());
+                assert_eq!(locale, None);
+                assert_eq!(touchup, None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -421,7 +469,25 @@ mod tests {
         let parsed: RequestEnvelope = serde_json::from_str(old).unwrap();
         assert!(matches!(
             parsed.request,
-            Request::LocateGame { slug: None, wine_prefix: None, .. }
+            Request::LocateGame { slug: None, wine_prefix: None, touchup: None, .. }
+        ));
+
+        let new = r#"{"id":5,"cmd":"locate-game","path":"/g","touchup":"never"}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(new).unwrap();
+        assert!(matches!(
+            parsed.request,
+            Request::LocateGame { touchup: Some(TouchupPolicy::Never), .. }
+        ));
+    }
+
+    #[test]
+    fn login_url_wire_shape() {
+        let n = Notification::LoginUrl { url: "https://example.invalid/login".into() };
+        let s = serde_json::to_string(&n).unwrap();
+        assert_eq!(s, r#"{"event":"login-url","url":"https://example.invalid/login"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&s).unwrap(),
+            ServerMessage::Notification(Notification::LoginUrl { .. })
         ));
     }
 

@@ -558,7 +558,9 @@ impl GameLibrary {
     }
 
     async fn request_owned_games(&mut self) -> Result<(), LibraryError> {
-        self.request_page_concurrent(Locale::EnUs, 1).await?;
+        // The catalog is read in en_US whatever the game locale: library
+        // names and matching don't depend on the language a game runs in.
+        self.request_page_concurrent(Locale::en_us(), 1).await?;
 
         Ok(())
     }

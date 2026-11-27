@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex};
 use crate::instance::{InstanceInfo, PROTO_VERSION};
 use crate::message::{
     EntitlementSource, ErrorKind, Notification, Request, RequestEnvelope, ResponseEnvelope,
-    ServerMessage,
+    ServerMessage, TouchupPolicy,
 };
 use crate::types::{
     BottleInfoDto, FriendDto, GameDetailsDto, GameDto, GameImagesDto, QueueDto, StatusDto, UserDto,
@@ -40,6 +40,10 @@ pub struct LaunchParams {
     pub wine_dll_overrides: Vec<String>,
     pub steam_app_id: Option<String>,
     pub entitlement_source: Option<EntitlementSource>,
+    /// Game locale (`xx_XX`); `None` = recorded, else the server default.
+    pub locale: Option<String>,
+    /// umu `GAMEID` (Linux hosts); `None` = the server's default.
+    pub umu_gameid: Option<String>,
 }
 
 impl Default for LaunchParams {
@@ -52,6 +56,8 @@ impl Default for LaunchParams {
             wine_dll_overrides: Vec::new(),
             steam_app_id: None,
             entitlement_source: None,
+            locale: None,
+            umu_gameid: None,
         }
     }
 }
@@ -97,6 +103,10 @@ pub struct InstallOptions {
     pub wine_prefix: Option<String>,
     /// Glob patterns of files to leave out of the download.
     pub exclude: Vec<String>,
+    /// Game locale (`xx_XX`); `None` = recorded, else the server default.
+    pub locale: Option<String>,
+    /// `None` = the server's `MAXIMA_TOUCHUP`, else `auto`.
+    pub touchup: Option<TouchupPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,6 +383,8 @@ impl MaximaClient {
             wine_dll_overrides: params.wine_dll_overrides,
             steam_app_id: params.steam_app_id,
             entitlement_source: params.entitlement_source,
+            locale: params.locale,
+            umu_gameid: params.umu_gameid,
         })
         .await
         .map(|_| ())
@@ -425,6 +437,8 @@ impl MaximaClient {
                 only_listed_files: options.only_listed_files,
                 wine_prefix: options.wine_prefix,
                 exclude: options.exclude,
+                locale: options.locale,
+                touchup: options.touchup,
             },
             timeout,
         )
@@ -519,7 +533,18 @@ impl MaximaClient {
         slug: Option<String>,
         wine_prefix: Option<String>,
     ) -> Result<(), ClientError> {
-        self.request(Request::LocateGame { path: path.to_owned(), slug, wine_prefix })
+        self.locate_game_with(path, slug, wine_prefix, None).await
+    }
+
+    /// [`locate_game_for`](Self::locate_game_for) with a touchup policy.
+    pub async fn locate_game_with(
+        &self,
+        path: &str,
+        slug: Option<String>,
+        wine_prefix: Option<String>,
+        touchup: Option<TouchupPolicy>,
+    ) -> Result<(), ClientError> {
+        self.request(Request::LocateGame { path: path.to_owned(), slug, wine_prefix, touchup })
             .await
             .map(|_| ())
     }

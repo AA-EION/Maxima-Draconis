@@ -1,6 +1,6 @@
 use super::{
     dip::DiPManifest, expand_args, lenient::split_args, parse, pre_dip::PreDiPManifest,
-    ManifestError,
+    ManifestError, TouchupPolicy,
 };
 use std::path::PathBuf;
 
@@ -278,4 +278,43 @@ async fn manifest_is_found_with_different_case() {
     std::fs::remove_dir_all(&dir).unwrap();
 
     assert_eq!(result.unwrap().version().as_deref(), Some("1.0.0.5"));
+}
+
+#[test]
+fn touchup_policy_parses() {
+    assert_eq!(TouchupPolicy::parse("auto"), Some(TouchupPolicy::Auto));
+    assert_eq!(TouchupPolicy::parse(" ALWAYS "), Some(TouchupPolicy::Always));
+    assert_eq!(TouchupPolicy::parse("Never"), Some(TouchupPolicy::Never));
+    assert_eq!(TouchupPolicy::parse("sometimes"), None);
+    assert_eq!(TouchupPolicy::parse(""), None);
+    assert_eq!(TouchupPolicy::resolve(Some(TouchupPolicy::Never)), TouchupPolicy::Never);
+    assert_eq!(serde_json::to_string(&TouchupPolicy::Always).unwrap(), "\"always\"");
+}
+
+#[test]
+fn touchup_policy_decides_per_command() {
+    let plain = parse(NORMAL_DIP.as_bytes()).unwrap();
+    let forced = parse(
+        NORMAL_DIP
+            .replace(
+                r#"forceTouchupInstallerAfterUpdate="false""#,
+                r#"forceTouchupInstallerAfterUpdate="true""#,
+            )
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(!plain.force_touchup_after_update());
+    assert!(forced.force_touchup_after_update());
+
+    assert!(!TouchupPolicy::Auto.runs_on_locate(plain.as_ref()));
+    assert!(TouchupPolicy::Auto.runs_on_locate(forced.as_ref()));
+    assert!(TouchupPolicy::Always.runs_on_locate(plain.as_ref()));
+    assert!(!TouchupPolicy::Never.runs_on_locate(forced.as_ref()));
+
+    assert!(TouchupPolicy::Auto.runs_on_install());
+    assert!(TouchupPolicy::Always.runs_on_install());
+    assert!(!TouchupPolicy::Never.runs_on_install());
+
+    assert!(!TouchupPolicy::Auto.locate_failure_is_fatal());
+    assert!(TouchupPolicy::Always.locate_failure_is_fatal());
 }

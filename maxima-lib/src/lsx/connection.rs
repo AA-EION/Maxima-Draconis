@@ -76,8 +76,13 @@ pub enum LSXConnectionError {
 const CORE_SENDER: &str = "EALS";
 
 const CHALLENGE_BUILD: &str = "release";
-const CHALLENGE_KEY: &str = "cacf897a20b6d612ad0c05e011df52bb"; // Need to figure out how to generate this
 const CHALLENGE_VERSION: &str = "10,5,30,15625";
+
+/// A fresh challenge key per connection: 16 random bytes, hex-encoded (the
+/// shape EA's own launcher sends), so a recorded handshake can't be replayed.
+fn new_challenge_key() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
 
 /// `ErrorSuccess` code for a request we can't answer (no handler, or the XML
 /// doesn't map onto a request type we know). Code 0 is the success ack.
@@ -408,7 +413,7 @@ impl Connection {
         let (outbound_tx, outbound) = unbounded_channel();
         let state = Arc::new(RwLock::new(ConnectionState {
             maxima: maxima_arc,
-            challenge: CHALLENGE_KEY.to_string(),
+            challenge: new_challenge_key(),
             encryption: EncryptionState::Disabled,
             pid: pid.unwrap_or(0),
             game_version: None,
@@ -645,6 +650,16 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_keys_are_random_16_byte_hex() {
+        let a = new_challenge_key();
+        let b = new_challenge_key();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b);
+        assert_ne!(a, "cacf897a20b6d612ad0c05e011df52bb");
+    }
 
     #[test]
     fn describes_a_request_with_an_unknown_body() {

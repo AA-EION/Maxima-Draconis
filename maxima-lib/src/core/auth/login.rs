@@ -43,17 +43,34 @@ async fn bind_login_callback() -> Result<TcpListener, AuthError> {
 }
 
 pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result<(), AuthError> {
+    begin_oauth_login_flow_with(context, |_| {}).await
+}
+
+/// [`begin_oauth_login_flow`], handing the login URL to `on_url` once the
+/// callback listener is up — so a caller without a usable browser or stdin
+/// (a detached server) can pass it on to someone who can open it.
+pub async fn begin_oauth_login_flow_with<'a, F>(
+    context: &mut AuthContext<'a>,
+    on_url: F,
+) -> Result<(), AuthError>
+where
+    F: FnOnce(&str) + Send,
+{
     let auth_url = context.nucleus_auth_url(JUNO_PC_CLIENT_ID, "code")?;
     // Bind before opening the browser so a fast redirect can't beat us.
     let listener = bind_login_callback().await?;
+    log::info!("EA login URL: {}", auth_url);
+    on_url(&auth_url);
     // Not fatal: a detached server (or a headless box) may have no browser
-    // handler, and the user can still open the logged URL by hand.
+    // handler, and the user can still open the URL by hand.
     if let Err(err) = open::that(&auth_url) {
         log::warn!("Couldn't open a browser ({}). Open this URL to log in: {}", err, auth_url);
     }
 
     println!("============================================================");
     println!("Please log in via the browser window that just opened.");
+    println!("If none opened, open this URL yourself:");
+    println!("{}", auth_url);
     println!("");
     println!("MAC / CROSSOVER USERS:");
     println!("If your browser gets stuck on signin.ea.com or blocks the qrc:// link:");
@@ -180,10 +197,4 @@ pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result
             }
         }
     }
-}
-
-// Use the OOA API to retrieve an access token without a captcha
-#[deprecated(note = "This method of login was patched and this function will be removed soon")]
-pub async fn manual_login(_persona: &str, _password: &str) -> Result<String, AuthError> {
-    unimplemented!();
 }

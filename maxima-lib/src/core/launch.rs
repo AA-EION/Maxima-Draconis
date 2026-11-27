@@ -18,6 +18,7 @@ use crate::{
         clients::JUNO_PC_CLIENT_ID,
         cloudsync::{CloudSyncError, CloudSyncLockMode},
         library::{path_in_install_root, LibraryError, OwnedOffer},
+        locale::Locale,
         manifest::{self, MANIFEST_RELATIVE_PATH},
         service_layer::ServiceLayerError,
         Maxima,
@@ -146,6 +147,16 @@ impl EntitlementSource {
     }
 }
 
+/// A umu `GAMEID` is a short token such as `umu-0` or `umu-1234`. Only used
+/// on Linux, but checked on every host so a request is judged the same way.
+pub fn valid_umu_gameid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// `MAXIMA_STEAM_APP_ID`, if set to a plausible Steam App ID.
 pub fn steam_app_id_from_env() -> Option<String> {
     let value = env::var("MAXIMA_STEAM_APP_ID").ok()?;
@@ -157,6 +168,7 @@ pub fn steam_app_id_from_env() -> Option<String> {
     }
 }
 
+#[derive(Default)]
 pub struct LaunchOptions {
     pub path_override: Option<String>,
     pub arguments: Vec<String>,
@@ -200,6 +212,13 @@ pub struct LaunchOptions {
     /// (e.g. `wsock32=n,b`), layered on top of the built-in defaults and
     /// `MAXIMA_WINE_DLL_OVERRIDES`. Ignored by hosts that don't use Wine.
     pub wine_dll_overrides: Vec<String>,
+    /// Locale to run the game in. `None` = the one in the game's install
+    /// record, else the process default (`MAXIMA_LOCALE`, else `en_US`). An
+    /// explicit value is also remembered in the install record.
+    pub locale: Option<Locale>,
+    /// umu `GAMEID` for this launch (Linux; ignored elsewhere). `None` =
+    /// `MAXIMA_UMU_GAMEID`, else `umu-0`.
+    pub umu_gameid: Option<String>,
 }
 
 pub enum LaunchMode {
@@ -247,6 +266,9 @@ pub struct ActiveGameContext {
     /// selection.
     wine_prefix: Option<PathBuf>,
     entitlement_override: Option<EntitlementSource>,
+    /// The locale the game was launched in (`EAGameLocale`); LSX reports it
+    /// as the installed language.
+    locale: Locale,
     process: Child,
     started: bool,
 }
@@ -263,6 +285,7 @@ impl ActiveGameContext {
         slug: Option<String>,
         wine_prefix: Option<PathBuf>,
         entitlement_override: Option<EntitlementSource>,
+        locale: Locale,
         process: Child,
     ) -> Self {
         Self {
@@ -277,6 +300,7 @@ impl ActiveGameContext {
             slug,
             wine_prefix,
             entitlement_override,
+            locale,
             process,
             started: false,
         }
@@ -308,6 +332,10 @@ pub struct BootstrapLaunchArgs {
     pub wine_prefix: Option<String>,
     #[serde(default)]
     pub wine_dll_overrides: Vec<String>,
+    /// umu `GAMEID` (Linux). Absent = the bootstrap's `MAXIMA_UMU_GAMEID`,
+    /// else `umu-0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umu_gameid: Option<String>,
 }
 
 impl Display for LaunchMode {
@@ -563,6 +591,25 @@ pub async fn start_game(
 
     let slug = offer.as_ref().map(|o| o.slug().clone());
 
+    let record = slug.as_deref().and_then(crate::gameinfo::load_game_info);
+    let locale = match options.locale.clone() {
+        Some(locale) => locale,
+        None => record
+            .as_ref()
+            .and_then(|r| r.locale.as_deref())
+            .and_then(|r| Locale::parse(r).ok())
+            .unwrap_or_else(|| maxima.locale.clone()),
+    };
+    if let (Some(explicit), Some(slug), Some(mut record)) =
+        (options.locale.as_ref(), slug.as_deref(), record)
+    {
+        if record.locale.as_deref() != Some(explicit.full_str()) {
+            record.locale = Some(explicit.full_str().to_owned());
+            record.save_to_json(slug);
+        }
+    }
+    info!("Game locale: {}", locale);
+
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
 
@@ -596,6 +643,7 @@ pub async fn start_game(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         wine_dll_overrides: options.wine_dll_overrides.clone(),
+        umu_gameid: options.umu_gameid.clone(),
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&bootstrap_args)?);
@@ -615,7 +663,7 @@ pub async fn start_game(
         .env("EAEntitlementSource", source_tag)
         .env("EAExternalSource", source_tag)
         .env("EAFreeTrialGame", "false")
-        .env("EAGameLocale", maxima.locale.full_str())
+        .env("EAGameLocale", locale.full_str())
         .env("EAGenericAuthToken", access_token.to_owned())
         .env("EALaunchCode", "unavailable")
         .env("EALaunchOwner", source_tag)
@@ -728,6 +776,7 @@ pub async fn start_game(
         slug,
         wine_prefix,
         entitlement_override,
+        locale,
         child,
     ));
 
@@ -766,15 +815,21 @@ pub async fn mx_linux_setup(wine_prefix: &std::path::Path) -> Result<(), NativeE
 
     let skip = std::env::var("MAXIMA_DISABLE_WINE_VERIFICATION").is_ok();
     if !skip {
-        if !check_wine_validity().await? {
+        // A Proton / umu the user points us at is theirs to keep current.
+        if crate::unix::wine::external_protonpath().is_none() && !check_wine_validity().await? {
             install_wine().await?;
         }
         let runtimes = get_lutris_runtimes().await?;
         if !check_runtime_validity("eac_runtime", &runtimes).await? {
             install_runtime("eac_runtime", &runtimes).await?;
         }
-        if !check_runtime_validity("umu", &runtimes).await? {
-            install_runtime("umu", &runtimes).await?;
+        match crate::unix::wine::external_umu_bin() {
+            Some(umu) => info!("Using umu-run at {}", umu.display()),
+            None => {
+                if !check_runtime_validity("umu", &runtimes).await? {
+                    install_runtime("umu", &runtimes).await?;
+                }
+            }
         }
     }
 
@@ -905,13 +960,17 @@ mod wine_prefix_tests {
             args: vec![],
             wine_prefix: Some("/prefixes/a".into()),
             wine_dll_overrides: vec![],
+            umu_gameid: Some("umu-1234".into()),
         };
         let json = serde_json::to_string(&with).unwrap();
         let back: BootstrapLaunchArgs = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wine_prefix.as_deref(), Some("/prefixes/a"));
+        assert_eq!(back.umu_gameid.as_deref(), Some("umu-1234"));
 
         let without = BootstrapLaunchArgs::default();
-        assert!(!serde_json::to_string(&without).unwrap().contains("wine_prefix"));
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("wine_prefix"));
+        assert!(!json.contains("umu_gameid"));
     }
 
     #[test]

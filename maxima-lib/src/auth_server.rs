@@ -446,6 +446,8 @@ async fn handle_authorize(
         // default) is picked inside `start_game`.
         wine_prefix: None,
         wine_dll_overrides: Vec::new(),
+        // The game's recorded locale, else the process default.
+        ..Default::default()
     };
 
     // Phase 3: hand off to the upstream launch flow. This refreshes the
